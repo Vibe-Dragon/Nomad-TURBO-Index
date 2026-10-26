@@ -22,8 +22,9 @@ from nomad_turbo.progress import (
     log_line_visible,
     log_lines_to_drop,
     log_should_stick,
-    next_log_height,
-    saved_log_height,
+    initial_log_split,
+    list_pane_position,
+    restored_log_top,
     usage_text,
 )
 from nomad_turbo.window import _MemoryLog, index_store_types, repair_store_types, window_close_action
@@ -310,24 +311,36 @@ class ProgressTest(unittest.TestCase):
         self.assertIsNone(follow_target(-1, 5))
         self.assertIsNone(follow_target(5, 5))
 
-    def test_the_log_height_ignores_an_old_window_split(self):
-        self.assertEqual(saved_log_height(0), 220)
-        self.assertEqual(saved_log_height(822), 220)
-        self.assertEqual(saved_log_height(160), 160)
-        self.assertEqual(next_log_height(220, 40, room=600), 260)
-        self.assertEqual(next_log_height(220, -500, room=600), 120)
-        self.assertEqual(next_log_height(220, 900, room=2000), 720)
-        self.assertEqual(next_log_height(220, 900, room=400), 400)
+    def test_the_log_split_keeps_a_saved_height_and_an_old_position(self):
+        self.assertEqual(initial_log_split(0, 900), 664)
+        self.assertEqual(initial_log_split(822, 900), 820)
+        self.assertEqual(initial_log_split(160, 900), 724)
+        self.assertEqual(initial_log_split(0, 100), 50)
+        self.assertEqual(restored_log_top(720, 0, 900), 164)
+        self.assertEqual(restored_log_top(720, 500, 900), 500)
+        self.assertEqual(restored_log_top(160, 0, 100), 50)
 
-    def test_the_log_bar_is_under_the_log_row(self):
+    def test_an_undragged_list_keeps_the_spare_space(self):
+        self.assertEqual(list_pane_position(0, 600, 200), 384)
+        self.assertEqual(list_pane_position(250, 600, 200), 250)
+        self.assertEqual(list_pane_position(0, 100, 400), 48)
+        self.assertEqual(list_pane_position(0, 80, 400), 40)
+
+    def test_the_window_panes_can_shrink(self):
         from pathlib import Path
 
         text = Path("nomad_turbo/window.py").read_text(encoding="utf-8")
-        self.assertNotIn("gtk.Paned", text)
-        self.assertIn("log_header.pack_start(log_head", text)
-        handle = text.index("log_body.pack_start(self._build_log_handle()")
-        scroll = text.index("log_body.pack_start(log_scroll")
-        self.assertLess(handle, scroll)
+        self.assertIn("set_resizable(True)", text)
+        self.assertIn("gtk.Paned", text)
+        self.assertNotIn("set_size_request(-1, self._log_height)", text)
+        self.assertLess(text.index("top.pack_start(log_header"), text.index("pack2(log_scroll"))
+        self.assertIn("self.index_pane", text)
+        self.assertIn("self.repair_pane", text)
+        self.assertIn("set_min_content_height(48)", text)
+        self.assertIn("pack1(scrolled, True, False)", text)
+        self.assertIn("pack1(top, True, False)", text)
+        self.assertIn("pack2(log_scroll, False, True)", text)
+        self.assertIn("https://github.com/Crosstalk-Solutions/project-nomad", text)
 
     def test_the_pane_reads_only_lines_it_has_not_shown(self):
         memory = _MemoryLog()

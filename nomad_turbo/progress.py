@@ -32,31 +32,54 @@ def format_eta(seconds: float | None) -> str:
 # The pane shows this many lines. The file keeps the whole session.
 LOG_PANE_LINES = 4000
 
-# Pixel height of the log text. The drag bar under the Log row sets this.
-# Older builds stored a window split in the same setting. A split taken from
-# the top of the window is outside this range and falls back to the default.
+# A saved log size in this range is the log text height from the fixed drag bar.
+# Larger values are a split measured from the top of the window.
 LOG_HEIGHT_MIN = 120
 LOG_HEIGHT_MAX = 720
 LOG_HEIGHT_DEFAULT = 220
 
 
-def saved_log_height(saved: int) -> int:
-    """Log text height. 0 and an old window-split position use the default."""
+def initial_log_split(saved: int, pane_height: int) -> int:
+    """Height of the area above the log bar.
+
+    The window itself stays resizable. This only places the bar inside it.
+    """
+    height = int(pane_height or 0)
+    if height < 160:
+        return max(0, height // 2)
     value = int(saved or 0)
     if LOG_HEIGHT_MIN <= value <= LOG_HEIGHT_MAX:
-        return value
-    return LOG_HEIGHT_DEFAULT
+        top = height - value - 16
+    elif value > 80:
+        top = value
+    else:
+        top = height - LOG_HEIGHT_DEFAULT - 16
+    return max(80, min(top, height - 80))
 
 
-def next_log_height(start: int, upward: int, *, room: int) -> int:
-    """Height after a drag. `upward` is how far the pointer moved up, in pixels."""
-    ceiling = min(LOG_HEIGHT_MAX, max(LOG_HEIGHT_MIN, int(room)))
-    grown = int(start) + int(upward)
-    if grown < LOG_HEIGHT_MIN:
-        return LOG_HEIGHT_MIN
-    if grown > ceiling:
-        return ceiling
-    return grown
+def restored_log_top(saved_height: int, saved_top: int, pane_height: int) -> int:
+    """Height of the area above the log bar, including a dragged split.
+
+    saved_top is the position from a drag. When it is unset, saved_height is
+    the older log-text height.
+    """
+    height = int(pane_height or 0)
+    top = int(saved_top or 0)
+    if top > 80 and height >= 160:
+        return max(80, min(top, height - 80))
+    return initial_log_split(saved_height, height)
+
+
+def list_pane_position(saved: int, pane_height: int, controls_height: int) -> int:
+    """Height of the file list. 0 leaves the spare space with the list."""
+    height = int(pane_height or 0)
+    if height < 96:
+        return max(0, height // 2)
+    chosen = int(saved or 0)
+    if chosen <= 0:
+        controls = max(48, int(controls_height or 0))
+        chosen = height - controls - 16
+    return max(48, min(chosen, height - 48))
 
 
 def log_lines_to_drop(line_count: int, limit: int = LOG_PANE_LINES) -> int:

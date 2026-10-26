@@ -48,6 +48,11 @@ class Install:
     # Saved column widths, keyed by "index:File" or "repair:Points". 0 means unset.
     column_widths: dict | None = None
     log_pane: int = 0
+    # Dragged height of the area above the log bar. 0 keeps the older log_pane height.
+    log_split: int = 0
+    # File-list height on each page. 0 leaves the spare space with the list.
+    index_pane: int = 0
+    repair_pane: int = 0
     # 10–110 slider. None means "use reserve_ratio", which is at most 100.
     # 110 is an overclock and is never the default for a new install.
     boost_percent: int | None = None
@@ -226,6 +231,9 @@ def load_install() -> Install:
         "log_follow",
         "column_widths",
         "log_pane",
+        "log_split",
+        "index_pane",
+        "repair_pane",
         "per_slot_mib",
         "max_slots",
         "slots",

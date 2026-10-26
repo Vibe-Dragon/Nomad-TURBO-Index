@@ -21,13 +21,12 @@ from nomad_turbo.progress import (
     format_current_file,
     format_run_stats,
     LOG_PANE_LINES,
+    list_pane_position,
+    restored_log_top,
     log_line_visible,
     log_lines_to_drop,
     log_should_stick,
-    LOG_HEIGHT_MAX,
-    next_log_height,
     preferred_column_width,
-    saved_log_height,
     usage_text,
 )
 from nomad_turbo.qdrant_status import changes_allowed
@@ -46,6 +45,9 @@ from nomad_turbo.slots import (
 from nomad_turbo.tips import TIPS
 
 log = logging.getLogger("nomad_turbo")
+
+# People who open this window can reach the project Turbo is built for.
+PROJECT_URL = "https://github.com/Crosstalk-Solutions/project-nomad"
 
 
 def window_close_action(indexing: bool) -> str:
@@ -196,9 +198,9 @@ class _Window:
         self._column_width: dict[str, int] = {}
         self._fit_meta: list[tuple] = []
         self._sizing = False
-        self._log_height = saved_log_height(int(getattr(install, "log_pane", 0) or 0))
-        self._log_drag = None
-        self._log_handle_hot = False
+        self._pane_lock = False
+        self._log_split_ready = False
+        self._pane_styled = False
         self.layout_timer = None
         self.scanning = False
         self.rows_ready = False
@@ -218,7 +220,10 @@ class _Window:
         self._tray_status_enum = None
 
         window = gtk.Window(title="Nomad TURBO Index")
+        window.set_resizable(True)
         window.set_default_size(1180, 820)
+        # A small floor. Portion minimums stay small so this does not pin the window.
+        window.set_size_request(480, 280)
         window.set_position(gtk.WindowPosition.CENTER)
         try:
             window.set_wmclass("nomad-turbo", "nomad-turbo")
@@ -243,7 +248,14 @@ class _Window:
         switcher = gtk.StackSwitcher()
         switcher.set_stack(self.stack)
         switcher.set_halign(gtk.Align.START)
-        root.pack_start(switcher, False, False, 0)
+        header = gtk.Box(orientation=gtk.Orientation.HORIZONTAL, spacing=8)
+        header.set_hexpand(True)
+        header.pack_start(switcher, False, False, 0)
+        project = gtk.LinkButton.new_with_label(PROJECT_URL, "Project NOMAD")
+        project.set_halign(gtk.Align.END)
+        project.set_tooltip_text(TIPS["project"])
+        header.pack_end(project, False, False, 0)
+        root.pack_start(header, False, False, 0)
         index = gtk.Box(orientation=gtk.Orientation.VERTICAL, spacing=8)
         index.set_vexpand(True)
         self.stack.add_titled(index, "index", "Index")
@@ -366,38 +378,39 @@ class _Window:
         scrolled = gtk.ScrolledWindow()
         scrolled.set_policy(gtk.PolicyType.AUTOMATIC, gtk.PolicyType.AUTOMATIC)
         scrolled.add(tree)
-        scrolled.set_min_content_height(220)
-        index.pack_start(scrolled, True, True, 0)
+        scrolled.set_min_content_height(48)
+        scrolled.set_vexpand(True)
         self.file_tree = tree
+        lower = gtk.Box(orientation=gtk.Orientation.VERTICAL, spacing=8)
 
-        legend = gtk.Label(label="Blue names are ZIM files. Amber names are files you uploaded. Drag a column edge to resize it. Click a heading to sort.")
+        legend = gtk.Label(label="Blue names are ZIM files. Amber names are files you uploaded. Drag a column edge to resize it. Drag a bar to resize the list, the controls, or the log. Click a heading to sort.")
         legend.set_xalign(0)
         legend.set_line_wrap(True)
-        index.pack_start(legend, False, False, 0)
+        lower.pack_start(legend, False, False, 0)
 
         self.current_label = gtk.Label(label="No file is indexing.")
         self.current_label.set_xalign(0)
         self.current_label.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
         self.current_label.set_tooltip_text(TIPS["file_now"])
-        index.pack_start(self.current_label, False, False, 0)
+        lower.pack_start(self.current_label, False, False, 0)
         self.current_bar = gtk.ProgressBar()
         self.current_bar.set_show_text(True)
         self.current_bar.set_text("Idle")
         self.current_bar.set_tooltip_text(TIPS["file_bar"])
-        index.pack_start(self.current_bar, False, False, 0)
+        lower.pack_start(self.current_bar, False, False, 0)
 
         self.overall = gtk.ProgressBar()
         self.overall.set_show_text(True)
         self.overall.set_text("Scanning…")
         self.overall.set_tooltip_text(TIPS["library_bar"])
-        index.pack_start(self.overall, False, False, 0)
+        lower.pack_start(self.overall, False, False, 0)
 
         self.stats = gtk.Label(label="")
         self.stats.set_xalign(0)
         self.stats.set_line_wrap(True)
         self.stats.set_selectable(True)
         self.stats.set_tooltip_text(TIPS["stats"])
-        index.pack_start(self.stats, False, False, 0)
+        lower.pack_start(self.stats, False, False, 0)
 
         gpu = gtk.Box(orientation=gtk.Orientation.VERTICAL, spacing=4)
         slider_row = gtk.Box(orientation=gtk.Orientation.HORIZONTAL, spacing=8)
@@ -433,7 +446,7 @@ class _Window:
         self.keep_check.set_tooltip_text(TIPS["keep"])
         self.keep_check.connect("toggled", self.on_keep)
         gpu.pack_start(self.keep_check, False, False, 0)
-        index.pack_start(gpu, False, False, 0)
+        lower.pack_start(gpu, False, False, 0)
 
         buttons = gtk.Box(orientation=gtk.Orientation.HORIZONTAL, spacing=8)
         self.start_button = gtk.Button(label="Start indexing")
@@ -457,7 +470,14 @@ class _Window:
         for button in (self.start_button, self.stop_button, self.rescan_button, self.export_button):
             buttons.pack_start(button, False, False, 0)
         buttons.pack_end(self.delete_button, False, False, 0)
-        index.pack_start(buttons, False, False, 0)
+        lower.pack_start(buttons, False, False, 0)
+        self.index_pane = self._make_pane()
+        # The list takes extra space and keeps a small floor. The controls keep
+        # the height from their drag bar and can shrink so the window can too.
+        self.index_pane.pack1(scrolled, True, False)
+        self.index_pane.pack2(self._portion(lower), False, True)
+        self._track_pane(self.index_pane, "index_pane")
+        index.pack_start(self.index_pane, True, True, 0)
         self._build_repair_page(headed)
 
         log_head = gtk.Box(orientation=gtk.Orientation.HORIZONTAL, spacing=8)
@@ -482,9 +502,9 @@ class _Window:
         log_head.pack_start(self.debug_check, False, False, 0)
         log_head.pack_start(self.follow_check, False, False, 0)
         self.log_filters = log_head
-        # The Log row is the dropdown. The drag bar is the next row, on the
-        # top edge of the log. Filters stay on the Log row so a click there
-        # does not open or close the log.
+        # The Log row is the last thing above the split, so the bar sits under it.
+        # The log text is the other side. Neither side sets a tall size request,
+        # so the window edges stay free.
         log_open = bool(getattr(install, "log_open", True))
         self.log_arrow = gtk.Image.new_from_icon_name(
             "pan-down-symbolic" if log_open else "pan-end-symbolic",
@@ -513,24 +533,26 @@ class _Window:
         self.log_buffer = self.log_view.get_buffer()
         log_scroll = gtk.ScrolledWindow()
         log_scroll.set_policy(gtk.PolicyType.AUTOMATIC, gtk.PolicyType.AUTOMATIC)
-        log_scroll.set_min_content_height(self._log_height)
-        log_scroll.set_size_request(-1, self._log_height)
-        log_scroll.set_vexpand(False)
+        log_scroll.set_min_content_height(48)
+        log_scroll.set_vexpand(True)
         log_scroll.add(self.log_view)
         self.log_scroll = log_scroll
-        log_body = gtk.Box(orientation=gtk.Orientation.VERTICAL, spacing=4)
-        log_body.pack_start(self._build_log_handle(), False, False, 0)
-        log_body.pack_start(log_scroll, False, False, 0)
-        self.log_body = log_body
         self.log_filters.set_no_show_all(not log_open)
         self.log_filters.set_visible(log_open)
-        log_body.set_no_show_all(not log_open)
-        log_body.set_visible(log_open)
+        log_scroll.set_no_show_all(not log_open)
+        log_scroll.set_visible(log_open)
         self.stack.set_vexpand(True)
-        root.pack_start(self.stack, True, True, 0)
-        root.pack_start(self.qdrant_label, False, False, 0)
-        root.pack_start(log_header, False, False, 0)
-        root.pack_start(log_body, False, False, 0)
+        top = gtk.Box(orientation=gtk.Orientation.VERTICAL, spacing=8)
+        top.pack_start(self.stack, True, True, 0)
+        top.pack_start(self.qdrant_label, False, False, 0)
+        top.pack_start(log_header, False, False, 0)
+        self.content_pane = self._make_pane()
+        # Extra window height goes to the pages. The log keeps its dragged size
+        # until the pages are at their floor, and the log itself can still shrink.
+        self.content_pane.pack1(top, True, False)
+        self.content_pane.pack2(log_scroll, False, True)
+        self._track_log_pane(self.content_pane)
+        root.pack_start(self.content_pane, True, True, 0)
         self._build_tray()
         self.refresh_usage()
 
@@ -828,148 +850,126 @@ class _Window:
             log.exception("could not save the window layout")
         return False
 
-    def _build_log_handle(self):
-        """Visible bar under the Log row. Dragging it changes the log height."""
-        gtk = self.gtk
-        from gi.repository import Gdk
-
-        handle = gtk.EventBox()
-        handle.set_size_request(-1, 16)
-        handle.set_hexpand(True)
-        handle.set_tooltip_text(TIPS["log"])
-        area = gtk.DrawingArea()
-        area.set_size_request(-1, 16)
-        area.set_hexpand(True)
-        area.connect("draw", self._draw_log_handle)
-        handle.add(area)
-        handle.add_events(
-            Gdk.EventMask.BUTTON_PRESS_MASK
-            | Gdk.EventMask.BUTTON_RELEASE_MASK
-            | Gdk.EventMask.POINTER_MOTION_MASK
-            | Gdk.EventMask.ENTER_NOTIFY_MASK
-            | Gdk.EventMask.LEAVE_NOTIFY_MASK
+    def _style_panes(self) -> None:
+        if self._pane_styled:
+            return
+        self._pane_styled = True
+        provider = self.gtk.CssProvider()
+        provider.load_from_data(
+            b"""
+            paned separator {
+                background-color: alpha(@theme_fg_color, 0.45);
+                background-image: none;
+                border: none;
+                min-height: 14px;
+                min-width: 14px;
+            }
+            paned separator:hover,
+            paned separator:active {
+                background-color: alpha(@theme_fg_color, 0.85);
+            }
+            """
         )
-        handle.connect("button-press-event", self._on_log_handle_press)
-        handle.connect("button-release-event", self._on_log_handle_release)
-        handle.connect("motion-notify-event", self._on_log_handle_motion)
-        handle.connect("enter-notify-event", self._on_log_handle_enter)
-        handle.connect("leave-notify-event", self._on_log_handle_leave)
-        self.log_handle = handle
-        self.log_handle_area = area
-        return handle
-
-    def _draw_log_handle(self, widget, cr) -> bool:
-        width = widget.get_allocated_width()
-        height = widget.get_allocated_height()
-        if width <= 0 or height <= 0:
-            return False
-        style = widget.get_style_context()
-        fg = style.get_color(style.get_state())
-        hot = self._log_handle_hot
-        # Filled strip so the drag target stays visible on a flat theme.
-        cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.22 if hot else 0.12)
-        cr.rectangle(0, 0, width, height)
-        cr.fill()
-        cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.75 if hot else 0.45)
-        cr.set_line_width(2)
-        mid = height / 2.0
-        cr.move_to(8, mid)
-        cr.line_to(max(8, width - 8), mid)
-        cr.stroke()
-        cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.95 if hot else 0.8)
-        for offset in (-18, 0, 18):
-            cr.rectangle((width / 2) + offset - 2, 3, 4, max(1, height - 6))
-            cr.fill()
-        return True
-
-    def _on_log_handle_enter(self, widget, _event) -> bool:
-        self._log_handle_hot = True
-        self._set_log_handle_cursor(widget, "ns-resize")
-        self.log_handle_area.queue_draw()
-        return False
-
-    def _on_log_handle_leave(self, widget, _event) -> bool:
-        if self._log_drag is None:
-            self._log_handle_hot = False
-            self._set_log_handle_cursor(widget, None)
-            self.log_handle_area.queue_draw()
-        return False
-
-    def _set_log_handle_cursor(self, widget, name: str | None) -> None:
-        window = widget.get_window()
-        if window is None:
-            return
         from gi.repository import Gdk
 
-        if not name:
-            window.set_cursor(None)
+        screen = Gdk.Screen.get_default()
+        if screen is None:
             return
-        display = widget.get_display()
-        cursor = Gdk.Cursor.new_from_name(display, name)
-        if cursor is None:
-            cursor = Gdk.Cursor.new_for_display(display, Gdk.CursorType.SB_V_DOUBLE_ARROW)
-        window.set_cursor(cursor)
+        self.gtk.StyleContext.add_provider_for_screen(
+            screen,
+            provider,
+            self.gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+        )
 
-    def _on_log_handle_press(self, widget, event) -> bool:
-        if getattr(event, "button", 1) != 1:
-            return False
-        self._log_drag = (float(event.y_root), int(self._log_height))
-        self._log_handle_hot = True
-        window = widget.get_window()
-        device = event.get_device() if hasattr(event, "get_device") else None
-        if window is not None and device is not None:
-            from gi.repository import Gdk
+    def _make_pane(self):
+        """A tall, visible split. Both sides can shrink so the window can too."""
+        self._style_panes()
+        pane = self.gtk.Paned(orientation=self.gtk.Orientation.VERTICAL)
+        pane.set_wide_handle(True)
+        pane.set_vexpand(True)
+        return pane
 
+    def _portion(self, child):
+        """Scroll the controls when a split is dragged smaller than their text."""
+        scrolled = self.gtk.ScrolledWindow()
+        scrolled.set_policy(self.gtk.PolicyType.AUTOMATIC, self.gtk.PolicyType.AUTOMATIC)
+        scrolled.set_min_content_height(48)
+        scrolled.set_propagate_natural_height(True)
+        scrolled.set_vexpand(True)
+        scrolled.add(child)
+        return scrolled
+
+    def _mark_pane_drag(self, pane, event) -> bool:
+        # A window resize also moves the bar. Only a drag on the bar is saved.
+        if getattr(event, "button", 1) == 1:
+            pane._user_drag = True
+        return False
+
+    def _track_pane(self, pane, key: str) -> None:
+        saved = int(getattr(self.install, key, 0) or 0)
+
+        def on_size(_widget, allocation) -> None:
+            if allocation.height < 80 or getattr(pane, "_split_ready", False):
+                return
+            pane._split_ready = True
+            controls = 0
+            child = pane.get_child2()
+            if saved <= 0 and child is not None:
+                _minimum, controls = child.get_preferred_height()
+            self._pane_lock = True
             try:
-                device.grab(
-                    window,
-                    Gdk.GrabOwnership.APPLICATION,
-                    False,
-                    Gdk.EventMask.POINTER_MOTION_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK,
-                    None,
-                    event.time,
-                )
-            except Exception:
-                log.debug("log resize grab failed", exc_info=True)
-        return True
+                pane.set_position(list_pane_position(saved, allocation.height, controls))
+            finally:
+                self._pane_lock = False
 
-    def _on_log_handle_motion(self, _widget, event) -> bool:
-        if self._log_drag is None:
-            return False
-        y0, start = self._log_drag
-        upward = int(round(y0 - float(event.y_root)))
-        self._set_log_height(next_log_height(start, upward, room=self._log_room()))
-        return True
+        def on_position(widget, _pspec) -> None:
+            if self._pane_lock or not getattr(widget, "_user_drag", False):
+                return
+            position = int(widget.get_position())
+            if position < 48:
+                return
+            setattr(self.install, key, position)
+            self._save_layout_soon()
 
-    def _on_log_handle_release(self, widget, event) -> bool:
-        if self._log_drag is None:
-            return False
-        self._log_drag = None
-        self._log_handle_hot = False
-        self._set_log_handle_cursor(widget, None)
-        self.log_handle_area.queue_draw()
-        device = event.get_device() if hasattr(event, "get_device") else None
-        if device is not None:
-            try:
-                device.ungrab(event.time)
-            except Exception:
-                log.debug("log resize ungrab failed", exc_info=True)
-        self.install.log_pane = self._log_height
-        self._save_layout_soon()
-        return True
+        pane.connect("size-allocate", on_size)
+        pane.connect("button-press-event", self._mark_pane_drag)
+        pane.connect("notify::position", on_position)
 
-    def _log_room(self) -> int:
-        """Most of the window can become log. Leave the file list some space."""
-        total = int(self.window.get_allocated_height() or 0)
-        if total < 400:
-            return LOG_HEIGHT_MAX
-        return max(120, total - 320)
+    def _place_log_split(self, pane, height: int) -> None:
+        if height < 160 or not self.log_open_button.get_active():
+            return
+        position = restored_log_top(
+            int(getattr(self.install, "log_pane", 0) or 0),
+            int(getattr(self.install, "log_split", 0) or 0),
+            height,
+        )
+        self._pane_lock = True
+        try:
+            pane.set_position(position)
+        finally:
+            self._pane_lock = False
 
-    def _set_log_height(self, height: int) -> None:
-        height = int(height)
-        self._log_height = height
-        self.log_scroll.set_min_content_height(height)
-        self.log_scroll.set_size_request(-1, height)
+    def _track_log_pane(self, pane) -> None:
+        def on_size(_widget, allocation) -> None:
+            if self._log_split_ready or allocation.height < 160:
+                return
+            self._log_split_ready = True
+            self._place_log_split(pane, allocation.height)
+
+        def on_position(widget, _pspec) -> None:
+            if self._pane_lock or not getattr(widget, "_user_drag", False):
+                return
+            if not self.log_open_button.get_active():
+                return
+            position = int(widget.get_position())
+            if position < 80:
+                return
+            self.install.log_split = position
+            self._save_layout_soon()
+
+        pane.connect("size-allocate", on_size)
+        pane.connect("button-press-event", self._mark_pane_drag)
+        pane.connect("notify::position", on_position)
 
     def on_follow(self, button) -> None:
         following = bool(button.get_active())
@@ -996,8 +996,10 @@ class _Window:
         self.install.log_open = expanded
         self.log_filters.set_no_show_all(not expanded)
         self.log_filters.set_visible(expanded)
-        self.log_body.set_no_show_all(not expanded)
-        self.log_body.set_visible(expanded)
+        self.log_scroll.set_no_show_all(not expanded)
+        self.log_scroll.set_visible(expanded)
+        if expanded and self._log_split_ready:
+            self._place_log_split(self.content_pane, int(self.content_pane.get_allocated_height() or 0))
         try:
             save_install(self.install)
         except Exception:
@@ -1616,26 +1618,27 @@ class _Window:
         scrolled = gtk.ScrolledWindow()
         scrolled.set_policy(gtk.PolicyType.AUTOMATIC, gtk.PolicyType.AUTOMATIC)
         scrolled.add(tree)
-        scrolled.set_min_content_height(220)
-        page.pack_start(scrolled, True, True, 0)
+        scrolled.set_min_content_height(48)
+        scrolled.set_vexpand(True)
         self.repair_tree = tree
+        lower = gtk.Box(orientation=gtk.Orientation.VERTICAL, spacing=8)
 
         self.repair_current_label = gtk.Label(label="No file is being repaired.")
         self.repair_current_label.set_xalign(0)
         self.repair_current_label.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
         self.repair_current_label.set_tooltip_text(TIPS["repair_file_now"])
-        page.pack_start(self.repair_current_label, False, False, 0)
+        lower.pack_start(self.repair_current_label, False, False, 0)
         self.repair_current_bar = gtk.ProgressBar()
         self.repair_current_bar.set_show_text(True)
         self.repair_current_bar.set_text("Idle")
         self.repair_current_bar.set_tooltip_text(TIPS["repair_file_bar"])
-        page.pack_start(self.repair_current_bar, False, False, 0)
+        lower.pack_start(self.repair_current_bar, False, False, 0)
 
         self.repair_overall = gtk.ProgressBar()
         self.repair_overall.set_show_text(True)
         self.repair_overall.set_text("Idle")
         self.repair_overall.set_tooltip_text(TIPS["repair_overall_bar"])
-        page.pack_start(self.repair_overall, False, False, 0)
+        lower.pack_start(self.repair_overall, False, False, 0)
 
         self.repair_stats = gtk.Label(label="Press Scan to check the index without changing it.")
         self.repair_stats.set_xalign(0)
@@ -1644,13 +1647,13 @@ class _Window:
         self.repair_stats.set_selectable(True)
         self.repair_stats.override_font(Pango.FontDescription("Monospace"))
         self.repair_stats.set_tooltip_text(TIPS["repair_stats"])
-        page.pack_start(self.repair_stats, False, False, 0)
+        lower.pack_start(self.repair_stats, False, False, 0)
 
         self.repair_specs = gtk.Label(label="Each row's spec is kept up to date while that file is repaired. Hover a row to read it.")
         self.repair_specs.set_xalign(0)
         self.repair_specs.set_line_wrap(True)
         self.repair_specs.set_selectable(True)
-        page.pack_start(self.repair_specs, False, False, 0)
+        lower.pack_start(self.repair_specs, False, False, 0)
 
         buttons = gtk.Box(orientation=gtk.Orientation.HORIZONTAL, spacing=8)
         self.repair_scan = gtk.Button(label="Scan")
@@ -1668,7 +1671,7 @@ class _Window:
         buttons.pack_start(self.repair_scan, False, False, 0)
         buttons.pack_start(self.repair_start, False, False, 0)
         buttons.pack_start(self.repair_stop_button, False, False, 0)
-        page.pack_start(buttons, False, False, 0)
+        lower.pack_start(buttons, False, False, 0)
 
         hint = gtk.Label(
             label=(
@@ -1681,7 +1684,12 @@ class _Window:
         )
         hint.set_xalign(0)
         hint.set_line_wrap(True)
-        page.pack_start(hint, False, False, 0)
+        lower.pack_start(hint, False, False, 0)
+        self.repair_pane = self._make_pane()
+        self.repair_pane.pack1(scrolled, True, False)
+        self.repair_pane.pack2(self._portion(lower), False, True)
+        self._track_pane(self.repair_pane, "repair_pane")
+        page.pack_start(self.repair_pane, True, True, 0)
         self.stack.add_titled(page, "repair", "Repair")
 
     def _gate_tip(self, button, normal: str) -> None:

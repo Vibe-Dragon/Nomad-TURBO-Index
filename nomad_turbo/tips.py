@@ -74,8 +74,12 @@ TIPS: dict[str, str] = {
         "Off keeps the page where it is while new lines arrive."
     ),
     "log": (
-        "Show or hide the log. The bar directly under this row resizes the log. "
-        "Drag it up for more log, or down for more of the file list. Both choices are remembered."
+        "Show or hide the log. The bar under this row sizes the log inside the window. "
+        "Each page has its own bar between the file list and the controls. "
+        "The window edges resize the whole window. Those positions are remembered."
+    ),
+    "project": (
+        "Open the Project NOMAD repository. Turbo is a side tool for that project."
     ),
     "repair_quick": (
         "Compare files on disk with ingest rows and checkpoints. "
