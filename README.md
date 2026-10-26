@@ -7,6 +7,7 @@ Nomad TURBO Index speeds up a stock Project NOMAD knowledge base from outside th
 - Turbo runs outside the admin container and does not patch it.
 - Turbo uses its own embed server and larger calls instead of stock's small embed jobs.
 - Turbo keeps the meat of a long HTML page and chunks it instead of cutting the page short.
+- Turbo resumes a ZIM from the article it stopped on. It does not count from the first article on every batch.
 - Turbo leaves out navigation, scripts, and similar chrome.
 - Turbo reads upload PDFs and pictures itself.
 - Turbo pauses only file embedding and restores the ingest policy found at start.
@@ -91,6 +92,42 @@ const SKIP_CLASS = new Set([
 ```
 
 Sections whose heading is "References", "See also", "External links", and the same kind of footer are left out too. The body of the article is not.
+
+## Turbo resumes a ZIM from the saved article instead of counting from the first article on every batch
+
+Stock NOMAD stores how many articles it has finished. The next batch opens the ZIM, starts at the first article, and counts forward until it reaches that number. The batch after that opens the file and counts from the first article again.
+
+Turbo stores the path of the last article it checkpointed. One reader opens the ZIM and walks forward until it reaches that path. Articles it passes are not parsed. The file stays open, and later embed calls continue with the next article. They do not go back to the start and count up to the saved number.
+
+This build of libzim can look up one path, and that lookup returns only that entry, not the rest of the file. The reader cannot jump to the saved article and then iterate the tail. It walks forward once, when the reader opens the file, and then stays there. A checkpoint that has no path still uses the article count.
+
+```javascript
+function* entries(archive, afterPath) {
+  // findByPath in this libzim build returns only that entry, not the tail.
+  // One forward walk reaches the checkpoint. The archive then stays open.
+  let skipping = Boolean(afterPath);
+  for (const entry of archive.iterByPath()) {
+    if (skipping) {
+      if (entry.path === afterPath) skipping = false;
+      continue;
+    }
+    yield entry;
+  }
+```
+
+When the checkpoint has a path, the count skip is left at 0 and the path is what the reader uses:
+
+```python
+    proc = start_extract(
+        install,
+        str(work.host),
+        0 if work.path else work.articles,
+        work.path,
+        work.articles,
+    )
+```
+
+A crash resumes after the last article that was checkpointed. The checkpoint is kept.
 
 ## Turbo reads upload PDFs and pictures itself
 
@@ -208,7 +245,7 @@ Turbo could not read that file, so it is not queued. The file stays on disk.
 
 ### What does Repair delete?
 
-**Scan** changes nothing. **Quick repair** and **Complete repair** remove points for library files that are already gone. Points for a file that is still on disk stay. Repair does not embed files again.
+**Scan** changes nothing. It does not pause embedding. **Start repair** pauses file embedding, then deletes points only for ZIM and upload files that are already gone. It also removes that file's ingest row, checkpoint, and leftover embed jobs. Points for a file that is still on disk stay. A count that does not match is reported and left in place. Repair does not embed files again, and it does not wipe the whole index. The Repair section describes the page.
 
 ### Is there a license?
 
@@ -232,15 +269,41 @@ The script writes `dist/nomad-turbo_<version>_all.deb`. It does not install the 
 
 Click the icon. The window scans the library. Opening it does not start or stop indexing.
 
-**Start indexing** pauses NOMAD's file embedding and continues from the saved place. **Rescan** reads the library again. It does not pause NOMAD or start indexing. **Stop** finishes the embed call already running. It does not delete the index. When the run started on Manual, unfinished files are not handed back to stock NOMAD. **Delete index** sits at the right end of the button row. You must type DELETE. Indexing does not start. ZIM files and uploads stay.
+**Start indexing** pauses NOMAD's file embedding and continues from the saved article. The reader opens the ZIM once, walks to that article, and keeps going from there. **Rescan** reads the library again. It does not pause NOMAD or start indexing. **Stop** finishes the embed call already running. It does not delete the index. When the run started on Manual, unfinished files are not handed back to stock NOMAD. **Delete index** sits at the right end of the button row. You must type DELETE. Indexing does not start. ZIM files and uploads stay.
 
 The **Embed batch** slider is the boost. The line under it shows the chunk count that setting will send. Hover any button, checkbox, column heading, progress bar, or that line for what it does.
 
 **Stay on after the last file** keeps Turbo in control when the queue is empty, so files that arrive later are indexed by Turbo. Off, which is the default, Turbo stops and the ingest policy returns to the value found at Start. When the run started on Manual, stock NOMAD does not start embedding.
 
-The **Repair** tab checks the index. **Scan** changes nothing: it does not pause embedding or delete points. **Quick repair** and **Complete repair** remove points for library files that are gone. Points for a file that is still on disk stay. Repair does not embed files again.
-
 Closing the window while a run is going hides it to the tray. The tray icon is the plain logo when idle, the logo on fire while indexing, and blue while a repair is running. Clicking the desktop icon brings the window back. It does not start or stop the run.
+
+## Repair
+
+Repair is the second page. It does not embed files, and it does not wipe the collection. It finds index entries whose library file is gone, and **Start repair** can delete those entries. **Delete index** is the other button, on the Index page, and it asks you to type DELETE.
+
+**Quick repair** and **Complete repair** are the two modes. Both **Scan** and **Start repair** use the mode that is selected.
+
+**Scan** only reads. It does not pause NOMAD, does not change the ingest policy, and does not delete points. Quick compares the files on disk with ingest rows and checkpoints. Complete also asks Qdrant to list every `source` in the collection, when the collection is answering. If it is not answering, the scan still compares files, rows, and checkpoints, and it says the source list did not return. Stop is checked between those steps. The source list itself runs until Qdrant answers.
+
+The list has File, Problem, Points, Progress, Status, and Elapsed. A scan marks a missing library file **Would delete** and a file that is still on disk **Report only**. Hover a row for its path and the detail. The line under the bars counts the library, ingest rows, checkpoints, and, on a complete scan, the sources Qdrant listed.
+
+**Start repair** is what changes the index. It remembers the ingest policy, sets Manual, pauses `file-embeddings`, and waits until that queue has no active job. The tray icon turns blue. The desktop icon does not change. It then repairs one file at a time.
+
+What a repair deletes:
+
+- Points for a ZIM or an upload that is no longer on disk.
+- That file's ingest row, Turbo checkpoint, and leftover NOMAD embed jobs.
+- On a complete repair, orphan points whose `source` is a library path that is gone, even when the only trace was the index itself.
+
+What a repair leaves in place:
+
+- Points for a file that is still on disk. A point count that does not match the ingest row is reported, not deleted.
+- A file that has points and no ingest row.
+- An ingest row that says indexed when the source list has no points for it.
+- Points stored outside `zim/` and `kb_uploads/`. NOMAD's own docs live outside those folders, so they stay.
+- An unfinished file whose point count disagrees with its checkpoint. Deleting those points would throw away the progress the checkpoint is holding.
+
+Stop works between files, or between scan steps. A delete that was already sent runs until the index finishes it. Stop does not wipe the collection. If a delete does not return, the embed queue stays paused so a second delete is not started on top of it. Start repair again when the index is idle. While a download is in progress, or the disk is busy, repair waits instead of deleting. Closing the window during a repair hides it to the tray. The run keeps going.
 
 ## Stock contract
 

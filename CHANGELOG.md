@@ -9,6 +9,7 @@
 - The drag bars are a thin strip. The Qdrant status sits under the page switch, away from the log bar.
 - Column edges still resize. Those positions are remembered.
 - The main window links to the Project NOMAD repository.
+- The README describes the Repair page, and how a ZIM resumes from the saved article instead of counting from the first article on every batch.
 
 ## 1.0.0
 
