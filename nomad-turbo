@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Launcher. The desktop shortcut calls this.
+set -euo pipefail
+ROOT="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+export PYTHONPATH="${ROOT}${PYTHONPATH:+:$PYTHONPATH}"
+exec python3 -m nomad_turbo "$@"

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Nomad TURBO Index
+Comment=Open the indexing window. This icon does not start or stop indexing.
+Exec=/usr/bin/nomad-turbo toggle
+Icon=nomad-turbo
+Terminal=false
+StartupNotify=false
+StartupWMClass=nomad-turbo
+Categories=Education;
