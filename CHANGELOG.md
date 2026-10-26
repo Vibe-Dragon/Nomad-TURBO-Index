@@ -6,6 +6,7 @@
 - Shrinking the window keeps a file list on screen. Extra space goes to the list. The log and the controls keep the size set by their drag bar.
 - Index and Repair each have a drag bar between the file list and the controls under it.
 - The log drag bar sits under the Log row and sizes the log inside the window.
+- The drag bars are a thin strip. The Qdrant status sits under the page switch, away from the log bar.
 - Column edges still resize. Those positions are remembered.
 - The main window links to the Project NOMAD repository.
 

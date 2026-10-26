@@ -256,6 +256,8 @@ class _Window:
         project.set_tooltip_text(TIPS["project"])
         header.pack_end(project, False, False, 0)
         root.pack_start(header, False, False, 0)
+        # Above the pages, not in the log split, so this line does not ride the log bar.
+        root.pack_start(self.qdrant_label, False, False, 0)
         index = gtk.Box(orientation=gtk.Orientation.VERTICAL, spacing=8)
         index.set_vexpand(True)
         self.stack.add_titled(index, "index", "Index")
@@ -544,7 +546,6 @@ class _Window:
         self.stack.set_vexpand(True)
         top = gtk.Box(orientation=gtk.Orientation.VERTICAL, spacing=8)
         top.pack_start(self.stack, True, True, 0)
-        top.pack_start(self.qdrant_label, False, False, 0)
         top.pack_start(log_header, False, False, 0)
         self.content_pane = self._make_pane()
         # Extra window height goes to the pages. The log keeps its dragged size
@@ -857,15 +858,20 @@ class _Window:
         provider = self.gtk.CssProvider()
         provider.load_from_data(
             b"""
-            paned separator {
-                background-color: alpha(@theme_fg_color, 0.45);
+            paned separator,
+            paned separator.wide {
+                background-color: alpha(@theme_fg_color, 0.55);
                 background-image: none;
                 border: none;
-                min-height: 14px;
-                min-width: 14px;
+                margin: 0;
+                padding: 0;
+                min-height: 6px;
+                min-width: 6px;
             }
             paned separator:hover,
-            paned separator:active {
+            paned separator:active,
+            paned separator.wide:hover,
+            paned separator.wide:active {
                 background-color: alpha(@theme_fg_color, 0.85);
             }
             """
