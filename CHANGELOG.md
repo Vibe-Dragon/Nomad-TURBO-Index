@@ -10,6 +10,7 @@
 - Column edges still resize. Those positions are remembered.
 - The main window links to the Project NOMAD repository.
 - The README describes the Repair page, and how a ZIM resumes from the saved article instead of counting from the first article on every batch.
+- The README names Project NOMAD 1.35.1 as the tested version, and describes the Index page, the log, the commands, and the Qdrant and embed-server errors.
 
 ## 1.0.0
 

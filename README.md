@@ -1,6 +1,6 @@
 # NOMAD Turbo
 
-Nomad TURBO Index speeds up a stock Project NOMAD knowledge base from outside the admin container. It detects the machine it is on and sizes one embed call from that hardware.
+Nomad TURBO Index speeds up a stock Project NOMAD knowledge base from outside the admin container. It detects the machine it is on and sizes one embed call from that hardware. This copy was tested with Project NOMAD 1.35.1.
 
 ## How Turbo indexing differs from stock NOMAD
 
@@ -127,7 +127,7 @@ When the checkpoint has a path, the count skip is left at 0 and the path is what
     )
 ```
 
-A crash resumes after the last article that was checkpointed. The checkpoint is kept.
+A crash resumes after the last article that was checkpointed. The checkpoint is kept. An article path that is already in the index is not embedded again. A plain upload that already has points is left as indexed.
 
 ## Turbo reads upload PDFs and pictures itself
 
@@ -243,6 +243,14 @@ Navigation, scripts, author boxes, and the same kind of chrome are left out. The
 
 Turbo could not read that file, so it is not queued. The file stays on disk.
 
+### Why are Start indexing, Delete index, Scan, and Start repair off?
+
+The Qdrant line under the page switch has not said the collection answered. Those buttons stay off until it reads `Qdrant is ready for changes.` Rescan does not wait. The messages are in Common log lines.
+
+### What does an HTTP error in the log mean?
+
+`qdrant 503` and `HTTP 503` are different programs. The first is the index. The second is Turbo's embed server. A timeout keeps the current file. An HTTP 400 from the embedder is one bad chunk, and the rest of the file continues. Common log lines has the wording.
+
 ### What does Repair delete?
 
 **Scan** changes nothing. It does not pause embedding. **Start repair** pauses file embedding, then deletes points only for ZIM and upload files that are already gone. It also removes that file's ingest row, checkpoint, and leftover embed jobs. Points for a file that is still on disk stay. A count that does not match is reported and left in place. Repair does not embed files again, and it does not wipe the whole index. The Repair section describes the page.
@@ -271,11 +279,43 @@ Click the icon. The window scans the library. Opening it does not start or stop 
 
 **Start indexing** pauses NOMAD's file embedding and continues from the saved article. The reader opens the ZIM once, walks to that article, and keeps going from there. **Rescan** reads the library again. It does not pause NOMAD or start indexing. **Stop** finishes the embed call already running. It does not delete the index. When the run started on Manual, unfinished files are not handed back to stock NOMAD. **Delete index** sits at the right end of the button row. You must type DELETE. Indexing does not start. ZIM files and uploads stay.
 
-The **Embed batch** slider is the boost. The line under it shows the chunk count that setting will send. Hover any button, checkbox, column heading, progress bar, or that line for what it does.
+The **Embed batch** slider is the boost. The line under it reads `Set 55% · <chunks> chunks per call. Embed server: idle.` The chunk count is the budget for that setting on your machine. Once a run has started the server, that line says `One embed server is running.` Above 100% it adds `Overclock past the detected budget.` The next line is `Card memory in use: <used> / <total> MiB`, or `No GPU detected. The embed server will use the CPU.` Hover any button, checkbox, column heading, progress bar, or those lines for what they do.
+
+**Project NOMAD** at the top right opens the Project NOMAD repository. The Qdrant line sits under the Index / Repair switch. **Start indexing**, **Delete index**, **Scan**, and **Start repair** stay off until that line says `Qdrant is ready for changes.` **Rescan** does not wait.
+
+The window edges resize the whole window. Each page has a drag bar between the file list and the controls. The log bar sits under the Log row. Column edges resize. Those positions are remembered.
+
+If Turbo dies while the embed queue is paused, the next time the window opens it puts the ingest policy back and resumes NOMAD embedding. If a repair delete may still be running, embedding stays paused. `nomad-turbo recover` does the same thing.
 
 **Stay on after the last file** keeps Turbo in control when the queue is empty, so files that arrive later are indexed by Turbo. Off, which is the default, Turbo stops and the ingest policy returns to the value found at Start. When the run started on Manual, stock NOMAD does not start embedding.
 
-Closing the window while a run is going hides it to the tray. The tray icon is the plain logo when idle, the logo on fire while indexing, and blue while a repair is running. Clicking the desktop icon brings the window back. It does not start or stop the run.
+Closing the window while a run is going hides it to the tray. The tray menu can show the window or stop the run. The tray icon is the plain logo when idle, the logo on fire while indexing, and blue while a repair is running. Clicking the desktop icon brings the window back. It does not start or stop the run.
+
+## Index
+
+The Index page is the library list.
+
+- **File.** Blue names are ZIM files. Amber names are uploads. Hover a row for the full path.
+- **Kind.** ZIM library, or a file uploaded to the knowledge base.
+- **Status.** Waiting, indexing, indexed, partial, failed, or needs NOMAD.
+- **Progress.** How far this file is through its articles.
+- **Articles.** Stored so far, and the total when it is known.
+- **Chunks.** Embedded pieces stored for this file. A long page is many chunks.
+- **Size.** The file on disk.
+- **Rate.** Articles per minute swing with page length. Chunks per second stay steadier.
+- **ETA.** Time left for this file at its recent article rate.
+
+The file being indexed has its own bar. The bar under it is the whole library, weighed by file size, and the time left for what remains. The stats line counts articles per minute, chunks per minute, skipped pages, and bad pages. Skipped pages had no text. Bad pages could not be read or parsed. A long page is indexed in full.
+
+The list keeps the active file near the top. Click a heading to sort. Drag a column edge to resize it. That width is remembered.
+
+## Log
+
+The Log row shows and hides the log. **Errors**, **Info**, and **Debug** only change which lines the pane draws. The log file still records every line. **Follow** jumps to the newest line and stays there. Scroll up to hold your place. Turn Follow off and the page stays where it is while new lines arrive.
+
+**Export log** saves that file, including lines the checkboxes are hiding. The suggested name is `nomad-turbo-log.txt`.
+
+On a long run the pane drops lines it has already shown, so the window still answers the close button. The file keeps the session.
 
 ## Repair
 
@@ -304,6 +344,50 @@ What a repair leaves in place:
 - An unfinished file whose point count disagrees with its checkpoint. Deleting those points would throw away the progress the checkpoint is holding.
 
 Stop works between files, or between scan steps. A delete that was already sent runs until the index finishes it. Stop does not wipe the collection. If a delete does not return, the embed queue stays paused so a second delete is not started on top of it. Start repair again when the index is idle. While a download is in progress, or the disk is busy, repair waits instead of deleting. Closing the window during a repair hides it to the tray. The run keeps going.
+
+## Commands
+
+The desktop icon runs `nomad-turbo toggle`. It opens or raises the window. It does not start or stop indexing.
+
+- `nomad-turbo plan` prints the call size for this machine. It does not pause NOMAD or start containers.
+- `nomad-turbo status` prints whether indexing is running, or only the window is open.
+- `nomad-turbo stop` stops after the embed call that is already running.
+- `nomad-turbo recover` puts the ingest policy back and resumes NOMAD embedding after a crash that left the queue paused. A repair delete that may still be running leaves embedding paused.
+
+## Common log lines
+
+These are the lines people meet when Qdrant or the embed server is not ready to take work. The wording is the wording in the window and the log.
+
+### Qdrant is not ready for changes
+
+The status line under the page switch is one of these until the collection answers:
+
+- `Qdrant is missing. Not ready for changes.` The container state replaces `missing` when Docker reports one.
+- `Qdrant is running and has not passed the health check. Not ready for changes.`
+- `Qdrant is running. The ready check has not passed. Not ready for changes.`
+- `Qdrant is up and the collection is not answering yet. Not ready for changes.`
+
+A large collection can be up and still on the last of those while it finishes loading. **Start indexing**, **Delete index**, **Scan**, and **Start repair** stay off. The second line of that status names the container, how long it has been up, the health check, the ready check, and whether the collection answered. When Docker returned a log line, it is included as `Last log:`.
+
+`Qdrant is ready for changes.` is the line that turns those buttons on.
+
+### Qdrant stopped taking a write
+
+A write that does not reach Qdrant is tried again. The log says `qdrant write timed out. Trying that batch again.`
+
+If it is still not taking the write, Turbo stays on that file. The status line says `Qdrant is not taking writes. Turbo is waiting and will keep this file.` The log says `qdrant is not taking writes. Staying on <file> at article <n>: qdrant unreachable: ...`
+
+`qdrant 400: ...`, `qdrant 503: ...`, and the other `qdrant <code>:` lines are answers Qdrant did return. Turbo does not treat those as "wait on this article." It tries that file once more from the same article (`will try <file> again from article <n> after an error`). A second failure at that same article is `file failed`.
+
+### The embed server is not ready
+
+Before Start, the usage line says `Embed server: idle.` After Start, Turbo waits while `llama-server` loads the model. New waits are logged as `embedder not ready yet: ...`. That wait is about three minutes. The usage line then says `One embed server is running.`
+
+A call that gets HTTP 408, 429, 500, 502, 503, or 504 is logged as `embedder call failed (HTTP 503: ...). Trying again.` The code in the message is the code that came back. Turbo tries that call up to three times. The error that remains is `embedder HTTP 503: ...`. The file is then tried once more from the same article. A second failure at that article is `file failed`.
+
+HTTP 400 is one input the embedder refused, not a dead server. The log says `splitting one chunk of <file> (<path>) that did not fit the embedder`. If that one chunk is still refused, the log says `skipping one chunk of <file> (<path>) the embedder rejected`. That chunk counts as bad. The rest of the file continues.
+
+`the embed server is not running` means a call was ready and the server process was already gone.
 
 ## Stock contract
 
