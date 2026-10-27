@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 1.0.2
+
+### Moderate
+
+- Index and Repair put the single-line controls on shared rows, so the file list gets at least half the page at the default window size when the log is open and the splits have not been dragged. Extra height still goes to the list. At 480 by 280 the list stays on screen and the control area stays mapped, so those controls can be scrolled into view.
+- The header shows the package version. An About page, beside Index and Repair, names that version, Project NOMAD 1.35.1, and links to this repository and the Project NOMAD repository.
+
 ### Minor
 
 - The corner link opens this repository. The README links to Project NOMAD.

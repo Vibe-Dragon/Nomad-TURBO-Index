@@ -29,7 +29,7 @@ TIPS: dict[str, str] = {
     "col_eta": "Time left for this file at its recent article rate.",
     "file_now": "The file being indexed right now.",
     "file_bar": (
-        "Progress of the file being indexed. The bar under it is the whole library, weighed by file size."
+        "Progress of the file being indexed. The library bar beside it is the whole library, weighed by file size."
     ),
     "library_bar": "Share of the library finished, by file size, and the ETA for what is left.",
     "stats": (
@@ -82,6 +82,23 @@ TIPS: dict[str, str] = {
     "project": (
         "Open this project's repository."
     ),
+    "nomad_repo": "Open the Project NOMAD repository.",
+    "version": "This copy of Nomad TURBO Index. About names the Project NOMAD version it was tested with.",
+    "legend": (
+        "Blue names are ZIM files. Amber names are files you uploaded. "
+        "Drag a column edge to resize it. Drag a bar to resize the list, the controls, or the log. "
+        "Click a heading to sort."
+    ),
+    "repair_page": (
+        "Scan checks the library and the index and changes nothing. "
+        "Start repair removes index entries for library files that are gone. "
+        "NOMAD keeps embedding until you press Start repair. "
+        "Quick compares files, ingest rows, and checkpoints. "
+        "Complete also lists sources in the index when Qdrant is answering. "
+        "Start repair pauses file embedding, then deletes points for files that are gone. "
+        "Points for a file that is still on disk stay there. "
+        "The tray icon turns blue while a repair is running. Stop is here and in the tray."
+    ),
     "repair_quick": (
         "Compare files on disk with ingest rows and checkpoints. "
         "Delete index points for ZIM and upload files that are gone."
@@ -100,7 +117,7 @@ TIPS: dict[str, str] = {
     "repair_col_status": "Waiting, deleting, repaired, noted, failed, stopped, would delete, or report only.",
     "repair_col_elapsed": "Time spent on this file. It updates while the delete is running.",
     "repair_file_now": "The file repair is working on right now.",
-    "repair_file_bar": "Progress of the file being repaired. The bar under it is the whole repair or scan.",
+    "repair_file_bar": "Progress of the file being repaired. The bar beside it is the whole repair or scan.",
     "repair_overall_bar": "During a scan, how far the check has got. During a repair, how many files are finished.",
     "repair_stats": "Live counts for the library, ingest rows, checkpoints, index sources, and what a repair would do.",
     "repair_scan": (

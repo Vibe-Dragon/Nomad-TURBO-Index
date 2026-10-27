@@ -12,6 +12,7 @@ import time
 from collections import deque
 from pathlib import Path
 
+from nomad_turbo import __version__
 from nomad_turbo.catalog import wipe_phrase_ok
 from nomad_turbo.desktop import icon_dir, write_shortcut
 from nomad_turbo.discover import load_install, save_install, state_dir
@@ -21,7 +22,7 @@ from nomad_turbo.progress import (
     format_current_file,
     format_run_stats,
     LOG_PANE_LINES,
-    list_pane_position,
+    fitted_list_position,
     restored_log_top,
     log_line_visible,
     log_lines_to_drop,
@@ -48,6 +49,35 @@ log = logging.getLogger("nomad_turbo")
 
 # Anyone running this window already has Project NOMAD. The corner link opens this repo.
 REPO_URL = "https://github.com/Vibe-Dragon/Nomad-TURBO-Index"
+NOMAD_REPO_URL = "https://github.com/Crosstalk-Solutions/project-nomad"
+# The README's tested-version sentence uses this same fact.
+TESTED_NOMAD_VERSION = "1.35.1"
+
+
+def about_facts() -> dict[str, str]:
+    """Copy for the About page. The window and the tests both read this."""
+    tested = f"This version was tested with Project NOMAD {TESTED_NOMAD_VERSION}."
+    body = "\n\n".join(
+        (
+            "Vibe-Dragon",
+            "MIT License. Copyright 2026 Vibe-Dragon.",
+            "I update this when I get to it. It can fall behind Project NOMAD.",
+            (
+                "I am not responsible if Turbo messes up your index, "
+                "your search results, or anything else on your machine."
+            ),
+        )
+    )
+    return {
+        "version": __version__,
+        "version_line": f"Nomad TURBO Index {__version__}",
+        "tested": tested,
+        "turbo_repo": REPO_URL,
+        "nomad_repo": NOMAD_REPO_URL,
+        "turbo_label": "Nomad TURBO Index",
+        "nomad_label": "Project NOMAD",
+        "body": body,
+    }
 
 
 def window_close_action(indexing: bool) -> str:
@@ -220,7 +250,7 @@ class _Window:
         self.indicator = None
         self._tray_status_enum = None
 
-        window = gtk.Window(title="Nomad TURBO Index")
+        window = gtk.Window(title=f"Nomad TURBO Index {__version__}")
         window.set_resizable(True)
         window.set_default_size(1180, 820)
         # A small floor. Portion minimums stay small so this does not pin the window.
@@ -252,10 +282,14 @@ class _Window:
         header = gtk.Box(orientation=gtk.Orientation.HORIZONTAL, spacing=8)
         header.set_hexpand(True)
         header.pack_start(switcher, False, False, 0)
+        self.version_label = gtk.Label(label=__version__)
+        self.version_label.set_halign(gtk.Align.END)
+        self.version_label.set_tooltip_text(TIPS["version"])
         project = gtk.LinkButton.new_with_label(REPO_URL, "Nomad TURBO Index")
         project.set_halign(gtk.Align.END)
         project.set_tooltip_text(TIPS["project"])
         header.pack_end(project, False, False, 0)
+        header.pack_end(self.version_label, False, False, 0)
         root.pack_start(header, False, False, 0)
         # Above the pages, not in the log split, so this line does not ride the log bar.
         root.pack_start(self.qdrant_label, False, False, 0)
@@ -267,9 +301,13 @@ class _Window:
         self.status = gtk.Label(label="Scanning the library…")
         self.status.set_xalign(0)
         self.status.set_line_wrap(True)
+        self.status.set_tooltip_text(TIPS["legend"])
         index.pack_start(self.status, False, False, 0)
 
         from gi.repository import Pango
+
+        self.status.set_ellipsize(Pango.EllipsizeMode.END)
+        self.status.set_lines(2)
 
         def headed(title: str, tip: str, cell, **props):
             column = gtk.TreeViewColumn(title, cell, **props)
@@ -381,66 +419,80 @@ class _Window:
         scrolled = gtk.ScrolledWindow()
         scrolled.set_policy(gtk.PolicyType.AUTOMATIC, gtk.PolicyType.AUTOMATIC)
         scrolled.add(tree)
-        scrolled.set_min_content_height(48)
+        # The header sets the real minimum. A 48px content floor makes the
+        # paned slide the list out of a short pane instead of shrinking it.
+        scrolled.set_min_content_height(1)
         scrolled.set_vexpand(True)
         self.file_tree = tree
-        lower = gtk.Box(orientation=gtk.Orientation.VERTICAL, spacing=8)
-
-        legend = gtk.Label(label="Blue names are ZIM files. Amber names are files you uploaded. Drag a column edge to resize it. Drag a bar to resize the list, the controls, or the log. Click a heading to sort.")
-        legend.set_xalign(0)
-        legend.set_line_wrap(True)
-        lower.pack_start(legend, False, False, 0)
+        self.index_list = scrolled
+        # Shared rows keep this cluster short. The list above it gets the spare height.
+        lower = gtk.Box(orientation=gtk.Orientation.VERTICAL, spacing=4)
 
         self.current_label = gtk.Label(label="No file is indexing.")
         self.current_label.set_xalign(0)
+        self.current_label.set_hexpand(True)
         self.current_label.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
         self.current_label.set_tooltip_text(TIPS["file_now"])
-        lower.pack_start(self.current_label, False, False, 0)
+        self.current_label.set_valign(gtk.Align.CENTER)
         self.current_bar = gtk.ProgressBar()
         self.current_bar.set_show_text(True)
         self.current_bar.set_text("Idle")
+        self.current_bar.set_hexpand(True)
+        self.current_bar.set_valign(gtk.Align.CENTER)
         self.current_bar.set_tooltip_text(TIPS["file_bar"])
-        lower.pack_start(self.current_bar, False, False, 0)
-
         self.overall = gtk.ProgressBar()
         self.overall.set_show_text(True)
         self.overall.set_text("Scanning…")
+        self.overall.set_hexpand(True)
+        self.overall.set_valign(gtk.Align.CENTER)
         self.overall.set_tooltip_text(TIPS["library_bar"])
-        lower.pack_start(self.overall, False, False, 0)
-
-        self.stats = gtk.Label(label="")
-        self.stats.set_xalign(0)
-        self.stats.set_line_wrap(True)
-        self.stats.set_selectable(True)
-        self.stats.set_tooltip_text(TIPS["stats"])
-        lower.pack_start(self.stats, False, False, 0)
-
-        gpu = gtk.Box(orientation=gtk.Orientation.VERTICAL, spacing=4)
-        slider_row = gtk.Box(orientation=gtk.Orientation.HORIZONTAL, spacing=8)
         slider_label = gtk.Label(label="Embed batch")
         slider_label.set_tooltip_text(TIPS["slider"])
-        slider_row.pack_start(slider_label, False, False, 0)
+        slider_label.set_valign(gtk.Align.CENTER)
         self.scale = gtk.Scale.new_with_range(gtk.Orientation.HORIZONTAL, 10, 110, 5)
         self.scale.set_value(session.get_percent())
         self.scale.set_hexpand(True)
         self.scale.set_draw_value(True)
         self.scale.set_value_pos(gtk.PositionType.RIGHT)
+        self.scale.set_valign(gtk.Align.CENTER)
         for mark in (10, 100, 110):
             self.scale.add_mark(mark, gtk.PositionType.BOTTOM, f"{mark}%")
         self.scale.set_tooltip_text(TIPS["slider"])
         self.scale.connect("format-value", lambda _scale, value: f"{int(round(value))}%")
         self.scale.connect("value-changed", self.on_slider)
-        slider_row.pack_start(self.scale, True, True, 0)
-        gpu.pack_start(slider_row, False, False, 0)
+        bars = gtk.Box(orientation=gtk.Orientation.HORIZONTAL, spacing=8)
+        bars.pack_start(self.current_label, True, True, 0)
+        bars.pack_start(self.current_bar, True, True, 0)
+        bars.pack_start(self.overall, True, True, 0)
+        bars.pack_start(slider_label, False, False, 0)
+        bars.pack_start(self.scale, True, True, 0)
+        lower.pack_start(bars, False, False, 0)
+
         self.usage = gtk.Label(label="")
         self.usage.set_xalign(0)
-        self.usage.set_line_wrap(True)
+        self.usage.set_hexpand(True)
+        self.usage.set_ellipsize(Pango.EllipsizeMode.END)
         self.usage.set_tooltip_text(TIPS["usage"])
-        gpu.pack_start(self.usage, False, False, 0)
         self.card = gtk.Label(label="")
         self.card.set_xalign(0)
+        self.card.set_hexpand(True)
+        self.card.set_ellipsize(Pango.EllipsizeMode.END)
         self.card.set_tooltip_text(TIPS["card"])
-        gpu.pack_start(self.card, False, False, 0)
+        meters = gtk.Box(orientation=gtk.Orientation.HORIZONTAL, spacing=12)
+        meters.pack_start(self.usage, True, True, 0)
+        meters.pack_start(self.card, True, True, 0)
+        lower.pack_start(meters, False, False, 0)
+
+        self.stats = gtk.Label(label="")
+        self.stats.set_xalign(0)
+        self.stats.set_hexpand(True)
+        self.stats.set_line_wrap(True)
+        self.stats.set_lines(2)
+        self.stats.set_ellipsize(Pango.EllipsizeMode.END)
+        self.stats.set_selectable(True)
+        self.stats.set_tooltip_text(TIPS["stats"])
+        lower.pack_start(self.stats, False, False, 0)
+
         self.keep_check = gtk.CheckButton(
             label="Stay on after the last file, and index new files as they arrive"
         )
@@ -448,8 +500,6 @@ class _Window:
         self.keep_check.set_halign(gtk.Align.START)
         self.keep_check.set_tooltip_text(TIPS["keep"])
         self.keep_check.connect("toggled", self.on_keep)
-        gpu.pack_start(self.keep_check, False, False, 0)
-        lower.pack_start(gpu, False, False, 0)
 
         buttons = gtk.Box(orientation=gtk.Orientation.HORIZONTAL, spacing=8)
         self.start_button = gtk.Button(label="Start indexing")
@@ -470,18 +520,21 @@ class _Window:
         self.delete_tip = TIPS["delete"]
         self.delete_button.set_tooltip_text(TIPS["delete"])
         self.delete_button.get_style_context().add_class("destructive-action")
+        buttons.pack_start(self.keep_check, False, False, 0)
         for button in (self.start_button, self.stop_button, self.rescan_button, self.export_button):
             buttons.pack_start(button, False, False, 0)
         buttons.pack_end(self.delete_button, False, False, 0)
         lower.pack_start(buttons, False, False, 0)
+        self.index_buttons = buttons
         self.index_pane = self._make_pane()
-        # The list takes extra space and keeps a small floor. The controls keep
-        # the height from their drag bar and can shrink so the window can too.
-        self.index_pane.pack1(scrolled, True, False)
-        self.index_pane.pack2(self._portion(lower), False, True)
+        # The list takes extra space and can shrink. The controls keep their
+        # 48px floor (shrink is off) so the scroller stays in the pane.
+        self.index_pane.pack1(scrolled, True, True)
+        self.index_pane.pack2(self._portion(lower), False, False)
         self._track_pane(self.index_pane, "index_pane")
         index.pack_start(self.index_pane, True, True, 0)
         self._build_repair_page(headed)
+        self._build_about_page()
 
         log_head = gtk.Box(orientation=gtk.Orientation.HORIZONTAL, spacing=8)
         self.error_check = gtk.CheckButton(label="Errors")
@@ -598,6 +651,18 @@ class _Window:
         self.indicator = indicator
         self._tray_status_enum = AyatanaAppIndicator3.IndicatorStatus
 
+    def drop_tray(self) -> None:
+        """Hide the tray icon created with the window."""
+        indicator = getattr(self, "indicator", None)
+        self.indicator = None
+        status = self._tray_status_enum
+        if indicator is None or status is None:
+            return
+        try:
+            indicator.set_status(status.PASSIVE)
+        except Exception:
+            return
+
     def _load_icons(self) -> None:
         self._idle_icon = ""
         self._index_icon = ""
@@ -693,7 +758,7 @@ class _Window:
         self.session.close_requested = True
         if indexing:
             if self.repair_thread is not None and self.repair_thread.is_alive():
-                self.repair_status.set_text("Stopping after the current file finishes…")
+                self._set_repair_status("Stopping after the current file finishes…")
             else:
                 self.status.set_text("Stopping after the current embeds finish…")
             return True
@@ -917,24 +982,118 @@ class _Window:
         # A window resize also moves the bar. Only a drag on the bar is saved.
         if getattr(event, "button", 1) == 1:
             pane._user_drag = True
+            pane._button_down = True
         return False
 
-    def _track_pane(self, pane, key: str) -> None:
-        saved = int(getattr(self.install, key, 0) or 0)
+    def _queue_pane_place(self, pane, key: str) -> None:
+        # A later allocate can arrive while the idle is waiting. Remember it
+        # instead of dropping it, or the bar stays where the first tiny size put it.
+        if getattr(pane, "_place_queued", False):
+            pane._place_again = True
+            return
+        pane._place_queued = True
 
-        def on_size(_widget, allocation) -> None:
-            if allocation.height < 80 or getattr(pane, "_split_ready", False):
-                return
-            pane._split_ready = True
+        def place() -> bool:
+            pane._place_queued = False
+            again = bool(getattr(pane, "_place_again", False))
+            pane._place_again = False
+            if getattr(pane, "_button_down", False):
+                if again:
+                    self._queue_pane_place(pane, key)
+                return False
+            # set_position during size-allocate does not move a page that
+            # was hidden, so the bar is placed on the next idle.
+            height = int(pane.get_allocated_height() or 0)
+            if height <= 1:
+                if again:
+                    self._queue_pane_place(pane, key)
+                return False
+            saved = int(getattr(self.install, key, 0) or 0)
             controls = 0
             child = pane.get_child2()
             if saved <= 0 and child is not None:
                 _minimum, controls = child.get_preferred_height()
+            list_min = 0
+            listing = pane.get_child1()
+            if listing is not None:
+                preferred, _natural = listing.get_preferred_height()
+                list_min = int(preferred or 0)
+                # Preferred height can miss the column headers. GTK then keeps
+                # that taller minimum and slides the extra pixels above the pane.
+                # Trust that distance only while it is still header-sized.
+                origin = listing.translate_coordinates(pane, 0, 0)
+                if origin is not None and int(origin[1]) < 0:
+                    covered = int(pane.get_position()) - int(origin[1])
+                    if list_min < covered <= 120:
+                        list_min = covered
+            # The pane must be able to hold the header and the control strip.
+            # Do not keep raising this from an expanded list, or the window
+            # grows past the 480×280 floor.
+            needed = int(list_min) + 48 + 8
+            _width, requested = pane.get_size_request()
+            if 0 < needed <= 160 and requested != needed:
+                pane.set_size_request(-1, needed)
+            target = fitted_list_position(saved, height, controls, list_min)
+            # On a short pane, put the divider at the header so the list top
+            # stays inside. A tall pane keeps the spare space on the list.
+            if height <= 220:
+                limit = height - 48 - 8
+                if limit > 8:
+                    target = min(max(target, list_min), limit)
+            position = int(pane.get_position())
+            if abs(position - target) <= 1 and not again:
+                return False
+            if abs(position - target) <= 1:
+                if again:
+                    self._queue_pane_place(pane, key)
+                return False
+            # A rejected position must not queue another idle for the same size.
+            fit_key = (height, target)
+            if getattr(pane, "_fit_key", None) != fit_key:
+                pane._fit_key = fit_key
+                pane._fit_count = 0
+            if int(getattr(pane, "_fit_count", 0)) >= 3:
+                return False
+            pane._fit_count = int(pane._fit_count) + 1
             self._pane_lock = True
             try:
-                pane.set_position(list_pane_position(saved, allocation.height, controls))
+                pane.set_position(target)
             finally:
                 self._pane_lock = False
+            if again or getattr(pane, "_place_again", False):
+                pane._place_again = False
+                self._queue_pane_place(pane, key)
+            return False
+
+        self.glib.idle_add(place)
+
+    def _show_pane_page(self, _stack, _pspec=None) -> None:
+        """A hidden page keeps its old allocation until it is shown."""
+        name = self.stack.get_visible_child_name()
+        if name == "index":
+            pane, key = self.index_pane, "index_pane"
+        elif name == "repair":
+            pane, key = self.repair_pane, "repair_pane"
+        else:
+            return
+        pane.queue_resize()
+        self._queue_pane_place(pane, key)
+
+    def _track_pane(self, pane, key: str) -> None:
+        def on_size(_widget, allocation) -> None:
+            if allocation.height <= 0 or getattr(pane, "_button_down", False):
+                return
+            self._queue_pane_place(pane, key)
+
+        def on_release(_widget, event) -> bool:
+            if getattr(event, "button", 1) == 1:
+                pane._button_down = False
+                self._queue_pane_place(pane, key)
+            return False
+
+        def on_grab_broken(*_args) -> bool:
+            pane._button_down = False
+            return False
 
         def on_position(widget, _pspec) -> None:
             if self._pane_lock or not getattr(widget, "_user_drag", False):
@@ -946,7 +1105,13 @@ class _Window:
             self._save_layout_soon()
 
         pane.connect("size-allocate", on_size)
+        listing = pane.get_child1()
+        if listing is not None:
+            # The header can grow after the pane's own allocate. Place again.
+            listing.connect("size-allocate", on_size)
         pane.connect("button-press-event", self._mark_pane_drag)
+        pane.connect("button-release-event", on_release)
+        pane.connect("grab-broken-event", on_grab_broken)
         pane.connect("notify::position", on_position)
 
     def _place_log_split(self, pane, height: int) -> None:
@@ -1338,7 +1503,9 @@ class _Window:
         elapsed = None
         if self.started_at:
             elapsed = max(0, int(time.monotonic() - self.started_at))
-        self._show(self.stats, format_run_stats(view["phase"], elapsed, snap))
+        text = format_run_stats(view["phase"], elapsed, snap)
+        self._show(self.stats, text)
+        self.stats.set_tooltip_text(f"{text}\n{TIPS['stats']}".strip() if text else TIPS["stats"])
 
     def refresh_tray(self, view: dict, snap) -> None:
         if self.indicator is None:
@@ -1416,6 +1583,7 @@ class _Window:
             slots_ignored=bool(self.install.slots),
         )
         self._show(self.usage, text)
+        self.usage.set_tooltip_text(f"{TIPS['usage']} {text}".strip())
         gpu = self.live_gpu
         if gpu:
             _index, total, used = gpu
@@ -1425,6 +1593,7 @@ class _Window:
         else:
             card = "No GPU detected. The embed server will use the CPU."
         self._show(self.card, card)
+        self.card.set_tooltip_text(f"{TIPS['card']} {card}".strip())
 
     def refresh_log(self) -> None:
         show_info = self.info_check.get_active()
@@ -1521,27 +1690,16 @@ class _Window:
         gtk = self.gtk
         page = gtk.Box(orientation=gtk.Orientation.VERTICAL, spacing=8)
         page.set_vexpand(True)
-        self.repair_status = gtk.Label(
-            label=(
-                "Scan checks the library and the index and changes nothing. "
-                "Start repair removes index entries for library files that are gone. "
-                "NOMAD keeps embedding until you press Start repair."
-            )
-        )
+        self.repair_status = gtk.Label(label="Ready. Scan changes nothing until you press Start repair.")
         self.repair_status.set_xalign(0)
         self.repair_status.set_line_wrap(True)
+        self.repair_status.set_tooltip_text(TIPS["repair_page"])
         page.pack_start(self.repair_status, False, False, 0)
 
-        modes = gtk.Box(orientation=gtk.Orientation.HORIZONTAL, spacing=16)
-        self.repair_quick = gtk.RadioButton.new_with_label_from_widget(None, "Quick repair")
-        self.repair_complete = gtk.RadioButton.new_with_label_from_widget(self.repair_quick, "Complete repair")
-        self.repair_quick.set_tooltip_text(TIPS["repair_quick"])
-        self.repair_complete.set_tooltip_text(TIPS["repair_complete"])
-        modes.pack_start(self.repair_quick, False, False, 0)
-        modes.pack_start(self.repair_complete, False, False, 0)
-        page.pack_start(modes, False, False, 0)
-
         from gi.repository import Pango
+
+        self.repair_status.set_ellipsize(Pango.EllipsizeMode.END)
+        self.repair_status.set_lines(2)
 
         self.repair_store = gtk.ListStore(*repair_store_types())
         tree = gtk.TreeView(model=self.repair_store)
@@ -1632,43 +1790,61 @@ class _Window:
         scrolled = gtk.ScrolledWindow()
         scrolled.set_policy(gtk.PolicyType.AUTOMATIC, gtk.PolicyType.AUTOMATIC)
         scrolled.add(tree)
-        scrolled.set_min_content_height(48)
+        scrolled.set_min_content_height(1)
         scrolled.set_vexpand(True)
         self.repair_tree = tree
-        lower = gtk.Box(orientation=gtk.Orientation.VERTICAL, spacing=8)
+        self.repair_list = scrolled
+        lower = gtk.Box(orientation=gtk.Orientation.VERTICAL, spacing=4)
 
         self.repair_current_label = gtk.Label(label="No file is being repaired.")
         self.repair_current_label.set_xalign(0)
+        self.repair_current_label.set_hexpand(True)
         self.repair_current_label.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
+        self.repair_current_label.set_valign(gtk.Align.CENTER)
         self.repair_current_label.set_tooltip_text(TIPS["repair_file_now"])
-        lower.pack_start(self.repair_current_label, False, False, 0)
         self.repair_current_bar = gtk.ProgressBar()
         self.repair_current_bar.set_show_text(True)
         self.repair_current_bar.set_text("Idle")
+        self.repair_current_bar.set_hexpand(True)
+        self.repair_current_bar.set_valign(gtk.Align.CENTER)
         self.repair_current_bar.set_tooltip_text(TIPS["repair_file_bar"])
-        lower.pack_start(self.repair_current_bar, False, False, 0)
-
         self.repair_overall = gtk.ProgressBar()
         self.repair_overall.set_show_text(True)
         self.repair_overall.set_text("Idle")
+        self.repair_overall.set_hexpand(True)
+        self.repair_overall.set_valign(gtk.Align.CENTER)
         self.repair_overall.set_tooltip_text(TIPS["repair_overall_bar"])
-        lower.pack_start(self.repair_overall, False, False, 0)
+        repair_bars = gtk.Box(orientation=gtk.Orientation.HORIZONTAL, spacing=8)
+        repair_bars.pack_start(self.repair_current_label, True, True, 0)
+        repair_bars.pack_start(self.repair_current_bar, True, True, 0)
+        repair_bars.pack_start(self.repair_overall, True, True, 0)
+        lower.pack_start(repair_bars, False, False, 0)
 
         self.repair_stats = gtk.Label(label="Press Scan to check the index without changing it.")
         self.repair_stats.set_xalign(0)
         self.repair_stats.set_line_wrap(True)
+        self.repair_stats.set_lines(6)
+        self.repair_stats.set_ellipsize(Pango.EllipsizeMode.END)
         self.repair_stats.set_max_width_chars(110)
         self.repair_stats.set_selectable(True)
         self.repair_stats.override_font(Pango.FontDescription("Monospace"))
         self.repair_stats.set_tooltip_text(TIPS["repair_stats"])
         lower.pack_start(self.repair_stats, False, False, 0)
 
-        self.repair_specs = gtk.Label(label="Each row's spec is kept up to date while that file is repaired. Hover a row to read it.")
+        self.repair_specs = gtk.Label(
+            label="Each row's spec is kept up to date while that file is repaired. Hover a row to read it."
+        )
         self.repair_specs.set_xalign(0)
-        self.repair_specs.set_line_wrap(True)
+        self.repair_specs.set_hexpand(True)
+        self.repair_specs.set_ellipsize(Pango.EllipsizeMode.END)
         self.repair_specs.set_selectable(True)
+        self.repair_specs.set_tooltip_text(self.repair_specs.get_text())
         lower.pack_start(self.repair_specs, False, False, 0)
 
+        self.repair_quick = gtk.RadioButton.new_with_label_from_widget(None, "Quick repair")
+        self.repair_complete = gtk.RadioButton.new_with_label_from_widget(self.repair_quick, "Complete repair")
+        self.repair_quick.set_tooltip_text(TIPS["repair_quick"])
+        self.repair_complete.set_tooltip_text(TIPS["repair_complete"])
         buttons = gtk.Box(orientation=gtk.Orientation.HORIZONTAL, spacing=8)
         self.repair_scan = gtk.Button(label="Scan")
         self.repair_start = gtk.Button(label="Start repair")
@@ -1682,29 +1858,79 @@ class _Window:
         self.repair_start.connect("clicked", lambda *_args: self.on_repair_start())
         self.repair_stop_button.connect("clicked", lambda *_args: self.repair_stop.set())
         self.repair_stop_button.set_sensitive(False)
+        buttons.pack_start(self.repair_quick, False, False, 0)
+        buttons.pack_start(self.repair_complete, False, False, 0)
         buttons.pack_start(self.repair_scan, False, False, 0)
         buttons.pack_start(self.repair_start, False, False, 0)
         buttons.pack_start(self.repair_stop_button, False, False, 0)
+        buttons.set_tooltip_text(TIPS["repair_page"])
         lower.pack_start(buttons, False, False, 0)
-
-        hint = gtk.Label(
-            label=(
-                "Scan changes nothing. Quick compares files, ingest rows, and checkpoints. "
-                "Complete also lists sources in the index when Qdrant is answering. "
-                "Start repair pauses file embedding, then deletes points for files that are gone. "
-                "Points for a file that is still on disk stay there. "
-                "The tray icon turns blue while a repair is running. Stop is here and in the tray."
-            )
-        )
-        hint.set_xalign(0)
-        hint.set_line_wrap(True)
-        lower.pack_start(hint, False, False, 0)
+        self.repair_buttons = buttons
         self.repair_pane = self._make_pane()
-        self.repair_pane.pack1(scrolled, True, False)
-        self.repair_pane.pack2(self._portion(lower), False, True)
+        self.repair_pane.pack1(scrolled, True, True)
+        self.repair_pane.pack2(self._portion(lower), False, False)
         self._track_pane(self.repair_pane, "repair_pane")
         page.pack_start(self.repair_pane, True, True, 0)
         self.stack.add_titled(page, "repair", "Repair")
+        self.repair_page = page
+
+    def _build_about_page(self) -> None:
+        gtk = self.gtk
+        facts = about_facts()
+        page = gtk.Box(orientation=gtk.Orientation.VERTICAL, spacing=8)
+        page.set_vexpand(True)
+        scroll = gtk.ScrolledWindow()
+        scroll.set_policy(gtk.PolicyType.NEVER, gtk.PolicyType.AUTOMATIC)
+        inner = gtk.Box(orientation=gtk.Orientation.VERTICAL, spacing=10)
+        inner.set_margin_top(4)
+        inner.set_margin_bottom(4)
+
+        heading = gtk.Label()
+        heading.set_markup("<span size='large' weight='bold'>About</span>")
+        heading.set_xalign(0)
+        self.about_heading = heading
+
+        version = gtk.Label(label=facts["version_line"])
+        version.set_xalign(0)
+        version.set_selectable(True)
+        self.about_version = version
+
+        tested = gtk.Label(label=facts["tested"])
+        tested.set_xalign(0)
+        tested.set_line_wrap(True)
+        tested.set_selectable(True)
+        self.about_tested = tested
+
+        body = gtk.Label(label=facts["body"])
+        body.set_xalign(0)
+        body.set_yalign(0)
+        body.set_line_wrap(True)
+        body.set_selectable(True)
+        body.set_max_width_chars(80)
+        self.about_body = body
+
+        turbo = gtk.LinkButton.new_with_label(facts["turbo_repo"], facts["turbo_label"])
+        turbo.set_halign(gtk.Align.START)
+        turbo.set_tooltip_text(TIPS["project"])
+        nomad = gtk.LinkButton.new_with_label(facts["nomad_repo"], facts["nomad_label"])
+        nomad.set_halign(gtk.Align.START)
+        nomad.set_tooltip_text(TIPS["nomad_repo"])
+        self.about_turbo_link = turbo
+        self.about_nomad_link = nomad
+
+        for widget in (heading, version, tested, body, turbo, nomad):
+            inner.pack_start(widget, False, False, 0)
+        scroll.add(inner)
+        page.pack_start(scroll, True, True, 0)
+        self.stack.add_titled(page, "about", "About")
+        self.about_page = page
+        self.stack.connect("notify::visible-child-name", self._show_pane_page)
+
+    def _set_repair_status(self, text: str) -> None:
+        self._show(self.repair_status, text)
+        note = text.strip()
+        guide = TIPS["repair_page"]
+        self.repair_status.set_tooltip_text(f"{note}\n\n{guide}" if note else guide)
 
     def _gate_tip(self, button, normal: str) -> None:
         if self.qdrant_ready:
@@ -1719,7 +1945,7 @@ class _Window:
         self.repair_stop = threading.Event()
         self._repair_told = False
         self.repair_starting = True
-        self.repair_status.set_text("Starting scan…")
+        self._set_repair_status("Starting scan…")
         self.stack.set_visible_child_name("repair")
         self.repair_thread = threading.Thread(
             target=self._repair_scan,
@@ -1754,7 +1980,7 @@ class _Window:
             if board is not None:
                 board.set_phase("error", str(exc))
             else:
-                self.glib.idle_add(self.repair_status.set_text, str(exc))
+                self.glib.idle_add(self._set_repair_status, str(exc))
         finally:
             self.repair_starting = False
 
@@ -1765,7 +1991,7 @@ class _Window:
         self.repair_stop = threading.Event()
         self._repair_told = False
         self.repair_starting = True
-        self.repair_status.set_text("Starting repair…")
+        self._set_repair_status("Starting repair…")
         self.stack.set_visible_child_name("repair")
         self.repair_thread = threading.Thread(
             target=self._repair,
@@ -1800,7 +2026,7 @@ class _Window:
             if board is not None:
                 board.set_phase("error", str(exc))
             else:
-                self.glib.idle_add(self.repair_status.set_text, str(exc))
+                self.glib.idle_add(self._set_repair_status, str(exc))
         finally:
             self.repair_starting = False
 
@@ -1810,7 +2036,7 @@ class _Window:
             return
         snap = board.snapshot()
         if snap.note:
-            self._show(self.repair_status, snap.note)
+            self._set_repair_status(snap.note)
         seen = {row.source for row in snap.rows}
         for index in range(len(self.repair_store) - 1, -1, -1):
             if self.repair_store[index][0] not in seen:
@@ -1850,13 +2076,19 @@ class _Window:
             self.repair_overall.set_fraction(min(1.0, max(0.0, snap.fraction)))
         self._show(self.repair_overall, snap.overall)
         if snap.stats:
-            self._show(self.repair_stats, snap.stats)
+            stats_text = snap.stats
         elif snap.phase in ("idle", ""):
-            self._show(self.repair_stats, "Press Scan to check the index without changing it.")
+            stats_text = "Press Scan to check the index without changing it."
         else:
-            self._show(self.repair_stats, "")
+            stats_text = ""
+        self._show(self.repair_stats, stats_text)
+        self.repair_stats.set_tooltip_text(
+            f"{stats_text}\n{TIPS['repair_stats']}".strip() if stats_text else TIPS["repair_stats"]
+        )
         active = next((row for row in snap.rows if row.pulse >= 0), None)
         if active is None and snap.rows:
             active = snap.rows[-1]
         if active is not None:
-            self._show(self.repair_specs, f"{active.name}: {active.detail}")
+            spec = f"{active.name}: {active.detail}"
+            self._show(self.repair_specs, spec)
+            self.repair_specs.set_tooltip_text(spec)

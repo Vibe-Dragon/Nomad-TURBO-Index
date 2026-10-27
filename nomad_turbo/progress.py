@@ -82,6 +82,39 @@ def list_pane_position(saved: int, pane_height: int, controls_height: int) -> in
     return max(48, min(chosen, height - 48))
 
 
+# Pixels the wide handle and the control scroller need so the scroller stays mapped.
+_LIST_HANDLE = 8
+_CONTROL_STRIP = 48
+_LIST_FLOOR = 8
+
+
+def fitted_list_position(
+    saved: int,
+    pane_height: int,
+    controls_height: int,
+    list_floor: int = 0,
+) -> int:
+    """List height that still leaves a mapped control strip.
+
+    A tall pane matches list_pane_position, so spare space stays with the list.
+    A short pane keeps the list at least at list_floor when it fits, and always
+    leaves the control scroller its own floor. list_floor is the list widget's
+    minimum; a smaller position makes GTK draw that minimum past the top of the pane.
+    """
+    height = int(pane_height or 0)
+    if height <= 0:
+        return 0
+    chosen = list_pane_position(saved, height, controls_height)
+    floor = max(_LIST_FLOOR, int(list_floor or 0))
+    # room is the list height that still leaves the control strip and the handle.
+    room = height - _CONTROL_STRIP - _LIST_HANDLE
+    if room < 1:
+        return 1
+    if room < floor:
+        return max(1, min(chosen, room))
+    return max(floor, min(chosen, room))
+
+
 def log_lines_to_drop(line_count: int, limit: int = LOG_PANE_LINES) -> int:
     """Leading lines to remove so the on-screen log stays within limit.
 

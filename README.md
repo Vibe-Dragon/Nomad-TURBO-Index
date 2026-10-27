@@ -279,11 +279,13 @@ Click the icon. The window scans the library. Opening it does not start or stop 
 
 **Start indexing** pauses NOMAD's file embedding and continues from the saved article. The reader opens the ZIM once, walks to that article, and keeps going from there. **Rescan** reads the library again. It does not pause NOMAD or start indexing. **Stop** finishes the embed call already running. It does not delete the index. When the run started on Manual, unfinished files are not handed back to stock NOMAD. **Delete index** sits at the right end of the button row. You must type DELETE. Indexing does not start. ZIM files and uploads stay.
 
-The **Embed batch** slider is the boost. The line under it reads `Set 55% · <chunks> chunks per call. Embed server: idle.` The chunk count is the budget for that setting on your machine. Once a run has started the server, that line says `One embed server is running.` Above 100% it adds `Overclock past the detected budget.` The next line is `Card memory in use: <used> / <total> MiB`, or `No GPU detected. The embed server will use the CPU.` Hover any button, checkbox, column heading, progress bar, or those lines for what they do.
+The header shows the package version beside **Index**, **Repair**, and **About**. The header link opens the [Nomad TURBO Index repository](https://github.com/Vibe-Dragon/Nomad-TURBO-Index). **About** is its own page. It shows this Turbo version, states that this version was tested with Project NOMAD 1.35.1, and links to that repository and the [Project NOMAD repository](https://github.com/Crosstalk-Solutions/project-nomad). It names the author Vibe-Dragon, the MIT license, Copyright 2026, that these notes are updated when I get to it, and that I am not responsible if Turbo messes up an index.
 
-The Qdrant line sits under the Index / Repair switch. **Start indexing**, **Delete index**, **Scan**, and **Start repair** stay off until that line says `Qdrant is ready for changes.` **Rescan** does not wait.
+The file list is the part that grows. On Index, the current-file bar, the library bar, and the **Embed batch** slider share one row under the list. The usage line and the card line share the next row. The usage line reads `Set 55% · <chunks> chunks per call. Embed server: idle.` The chunk count is the budget for that setting on your machine. Once a run has started the server, that line says `One embed server is running.` Above 100% it adds `Overclock past the detected budget.` The card line on that same row reads `Card memory in use: <used> / <total> MiB`, or `No GPU detected. The embed server will use the CPU.` The stats line is under those. **Stay on after the last file** shares the button row with **Start indexing**, **Stop**, **Rescan**, and **Export log**. At the default window size, with the log open and the drag bars left where a new install puts them, each file list is at least half its page. Extra height goes to the list. Hover any button, checkbox, column heading, progress bar, or those lines for what they do.
 
-The window edges resize the whole window. Each page has a drag bar between the file list and the controls. The log bar sits under the Log row. Column edges resize. Those positions are remembered.
+The Qdrant line sits under the Index / Repair / About switch. **Start indexing**, **Delete index**, **Scan**, and **Start repair** stay off until that line says `Qdrant is ready for changes.` **Rescan** does not wait.
+
+The window edges resize the whole window. The smallest size it asks for is 480 by 280. Each page has a drag bar between the file list and the controls. At that size the file list keeps a non-zero height and the controls stay in their scroller, so they can be scrolled into view when the window is short. The log bar sits under the Log row. Column edges resize. Those positions are remembered. Blue names are ZIM files and amber names are uploads. That note is on the File heading, and on the Index status line's tip. Repair's longer instructions are on the repair status tip.
 
 If Turbo dies while the embed queue is paused, the next time the window opens it puts the ingest policy back and resumes NOMAD embedding. If a repair delete may still be running, embedding stays paused. `nomad-turbo recover` does the same thing.
 
@@ -305,7 +307,7 @@ The Index page is the library list.
 - **Rate.** Articles per minute swing with page length. Chunks per second stay steadier.
 - **ETA.** Time left for this file at its recent article rate.
 
-The file being indexed has its own bar. The bar under it is the whole library, weighed by file size, and the time left for what remains. The stats line counts articles per minute, chunks per minute, skipped pages, and bad pages. Skipped pages had no text. Bad pages could not be read or parsed. A long page is indexed in full.
+The file being indexed has its own bar. The library bar on the same row is the whole library, weighed by file size, and the time left for what remains. The stats line counts articles per minute, chunks per minute, skipped pages, and bad pages. Skipped pages had no text. Bad pages could not be read or parsed. A long page is indexed in full.
 
 The list keeps the active file near the top. Click a heading to sort. Drag a column edge to resize it. That width is remembered.
 
@@ -357,7 +359,7 @@ On a long run the pane drops lines it has already shown, so the window still ans
 
 Repair is the second page. It does not embed files, and it does not wipe the collection. It finds index entries whose library file is gone, and **Start repair** can delete those entries. **Delete index** is the other button, on the Index page, and it asks you to type DELETE.
 
-**Quick repair** and **Complete repair** are the two modes. Both **Scan** and **Start repair** use the mode that is selected.
+**Quick repair** and **Complete repair** are the two modes. Both **Scan** and **Start repair** use the mode that is selected. Those two modes share the row under the file list with **Scan**, **Start repair**, and **Stop**. The file list takes the spare height on this page, the same way the Index list does. The longer repair instructions are on the status line's tip.
 
 **Scan** only reads. It does not pause NOMAD, does not change the ingest policy, and does not delete points. Quick compares the files on disk with ingest rows and checkpoints. Complete also asks Qdrant to list every `source` in the collection, when the collection is answering. If it is not answering, the scan still compares files, rows, and checkpoints, and it says the source list did not return. Stop is checked between those steps. The source list itself runs until Qdrant answers.
 
