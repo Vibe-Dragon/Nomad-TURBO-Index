@@ -46,8 +46,8 @@ from nomad_turbo.tips import TIPS
 
 log = logging.getLogger("nomad_turbo")
 
-# People who open this window can reach the project Turbo is built for.
-PROJECT_URL = "https://github.com/Crosstalk-Solutions/project-nomad"
+# Anyone running this window already has Project NOMAD. The corner link opens this repo.
+REPO_URL = "https://github.com/Vibe-Dragon/Nomad-TURBO-Index"
 
 
 def window_close_action(indexing: bool) -> str:
@@ -252,7 +252,7 @@ class _Window:
         header = gtk.Box(orientation=gtk.Orientation.HORIZONTAL, spacing=8)
         header.set_hexpand(True)
         header.pack_start(switcher, False, False, 0)
-        project = gtk.LinkButton.new_with_label(PROJECT_URL, "Project NOMAD")
+        project = gtk.LinkButton.new_with_label(REPO_URL, "Nomad TURBO Index")
         project.set_halign(gtk.Align.END)
         project.set_tooltip_text(TIPS["project"])
         header.pack_end(project, False, False, 0)

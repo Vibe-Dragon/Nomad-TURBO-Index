@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Minor
+
+- The corner link opens this repository. The README links to Project NOMAD.
+- The README describes the CPU, GPU, memory, and disk spikes a run can show, and which of them mean the index is still working.
+
 ## 1.0.1
 
 ### Major

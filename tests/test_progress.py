@@ -343,7 +343,8 @@ class ProgressTest(unittest.TestCase):
         self.assertIn("pack1(scrolled, True, False)", text)
         self.assertIn("pack1(top, True, False)", text)
         self.assertIn("pack2(log_scroll, False, True)", text)
-        self.assertIn("https://github.com/Crosstalk-Solutions/project-nomad", text)
+        self.assertIn("https://github.com/Vibe-Dragon/Nomad-TURBO-Index", text)
+        self.assertIn("Nomad TURBO Index", text)
 
     def test_the_pane_reads_only_lines_it_has_not_shown(self):
         memory = _MemoryLog()

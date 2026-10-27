@@ -1,6 +1,6 @@
 # NOMAD Turbo
 
-Nomad TURBO Index speeds up a stock Project NOMAD knowledge base from outside the admin container. It detects the machine it is on and sizes one embed call from that hardware. This copy was tested with Project NOMAD 1.35.1.
+Nomad TURBO Index speeds up a stock [Project NOMAD](https://github.com/Crosstalk-Solutions/project-nomad) knowledge base from outside the admin container. It detects the machine it is on and sizes one embed call from that hardware. This copy was tested with Project NOMAD 1.35.1.
 
 ## How Turbo indexing differs from stock NOMAD
 
@@ -281,7 +281,7 @@ Click the icon. The window scans the library. Opening it does not start or stop 
 
 The **Embed batch** slider is the boost. The line under it reads `Set 55% · <chunks> chunks per call. Embed server: idle.` The chunk count is the budget for that setting on your machine. Once a run has started the server, that line says `One embed server is running.` Above 100% it adds `Overclock past the detected budget.` The next line is `Card memory in use: <used> / <total> MiB`, or `No GPU detected. The embed server will use the CPU.` Hover any button, checkbox, column heading, progress bar, or those lines for what they do.
 
-**Project NOMAD** at the top right opens the Project NOMAD repository. The Qdrant line sits under the Index / Repair switch. **Start indexing**, **Delete index**, **Scan**, and **Start repair** stay off until that line says `Qdrant is ready for changes.` **Rescan** does not wait.
+**Nomad TURBO Index** at the top right opens this repository. The Qdrant line sits under the Index / Repair switch. **Start indexing**, **Delete index**, **Scan**, and **Start repair** stay off until that line says `Qdrant is ready for changes.` **Rescan** does not wait.
 
 The window edges resize the whole window. Each page has a drag bar between the file list and the controls. The log bar sits under the Log row. Column edges resize. Those positions are remembered.
 
@@ -308,6 +308,42 @@ The Index page is the library list.
 The file being indexed has its own bar. The bar under it is the whole library, weighed by file size, and the time left for what remains. The stats line counts articles per minute, chunks per minute, skipped pages, and bad pages. Skipped pages had no text. Bad pages could not be read or parsed. A long page is indexed in full.
 
 The list keeps the active file near the top. Click a heading to sort. Drag a column edge to resize it. That width is remembered.
+
+## Resource spikes while indexing
+
+A run trades work between the embed server, Qdrant, and the disk. One of them getting busy while another goes quiet is that handoff. The link at the top right only opens this repository. It does not start a job, and it does not talk to Qdrant or the embed server.
+
+### The GPU stays busy and articles per minute drop
+
+A long page becomes many chunks. The embed server spends that time on the GPU. Articles per minute fall because the page takes a while. Chunks per minute on the stats line are the sign the run is still working. A quiet disk during that stretch is normal.
+
+### The GPU is quieter and the embed server uses more CPU
+
+Short pages leave the graphics card waiting between calls. The embed server then spends more of its time on the CPU, packing those small chunks. Dictionaries and other short-article libraries look like this. Chunks per minute can stay healthy while the GPU graph sits well under full.
+
+### CPU jumps for a few minutes and the GPU drops
+
+Qdrant builds a new segment when the one it is writing fills. That build is CPU work: the payload indexes, then the search graph. Turbo waits until each batch is stored, so the embed server sits idle and GPU use falls until the build finishes. The collection can show yellow while those new points are not in the search graph yet. Closing a browser does not stop the build. Leave Qdrant running. A restart replays the unfinished write and can use more memory than the build did.
+
+### CPU stays high after the Knowledge Base page is closed, and the article count stops
+
+Project NOMAD's Knowledge Base page asks Qdrant to set `active` on every stored point that does not already have it. The page can time out and be closed while Qdrant is still doing that rewrite. Turbo waits on the current file, and the GPU drops because new batches are not being stored. Points Turbo stores already include `active`. The rewrite is the older points. Leave Qdrant running, and leave that page closed during a run.
+
+### Memory climbs over a long run
+
+Qdrant keeps the search graph in RAM. The graph grows as more of the library is stored. That climb is the index. A restart loads the graph again from disk, and a large index can use more memory on the way back up than it did while it was running.
+
+### The disk is busy and the next batch waits
+
+Reading a ZIM and writing the index share the disk. When the disk is saturated, Turbo waits before the next upsert. A download onto the same disk slows both.
+
+### Start spends a short while loading the model
+
+The embed server loads the model once when a run starts. The log says `embedder not ready yet` until that load finishes. Card memory steps up by the model and stays there. The usage line then says `One embed server is running.`
+
+### One page holds the article count
+
+A very long page is read and split before its chunks are stored. The article count sits on that page while the reader and the embed server work through it. The next article shows up when that page has been stored. Chunks per minute still move if the page is producing chunks.
 
 ## Log
 

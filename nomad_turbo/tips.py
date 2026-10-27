@@ -80,7 +80,7 @@ TIPS: dict[str, str] = {
         "The window edges resize the whole window. Those positions are remembered."
     ),
     "project": (
-        "Open the Project NOMAD repository. Turbo is a side tool for that project."
+        "Open this project's repository."
     ),
     "repair_quick": (
         "Compare files on disk with ingest rows and checkpoints. "
