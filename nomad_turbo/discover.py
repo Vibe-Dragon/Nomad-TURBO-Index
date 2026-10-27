@@ -56,6 +56,11 @@ class Install:
     # 10–110 slider. None means "use reserve_ratio", which is at most 100.
     # 110 is an overclock and is never the default for a new install.
     boost_percent: int | None = None
+    # Separate host-meter window. None leaves the place to the window manager.
+    host_x: int | None = None
+    host_y: int | None = None
+    host_width: int = 0
+    host_height: int = 0
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2)
@@ -242,6 +247,10 @@ def load_install() -> Install:
         "collection",
         "dimension",
         "boost_percent",
+        "host_x",
+        "host_y",
+        "host_width",
+        "host_height",
     ):
         setattr(found, key, getattr(saved, key))
     return found

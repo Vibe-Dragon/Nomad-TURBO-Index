@@ -233,6 +233,8 @@ class _Window:
         self._log_split_ready = False
         self._pane_styled = False
         self.layout_timer = None
+        self.host_window = None
+        self._host_guard = False
         self.scanning = False
         self.rows_ready = False
         self.last_seq = 0
@@ -282,6 +284,11 @@ class _Window:
         header = gtk.Box(orientation=gtk.Orientation.HORIZONTAL, spacing=8)
         header.set_hexpand(True)
         header.pack_start(switcher, False, False, 0)
+        self.host_button = gtk.ToggleButton(label="Host")
+        self.host_button.set_tooltip_text(TIPS["host"])
+        self.host_button.set_valign(gtk.Align.CENTER)
+        self.host_button.connect("toggled", self.on_host)
+        header.pack_start(self.host_button, False, False, 0)
         self.version_label = gtk.Label(label=__version__)
         self.version_label.set_halign(gtk.Align.END)
         self.version_label.set_tooltip_text(TIPS["version"])
@@ -452,20 +459,28 @@ class _Window:
         self.scale = gtk.Scale.new_with_range(gtk.Orientation.HORIZONTAL, 10, 110, 5)
         self.scale.set_value(session.get_percent())
         self.scale.set_hexpand(True)
+        # The live percent sits above the thumb. 100 and 110 are one tenth of
+        # the track apart, so 110% is a label past the end instead of a mark.
         self.scale.set_draw_value(True)
-        self.scale.set_value_pos(gtk.PositionType.RIGHT)
+        self.scale.set_value_pos(gtk.PositionType.TOP)
+        self.scale.set_size_request(-1, 52)
         self.scale.set_valign(gtk.Align.CENTER)
-        for mark in (10, 100, 110):
+        for mark in (10, 100):
             self.scale.add_mark(mark, gtk.PositionType.BOTTOM, f"{mark}%")
+        self.scale.add_mark(110, gtk.PositionType.BOTTOM, None)
         self.scale.set_tooltip_text(TIPS["slider"])
         self.scale.connect("format-value", lambda _scale, value: f"{int(round(value))}%")
         self.scale.connect("value-changed", self.on_slider)
+        self.scale_end = gtk.Label(label="110%")
+        self.scale_end.set_valign(gtk.Align.END)
+        self.scale_end.set_tooltip_text(TIPS["slider"])
         bars = gtk.Box(orientation=gtk.Orientation.HORIZONTAL, spacing=8)
         bars.pack_start(self.current_label, True, True, 0)
         bars.pack_start(self.current_bar, True, True, 0)
         bars.pack_start(self.overall, True, True, 0)
         bars.pack_start(slider_label, False, False, 0)
         bars.pack_start(self.scale, True, True, 0)
+        bars.pack_start(self.scale_end, False, False, 0)
         lower.pack_start(bars, False, False, 0)
 
         self.usage = gtk.Label(label="")
@@ -747,6 +762,43 @@ class _Window:
     def on_raise(self, _signum, _frame) -> None:
         self.raise_requested = True
 
+    def on_host(self, button) -> None:
+        if self._host_guard:
+            return
+        if button.get_active():
+            try:
+                self._open_host()
+            except Exception:
+                log.exception("could not open the host window")
+                self._host_guard = True
+                button.set_active(False)
+                self._host_guard = False
+            return
+        self._close_host()
+
+    def _open_host(self) -> None:
+        if self.host_window is not None:
+            self.host_window.present()
+            return
+        from nomad_turbo.host_window import HostWindow
+
+        self.host_window = HostWindow(self.install, self.gtk, self.glib, self._host_closed)
+        self.host_window.window.show_all()
+
+    def _host_closed(self) -> None:
+        self.host_window = None
+        self._host_guard = True
+        try:
+            self.host_button.set_active(False)
+        finally:
+            self._host_guard = False
+
+    def _close_host(self) -> None:
+        window = self.host_window
+        self.host_window = None
+        if window is not None:
+            window.close()
+
     def on_delete(self, *_args) -> bool:
         indexing = self._work_alive()
         if window_close_action(indexing) == "hide" and self.indicator is not None:
@@ -754,6 +806,7 @@ class _Window:
             self.window.hide()
             log.info("window closed to the tray. Turbo keeps running.")
             return True
+        self._close_host()
         self._stop_all()
         self.session.close_requested = True
         if indexing:

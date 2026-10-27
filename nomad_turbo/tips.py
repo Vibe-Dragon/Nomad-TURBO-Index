@@ -84,6 +84,14 @@ TIPS: dict[str, str] = {
     ),
     "nomad_repo": "Open the Project NOMAD repository.",
     "version": "This copy of Nomad TURBO Index. About names the Project NOMAD version it was tested with.",
+    "host": (
+        "Open a separate window for CPU, memory, GPU, video memory, and the disks the library uses. "
+        "Resize that window and place it where you want. The size and place are remembered."
+    ),
+    "host_disk": (
+        "Used space and size of each disk the library uses, and how fast that disk is reading and writing. "
+        "A folder on its own disk, such as Qdrant, is a separate line."
+    ),
     "legend": (
         "Blue names are ZIM files. Amber names are files you uploaded. "
         "Drag a column edge to resize it. Drag a bar to resize the list, the controls, or the log. "

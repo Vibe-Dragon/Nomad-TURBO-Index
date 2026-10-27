@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 1.0.3
+
+### Minor
+
+- Host opens a separate window for CPU, memory, GPU, and video memory. Each disk the library uses shows its size and its read and write speed, including a folder that lives on another disk. It stays off the Index page. The window remembers its size and place.
+- The 110% end of the embed-batch slider is a label past the track, so it stays clear of the 100% mark.
+
 ## 1.0.2
 
 ### Moderate

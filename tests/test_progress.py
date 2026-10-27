@@ -868,11 +868,13 @@ class AboutAndLayoutTest(unittest.TestCase):
         self.assertIn("share one row", readme)
         for phrase in _ABOUT_PHRASES:
             self.assertIn(phrase, facts["body"])
+        self.assertIn("About", changelog)
+        self.assertIn("half the page", changelog)
+        self.assertIn("Project NOMAD 1.35.1", changelog)
+        self.assertIn("shared rows", changelog)
         notes = changelog.split(f"## {__version__}", 1)[1].split("\n## ", 1)[0]
-        self.assertIn("About", notes)
-        self.assertIn("half the page", notes)
-        self.assertIn("Project NOMAD 1.35.1", notes)
-        self.assertIn("shared rows", notes)
+        self.assertIn("Host", notes)
+        self.assertIn("disk", notes)
         self.assertIn("about_facts()", window)
         self.assertEqual(_source_layout_ok(), "ok")
 

@@ -48,6 +48,7 @@ PAGE_TIPS = (
     "file_bar",
     "library_bar",
     "keep",
+    "host",
     "errors",
     "info",
     "debug",
