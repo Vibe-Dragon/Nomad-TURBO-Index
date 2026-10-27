@@ -38,7 +38,7 @@ TIPS: dict[str, str] = {
         "A long page is indexed in full and stored as many chunks."
     ),
     "slider": (
-        "How many chunks the next embed call sends, as a percent of the budget detected on this computer. "
+        "How many chunks the next embed call sends, as a percent of the budget detected on the computer running Turbo. "
         "10% to 100% stays inside that budget. 110% is an overclock past that budget. "
         "One embed server stays up. A call that is already running is left alone."
     ),

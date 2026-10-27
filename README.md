@@ -40,7 +40,7 @@ Stock NOMAD queues small embed jobs on `file-embeddings` and talks to Ollama one
 
 ```python
 def batch_width(self, percent: int) -> int:
-    """Chunks the next call sends. One server. The width follows this machine."""
+    """Chunks the next call sends. One server. The width follows the computer running Turbo."""
     gpu_total = self.total_mib if self.use_gpu and self.total_mib > 0 else None
     return embed_call_budget(
         percent,
@@ -349,7 +349,7 @@ Stop works between files, or between scan steps. A delete that was already sent 
 
 The desktop icon runs `nomad-turbo toggle`. It opens or raises the window. It does not start or stop indexing.
 
-- `nomad-turbo plan` prints the call size for this machine. It does not pause NOMAD or start containers.
+- `nomad-turbo plan` prints the call size for the computer it is running on. It does not pause NOMAD or start containers.
 - `nomad-turbo status` prints whether indexing is running, or only the window is open.
 - `nomad-turbo stop` stops after the embed call that is already running.
 - `nomad-turbo recover` puts the ingest policy back and resumes NOMAD embedding after a crash that left the queue paused. A repair delete that may still be running leaves embedding paused.

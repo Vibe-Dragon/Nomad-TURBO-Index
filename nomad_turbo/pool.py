@@ -94,7 +94,7 @@ class EmbedPool:
             log.info("config slots=%s is ignored. Turbo keeps one embed server.", install.slots)
 
     def batch_width(self, percent: int) -> int:
-        """Chunks the next call sends. One server. The width follows this machine."""
+        """Chunks the next call sends. One server. The width follows the computer running Turbo."""
         gpu_total = self.total_mib if self.use_gpu and self.total_mib > 0 else None
         return embed_call_budget(
             percent,

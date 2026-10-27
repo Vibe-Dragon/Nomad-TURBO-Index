@@ -107,7 +107,7 @@ def _isqrt(value: int) -> int:
 
 
 def safe_call_chunks(*, gpu_total_mib: int | None, host_total_mib: int, cpu_count: int) -> int:
-    """Safe 100% chunk count for this machine.
+    """Safe 100% chunk count for the computer running Turbo.
 
     GPU memory wins when a GPU is present. Otherwise the count comes from
     system RAM and the CPU count. The result is finite, and a bigger memory
@@ -134,7 +134,7 @@ def embed_call_budget(
     host_total_mib: int,
     cpu_count: int,
 ) -> int:
-    """Chunks one embed call should carry on this machine.
+    """Chunks one embed call should carry on the computer running Turbo.
 
     100% is the safe size from GPU memory when a GPU is present, otherwise
     from system RAM and the CPU count. 10% through 100% scale that size.
