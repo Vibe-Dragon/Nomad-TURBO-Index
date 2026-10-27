@@ -281,7 +281,7 @@ Click the icon. The window scans the library. Opening it does not start or stop 
 
 The **Embed batch** slider is the boost. The line under it reads `Set 55% · <chunks> chunks per call. Embed server: idle.` The chunk count is the budget for that setting on your machine. Once a run has started the server, that line says `One embed server is running.` Above 100% it adds `Overclock past the detected budget.` The next line is `Card memory in use: <used> / <total> MiB`, or `No GPU detected. The embed server will use the CPU.` Hover any button, checkbox, column heading, progress bar, or those lines for what they do.
 
-**Nomad TURBO Index** at the top right opens this repository. The Qdrant line sits under the Index / Repair switch. **Start indexing**, **Delete index**, **Scan**, and **Start repair** stay off until that line says `Qdrant is ready for changes.` **Rescan** does not wait.
+The Qdrant line sits under the Index / Repair switch. **Start indexing**, **Delete index**, **Scan**, and **Start repair** stay off until that line says `Qdrant is ready for changes.` **Rescan** does not wait.
 
 The window edges resize the whole window. Each page has a drag bar between the file list and the controls. The log bar sits under the Log row. Column edges resize. Those positions are remembered.
 
@@ -311,7 +311,7 @@ The list keeps the active file near the top. Click a heading to sort. Drag a col
 
 ## Resource spikes while indexing
 
-A run trades work between the embed server, Qdrant, and the disk. One of them getting busy while another goes quiet is that handoff. The link at the top right only opens this repository. It does not start a job, and it does not talk to Qdrant or the embed server.
+A run trades work between the embed server, Qdrant, and the disk. One of them getting busy while another goes quiet is that handoff.
 
 ### The GPU stays busy and articles per minute drop
 
