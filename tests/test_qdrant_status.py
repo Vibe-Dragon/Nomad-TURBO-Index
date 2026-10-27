@@ -2,7 +2,14 @@ import unittest
 from datetime import datetime, timezone
 
 import nomad_turbo.qdrant_status as qdrant_status
-from nomad_turbo.qdrant_status import activity_from_text, changes_allowed, describe_qdrant, uptime_text
+from nomad_turbo.qdrant_status import (
+    activity_from_text,
+    changes_allowed,
+    describe_qdrant,
+    growth_line,
+    read_vector_count,
+    uptime_text,
+)
 
 
 class QdrantStatusTest(unittest.TestCase):
@@ -49,11 +56,26 @@ class QdrantStatusTest(unittest.TestCase):
             health_ok=True,
             ready_ok=True,
             collection_ok=False,
+            vectors=1000,
+            previous_vectors=800,
             **common,
         )
         self.assertFalse(listed.ready)
-        self.assertIn("not answering", listed.text)
+        self.assertIn("Do not restart it or delete the index.", listed.text)
         self.assertIn("did not answer", listed.text)
+        self.assertIn("grew by 200 vectors", listed.text)
+        self.assertIn("now holds 1,000", listed.text)
+        self.assertIn("A restart would replay this write.", listed.text)
+        stalled = describe_qdrant(
+            health_ok=True,
+            ready_ok=True,
+            collection_ok=False,
+            vectors=1000,
+            previous_vectors=1000,
+            **common,
+        )
+        self.assertIn("still holds 1,000 vectors", stalled.text)
+        self.assertIn("Leave Qdrant running until the collection answers.", stalled.text)
 
         ready = describe_qdrant(
             health_ok=True,
@@ -78,6 +100,13 @@ class QdrantStatusTest(unittest.TestCase):
         self.assertFalse(down.ready)
         self.assertIn("Qdrant is exited.", down.text)
         self.assertIn("Not ready for changes.", down.text)
+
+    def test_the_segment_counter_and_its_wording(self):
+        self.assertIsNone(read_vector_count(b""))
+        self.assertIsNone(read_vector_count(b"\x01\x02"))
+        self.assertEqual(read_vector_count((24556160).to_bytes(8, "little") + b"\x00"), 24556160)
+        self.assertIn("could not be read", growth_line(10, None))
+        self.assertIn("holds 4 vectors", growth_line(None, 4))
 
     def test_changes_wait_until_the_collection_answers(self):
         self.assertFalse(changes_allowed(False))

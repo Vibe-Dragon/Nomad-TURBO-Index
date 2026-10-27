@@ -67,6 +67,7 @@ from nomad_turbo.store import (
     mark_pending,
     point_id,
     set_policy,
+    source_active,
     upsert,
 )
 
@@ -77,7 +78,10 @@ SCAN_SECONDS = 5
 
 # After a Qdrant write times out, stay on this file instead of walking the library.
 QDRANT_HOLD_SECONDS = 20
-QDRANT_HOLD_NOTE = "Qdrant is not taking writes. Turbo is waiting and will keep this file."
+QDRANT_HOLD_NOTE = (
+    "Qdrant is still writing this file. Do not restart Qdrant or delete the index. "
+    "Turbo is waiting here."
+)
 
 _rules_mod = None
 _rules_lock = threading.Lock()
@@ -277,6 +281,8 @@ class FileWork:
     touched: bool = False
     skipped: int = 0
     bad: int = 0
+    # Copied onto every point. False only when the ingest row turned the file off.
+    point_active: bool = True
 
 
 def _checkpoint_file(source: str) -> Path:
@@ -708,6 +714,7 @@ def _points_for(
                     "char_count": len(text),
                     "created_at": stamp,
                     "source": meta["source"],
+                    "active": bool(meta.get("active", True)),
                 },
             }
         )
@@ -825,13 +832,29 @@ def _prepare_article(install: Install, work: FileWork, article: dict, seen: set[
             section_for_input=[],
             already_stored=True,
         )
-    return prepare_article(
+    prepared = prepare_article(
         article,
         work.source,
         article.get("_archive") or {},
         str(uuid.uuid4()),
         install.document_prefix or DOCUMENT_PREFIX,
     )
+    for section in prepared.sections:
+        section.meta["active"] = work.point_active
+    return prepared
+
+
+def _load_point_active(install: Install, work: FileWork) -> None:
+    """Read the file's search flag once. A lookup failure leaves points searchable."""
+    try:
+        work.point_active = source_active(install, work.source)
+    except Exception as exc:
+        log.warning(
+            "could not read the active flag for %s. New points stay searchable: %s",
+            work.source,
+            exc,
+        )
+        work.point_active = True
 
 
 class _UpsertPipe:
@@ -873,6 +896,7 @@ def _index_zim(
     session: Session | None,
     retire: threading.Event | None = None,
 ) -> None:
+    _load_point_active(install, work)
     already = count_source(install, work.source)
     stored = existing_paths(install, work.source) or set() if already is not None and already <= 2000 else set()
     log.info("indexing %s from article %s (%s paths already stored)", work.source, work.articles, len(stored))
@@ -1080,6 +1104,7 @@ def _index_plain(
         if retire is not None and retire.is_set():
             raise RuntimeError("replaced")
         return
+    _load_point_active(install, work)
     existing = count_source(install, work.source)
     if existing:
         log.info("skipping %s, points already stored", work.source)

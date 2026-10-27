@@ -8,8 +8,9 @@ from __future__ import annotations
 
 TIPS: dict[str, str] = {
     "qdrant": (
-        "Whether the Qdrant container is running, what its last log line says, "
-        "and whether the collection is answering. Ready for changes means the collection answered."
+        "Whether Qdrant is running and the collection is answering. "
+        "While a write is still moving, this says so and says not to restart Qdrant or delete the index. "
+        "Ready for changes means the collection answered."
     ),
     "qdrant_gate": (
         "Qdrant is not ready for changes yet. This stays off until the collection answers."

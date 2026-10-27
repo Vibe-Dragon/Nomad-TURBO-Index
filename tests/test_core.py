@@ -34,7 +34,7 @@ from nomad_turbo.decisions import (
 from nomad_turbo.desktop import desktop_text
 from nomad_turbo.icons import icon_bytes, write_icons
 from nomad_turbo.prompt import ask_gpu_share
-from nomad_turbo.store import collection_action
+from nomad_turbo.store import active_from_cell, collection_action
 from nomad_turbo.discover import Install
 from nomad_turbo.packing import ArticleFeed, PreparedArticle, prepare_article
 from nomad_turbo.runtime import (
@@ -582,6 +582,54 @@ class SpeedTest(unittest.TestCase):
         self.assertEqual(prepared.sections[0].meta["source"], "/app/storage/zim/a.zim")
         self.assertEqual(prepared.sections[0].meta["section_title"], "H")
         self.assertEqual(prepared.sections[1].meta["section_level"], 3)
+        self.assertIs(prepared.sections[0].meta["active"], True)
+
+    def test_a_stored_point_always_has_the_active_flag(self):
+        """NOMAD rewrites every point that is missing this field."""
+        self.assertTrue(active_from_cell(None))
+        self.assertTrue(active_from_cell(""))
+        self.assertTrue(active_from_cell("1"))
+        self.assertFalse(active_from_cell("0"))
+        self.assertFalse(active_from_cell("1\n0"))
+        from nomad_turbo.engine import FileWork, _points_for, _prepare_article
+
+        install = Install(
+            admin_container="admin",
+            admin_image="admin",
+            network="net",
+            redis_host="redis",
+            redis_port=6379,
+            redis_container="redis",
+            mysql_container="mysql",
+            qdrant_url="http://127.0.0.1:6333",
+            ollama_image="ollama",
+            ollama_container="ollama",
+            models_dir="/models",
+            storage_host="/storage",
+        )
+        work = FileWork(
+            host=Path("a.zim"),
+            kind="zim",
+            source="/app/storage/zim/a.zim",
+            point_active=False,
+        )
+        prepared = _prepare_article(
+            install,
+            work,
+            {"title": "Title", "path": "A", "sections": [{"heading": "", "text": "body", "level": 2}]},
+            set(),
+        )
+        self.assertIs(prepared.sections[0].meta["active"], False)
+        off = _points_for(install, [[0.0] * 768], ["body"], prepared.sections[0].meta, 0)
+        self.assertIs(off[0]["payload"]["active"], False)
+        on_meta = dict(prepared.sections[0].meta)
+        on_meta["active"] = True
+        on = _points_for(install, [[0.0] * 768], ["body"], on_meta, 0)
+        self.assertIs(on[0]["payload"]["active"], True)
+        bare = dict(on_meta)
+        del bare["active"]
+        defaulted = _points_for(install, [[0.0] * 768], ["body"], bare, 0)
+        self.assertIs(defaulted[0]["payload"]["active"], True)
 
     def test_a_partial_article_is_not_emitted(self):
         feed = ArticleFeed()

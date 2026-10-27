@@ -192,6 +192,7 @@ class _Window:
         self.qdrant_stop = threading.Event()
         self.qdrant_text = "Checking Qdrant…"
         self.qdrant_ready = False
+        self.qdrant_vectors = None
         self._qdrant_error = None
         self._followed: dict[int, str] = {}
         self._column_manual: dict[str, bool] = {}
@@ -641,9 +642,16 @@ class _Window:
 
         while not self.qdrant_stop.is_set():
             try:
-                view = probe_qdrant(self.install.qdrant_url, self.install.collection)
+                view = probe_qdrant(
+                    self.install.qdrant_url,
+                    self.install.collection,
+                    storage=self.install.storage_host,
+                    previous_vectors=self.qdrant_vectors,
+                )
                 self.qdrant_text = view.text
                 self.qdrant_ready = view.ready
+                if view.vectors is not None:
+                    self.qdrant_vectors = view.vectors
             except Exception as exc:
                 message = f"{exc.__class__.__name__}: {exc}"
                 if message != self._qdrant_error:

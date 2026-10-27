@@ -107,6 +107,31 @@ def set_policy(install: Install, policy: str) -> None:
     )
 
 
+def active_from_cell(cell: str | None) -> bool:
+    """A missing ingest row leaves the file searchable. Stock NOMAD does the same.
+
+    The knowledge-base page stamps ``active: true`` onto every point that has
+    no ``active`` field. That rewrite holds the collection until it finishes,
+    so a point Turbo stores has to carry the flag itself.
+    """
+    if cell is None:
+        return True
+    text = cell.strip()
+    if not text:
+        return True
+    return text.splitlines()[-1].strip() != "0"
+
+
+def source_active(install: Install, source: str) -> bool:
+    """The file's current search flag. True when the ingest row does not say off."""
+    safe = source.replace("\\", "\\\\").replace("'", "''")
+    text = _sql(
+        install,
+        f"SELECT active FROM kb_ingest_state WHERE file_path='{safe}' LIMIT 1;\n",
+    ).strip()
+    return active_from_cell(text or None)
+
+
 def ingest_states(install: Install) -> dict[str, str]:
     return {path: state for path, (state, _chunks) in ingest_details(install).items()}
 

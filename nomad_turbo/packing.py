@@ -66,6 +66,9 @@ def prepare_article(
                 "hierarchy": f"{title} > {heading}" if heading else title,
                 "section_level": raw.get("level") or 2,
                 "document_id": document_id,
+                # Stock search hides a point only when active is false. Leaving
+                # the field off makes the knowledge-base page rewrite the index.
+                "active": True,
                 "archive_title": archive.get("title") or "",
                 "archive_creator": archive.get("creator") or "",
                 "archive_publisher": archive.get("publisher") or "",

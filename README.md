@@ -365,9 +365,9 @@ The status line under the page switch is one of these until the collection answe
 - `Qdrant is missing. Not ready for changes.` The container state replaces `missing` when Docker reports one.
 - `Qdrant is running and has not passed the health check. Not ready for changes.`
 - `Qdrant is running. The ready check has not passed. Not ready for changes.`
-- `Qdrant is up and the collection is not answering yet. Not ready for changes.`
+- `Qdrant is still writing. Do not restart it or delete the index.`
 
-A large collection can be up and still on the last of those while it finishes loading. **Start indexing**, **Delete index**, **Scan**, and **Start repair** stay off. The second line of that status names the container, how long it has been up, the health check, the ready check, and whether the collection answered. When Docker returned a log line, it is included as `Last log:`.
+A large collection can be up and still on the last of those while it finishes a write. **Start indexing**, **Delete index**, **Scan**, and **Start repair** stay off. The second line names the container, how long it has been up, the health check, the ready check, and whether the collection answered. When the collection does not answer, that line also says a restart would replay the write, and it says whether the open segment is still gaining vectors. When Docker returned a log line, it is included as `Last log:`.
 
 `Qdrant is ready for changes.` is the line that turns those buttons on.
 
@@ -375,7 +375,7 @@ A large collection can be up and still on the last of those while it finishes lo
 
 A write that does not reach Qdrant is tried again. The log says `qdrant write timed out. Trying that batch again.`
 
-If it is still not taking the write, Turbo stays on that file. The status line says `Qdrant is not taking writes. Turbo is waiting and will keep this file.` The log says `qdrant is not taking writes. Staying on <file> at article <n>: qdrant unreachable: ...`
+If it is still not taking the write, Turbo stays on that file. The status line says `Qdrant is still writing this file. Do not restart Qdrant or delete the index. Turbo is waiting here.` The log says `qdrant is not taking writes. Staying on <file> at article <n>: qdrant unreachable: ...`
 
 `qdrant 400: ...`, `qdrant 503: ...`, and the other `qdrant <code>:` lines are answers Qdrant did return. Turbo does not treat those as "wait on this article." It tries that file once more from the same article (`will try <file> again from article <n> after an error`). A second failure at that same article is `file failed`.
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 
 from nomad_turbo.store import _health_ok, _request
 
@@ -17,6 +18,7 @@ from nomad_turbo.store import _health_ok, _request
 class QdrantView:
     text: str
     ready: bool
+    vectors: int | None = None
 
 
 def activity_from_text(text: str) -> str:
@@ -79,6 +81,64 @@ def changes_allowed(ready: bool) -> bool:
     return bool(ready)
 
 
+def read_vector_count(raw: bytes) -> int | None:
+    """The vector counter Qdrant stores at the front of a segment status file."""
+    if len(raw) < 8:
+        return None
+    count = int.from_bytes(raw[:8], "little")
+    if count < 0:
+        return None
+    return count
+
+
+def open_segment_vectors(storage: str, collection: str) -> int | None:
+    """How many vectors the busiest segment holds. None when the files cannot be read.
+
+    This is a local file read. It does not call Qdrant, so it still works
+    while a write is holding the collection.
+    """
+    root = Path(storage) / "qdrant" / "collections" / collection
+    if not root.is_dir():
+        return None
+    newest: Path | None = None
+    newest_mtime = -1.0
+    try:
+        matches = root.glob("*/segments/*/vector_storage/vectors/status.dat")
+    except OSError:
+        return None
+    for status in matches:
+        try:
+            mtime = status.stat().st_mtime
+        except OSError:
+            continue
+        if mtime >= newest_mtime:
+            newest = status
+            newest_mtime = mtime
+    if newest is None:
+        return None
+    try:
+        return read_vector_count(newest.read_bytes())
+    except OSError:
+        return None
+
+
+def growth_line(previous: int | None, current: int | None) -> str:
+    """Say whether the open segment is still taking vectors."""
+    if current is None:
+        return "The index files could not be read. Leave Qdrant running."
+    if previous is not None and current > previous:
+        return (
+            f"The open segment grew by {current - previous:,} vectors "
+            f"and now holds {current:,}. That write is still moving."
+        )
+    if previous is not None:
+        return (
+            f"The open segment still holds {current:,} vectors. "
+            "Leave Qdrant running until the collection answers."
+        )
+    return f"The open segment holds {current:,} vectors."
+
+
 def describe_qdrant(
     *,
     running: bool,
@@ -89,9 +149,12 @@ def describe_qdrant(
     collection: str,
     activity: str,
     uptime: str,
+    vectors: int | None = None,
+    previous_vectors: int | None = None,
 ) -> QdrantView:
     """One block of text for the window. ready is true only when changes can be sent."""
     state = status or "missing"
+    hold_detail = ""
     if not running:
         headline = f"Qdrant is {state}. Not ready for changes."
         ready = False
@@ -102,7 +165,8 @@ def describe_qdrant(
         headline = "Qdrant is running. The ready check has not passed. Not ready for changes."
         ready = False
     elif not collection_ok:
-        headline = "Qdrant is up and the collection is not answering yet. Not ready for changes."
+        headline = "Qdrant is still writing. Do not restart it or delete the index."
+        hold_detail = growth_line(previous_vectors, vectors)
         ready = False
     else:
         headline = "Qdrant is ready for changes."
@@ -115,12 +179,14 @@ def describe_qdrant(
     if collection_ok:
         parts.append(f"Collection {collection} answered.")
     elif health_ok and ready_ok:
-        parts.append(f"Collection {collection} did not answer.")
+        parts.append(f"Collection {collection} did not answer. A restart would replay this write.")
     else:
         parts.append(f"Collection {collection} was not asked while the process is still starting.")
+    if hold_detail:
+        parts.append(hold_detail)
     if activity:
         parts.append(f"Last log: {activity}")
-    return QdrantView(text=headline + "\n" + " ".join(parts), ready=ready)
+    return QdrantView(text=headline + "\n" + " ".join(parts), ready=ready, vectors=vectors)
 
 
 def _plain_ok(url: str, timeout: float = 2) -> bool:
@@ -164,7 +230,13 @@ def _collection_answered(url: str, timeout: float = 3) -> bool:
     return True
 
 
-def probe_qdrant(base_url: str, collection: str, container: str | None = None) -> QdrantView:
+def probe_qdrant(
+    base_url: str,
+    collection: str,
+    container: str | None = None,
+    storage: str | None = None,
+    previous_vectors: int | None = None,
+) -> QdrantView:
     """Ask Docker and Qdrant. A starting collection is not poked with a long call."""
     name = container if container is not None else find_qdrant_container()
     status = "missing"
@@ -179,6 +251,9 @@ def probe_qdrant(base_url: str, collection: str, container: str | None = None) -
     health_ok = _health_ok(base) if running else False
     ready_ok = _plain_ok(f"{base}/readyz") if health_ok else False
     collection_ok = _collection_answered(f"{base}/collections/{collection}") if ready_ok else False
+    vectors = None
+    if storage and running and health_ok and ready_ok and not collection_ok:
+        vectors = open_segment_vectors(storage, collection)
     activity = ""
     if name and running:
         activity = activity_from_text(_docker("logs", "--tail", "40", name))
@@ -191,4 +266,6 @@ def probe_qdrant(base_url: str, collection: str, container: str | None = None) -
         collection=collection,
         activity=activity,
         uptime=uptime_text(started) if running else "",
+        vectors=vectors,
+        previous_vectors=previous_vectors,
     )
