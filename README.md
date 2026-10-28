@@ -11,7 +11,7 @@ Nomad TURBO Index speeds up a stock [Project NOMAD](https://github.com/Crosstalk
 - Turbo leaves out navigation, scripts, and similar chrome.
 - Turbo reads upload PDFs and pictures itself.
 - Turbo pauses only file embedding and restores the ingest policy found at start.
-- The call size scales with detected hardware and can be set to 110%.
+- The call size scales with detected hardware and can be set to 150%.
 
 ## Turbo runs outside the admin container and does not patch it
 
@@ -171,11 +171,13 @@ def stock_should_continue(previous: str | None) -> bool:
 
 Stop does not delete the index. Delete is a separate button. It asks you to type DELETE, removes stored vectors and ingest rows, and does not start indexing. ZIM files and uploads stay on disk.
 
-## The call size scales with detected hardware and can be set to 110%
+## The call size scales with detected hardware and can be set to 150%
 
 There is no fixed chunk ceiling and no graphics-card name in the math. When a GPU is present, the safe 100% call is computed from that card's memory. Otherwise it is computed from system RAM and the CPU count. The same inputs always give the same count. A machine with more memory gets a 100% call at least as large as a machine with less. A machine with no GPU still gets a finite plan.
 
-The slider runs from 10% to 100% of that budget. 110% is an overclock past it: strictly more chunks than 100% on the same hardware. A new install does not start at 110%. The default is 55% (`reserve_ratio` 0.45) until you move the slider. One embed server stays up either way. 110% can be slower if the card is already full. It is there for people who want to try past the safe size.
+The slider runs from 10% to 100% of that budget. Above 100% is an overclock, up to 150%. 150% adds half of the safe call, rounded down to a whole number of chunks. A new install does not start at 150%. The default is 55% (`reserve_ratio` 0.45) until you move the slider. One embed server stays up either way. Past 100% can be slower if the card is already full. It is there for people who want to try past the safe size.
+
+Moving the slider during a run changes the next embed call. The usage line updates as you move it. The call that is already in flight finishes at the old size. When the next call starts, the log says how many chunks it will send and the percent you set. The server is not restarted.
 
 ```python
 full = safe_call_chunks(
@@ -227,9 +229,9 @@ You have to type DELETE. It removes stored knowledge points and ingest rows. Ind
 
 A GPU is used when the machine has one. With no GPU, the call size comes from system RAM and the CPU count. The package does not depend on a specific driver or a specific card. It installs on Debian, Ubuntu, and Linux Mint. It needs Python 3, GTK, Docker usable by your user, and NOMAD already running.
 
-### What does the slider do, and what is 110%?
+### What does the slider do, and what is 150%?
 
-The slider is a share of the budget detected on your computer. 10% to 100% stays inside that budget. 110% is an overclock past it. A new install starts at 55%. One embed server stays up. The slider changes how many chunks the next call sends. 110% can be slower when the card is already busy.
+The slider is a share of the budget detected on your computer. 10% to 100% stays inside that budget. 150% is an overclock past it: half again the safe call, rounded down to whole chunks. A new install starts at 55%. One embed server stays up. Moving the slider during a run changes the next call. The call already running is left alone. Past 100% can be slower when the card is already busy.
 
 ### Will this stay current when I update NOMAD?
 
@@ -281,7 +283,7 @@ Click the icon. The window scans the library. Opening it does not start or stop 
 
 The header shows the package version beside **Index**, **Repair**, and **About**. **Host** opens a separate window for CPU, memory, GPU, and video memory, plus the used space, size, read speed, and write speed of each disk the library uses. A folder on its own disk is its own line. That window resizes on its own, and its size and place are remembered. The header link opens the [Nomad TURBO Index repository](https://github.com/Vibe-Dragon/Nomad-TURBO-Index). **About** is its own page. It shows this Turbo version, states that this version was tested with Project NOMAD 1.35.1, and links to that repository and the [Project NOMAD repository](https://github.com/Crosstalk-Solutions/project-nomad). It names the author Vibe-Dragon, the MIT license, Copyright 2026, that these notes are updated when I get to it, and that I am not responsible if Turbo messes up an index.
 
-The file list is the part that grows. On Index, the current-file bar, the library bar, and the **Embed batch** slider share one row under the list. The usage line and the card line share the next row. The usage line reads `Set 55% · <chunks> chunks per call. Embed server: idle.` The chunk count is the budget for that setting on your machine. Once a run has started the server, that line says `One embed server is running.` Above 100% it adds `Overclock past the detected budget.` The card line on that same row reads `Card memory in use: <used> / <total> MiB`, or `No GPU detected. The embed server will use the CPU.` The stats line is under those. **Stay on after the last file** shares the button row with **Start indexing**, **Stop**, **Rescan**, and **Export log**. At the default window size, with the log open and the drag bars left where a new install puts them, each file list is at least half its page. Extra height goes to the list. Hover any button, checkbox, column heading, progress bar, or those lines for what they do.
+The file list is the part that grows. On Index, the current-file bar and the library bar share one row under the list. The optimization bar sits above the list and appears when indexing is waiting on a segment rewrite. The usage line and the card line share the next row. The usage line reads `Set 55% · <chunks> chunks per call. Embed server: idle.` The chunk count is the budget for that setting on your machine. Once a run has started the server, that line says `One embed server is running.` Above 100% it adds `Overclock past the detected budget.` The card line on that same row reads `Card memory in use: <used> / <total> MiB`, or `No GPU detected. The embed server will use the CPU.` The stats line is under those. **Stay on after the last file** shares the button row with **Start indexing**, **Stop**, **Rescan**, and **Export log**. **Embed batch** is on that same row, between **Export log** and **Delete index**. At the default window size, with the log open and the drag bars left where a new install puts them, each file list is at least half its page. Extra height goes to the list. Hover any button, checkbox, column heading, progress bar, or those lines for what they do.
 
 The Qdrant line sits under the Index / Repair / About switch. **Start indexing**, **Delete index**, **Scan**, and **Start repair** stay off until that line says `Qdrant is ready for changes.` **Rescan** does not wait.
 
@@ -307,7 +309,9 @@ The Index page is the library list.
 - **Rate.** Articles per minute swing with page length. Chunks per second stay steadier.
 - **ETA.** Time left for this file at its recent article rate.
 
-The file being indexed has its own bar. The library bar on the same row is the whole library, weighed by file size, and the time left for what remains. The stats line counts articles per minute, chunks per minute, skipped pages, and bad pages. Skipped pages had no text. Bad pages could not be read or parsed. A long page is indexed in full.
+The file being indexed has its own bar. The library bar on the same row is the whole library, weighed by file size, and the time left for what remains. **Embed batch** is on the button row, between **Export log** and **Delete index**. Moving it during a run changes the next embed call.
+
+An optimization bar appears above the file list while indexing is paused so a segment can be rewritten. Each new pause starts that bar's clock over. Qdrant does not report how far the in-memory build is, so the bar moves without a percent. The stats line counts articles per minute, chunks per minute, skipped pages, and bad pages. Skipped pages had no text. Bad pages could not be read or parsed. A long page is indexed in full.
 
 The list keeps the active file near the top. Click a heading to sort. Drag a column edge to resize it. That width is remembered.
 
@@ -326,6 +330,8 @@ Short pages leave the graphics card waiting between calls. The embed server then
 ### CPU jumps for a few minutes and the GPU drops
 
 Qdrant builds a new segment when the one it is writing fills. That build is CPU work: the payload indexes, then the search graph. Turbo waits until each batch is stored, so the embed server sits idle and GPU use falls until the build finishes. The collection can show yellow while those new points are not in the search graph yet. Closing a browser does not stop the build. Leave Qdrant running. A restart replays the unfinished write and can use more memory than the build did.
+
+If a plain segment grows past 4 GiB of vectors, or free space is under twice the segment that would be copied, indexing pauses before the next upsert. Points already stored stay. The optimization bar on the Index page is that pause. Making this rewrite faster is the next major milestone, **Speed up segment optimization**. This version does not change how Qdrant builds the graph.
 
 ### CPU stays high after the Knowledge Base page is closed, and the article count stops
 
@@ -383,6 +389,8 @@ What a repair leaves in place:
 
 Stop works between files, or between scan steps. A delete that was already sent runs until the index finishes it. Stop does not wipe the collection. If a delete does not return, the embed queue stays paused so a second delete is not started on top of it. Start repair again when the index is idle. While a download is in progress, or the disk is busy, repair waits instead of deleting. Closing the window during a repair hides it to the tray. The run keeps going.
 
+**Optimize stuck segments** is on its own row under those buttons, with a bar beside it. It does not need a file in the repair list. It asks Qdrant to rewrite an oversized plain segment, or a fully-deleted segment still on disk, only when that copy is safe: no optimization is already open, free space is at least twice the segment, and the in-memory graph fits in spare memory. A refusal leaves the collection unchanged and says why. The bar can read **Already optimizing**, **Waiting for an update**, **Not started**, or **Optimizer error**. It pulses when a build is open. Qdrant does not report a percent. Do not restart Qdrant to clear that bar.
+
 ## Commands
 
 The desktop icon runs `nomad-turbo toggle`. It opens or raises the window. It does not start or stop indexing.
@@ -411,11 +419,21 @@ A large collection can be up and still on the last of those while it finishes a 
 
 ### Qdrant stopped taking a write
 
-A write that does not reach Qdrant is tried again. The log says `qdrant write timed out. Trying that batch again.`
+A write that does not reach Qdrant is tried again. The log says `qdrant write timed out. Trying that batch again.` and includes the error Qdrant returned.
+
+While indexing is running, a Qdrant problem is also logged as `Qdrant problem while indexing:`. That covers an optimizer error, a red collection, a collection that stops answering, and a status check that fails. The same problem is logged once. When the collection is answering again, the log says `Qdrant problem cleared. The collection is answering again.` A point count or stored-path read that fails uses the same `Qdrant problem while indexing:` wording. An optimization that is only still outstanding is not logged as a problem.
 
 If it is still not taking the write, Turbo stays on that file. The status line says `Qdrant is still writing this file. Do not restart Qdrant or delete the index. Turbo is waiting here.` The log says `qdrant is not taking writes. Staying on <file> at article <n>: qdrant unreachable: ...`
 
 `qdrant 400: ...`, `qdrant 503: ...`, and the other `qdrant <code>:` lines are answers Qdrant did return. Turbo does not treat those as "wait on this article." It tries that file once more from the same article (`will try <file> again from article <n> after an error`). A second failure at that same article is `file failed`.
+
+### Indexing paused for a segment
+
+When a plain segment is past the 4 GiB vector cap, the log says indexing is paused so a segment can be optimized, and that a plain segment is past the cap. When free space is under twice the segment that would be copied, the log says that instead. New points wait. Points already stored stay. The optimization bar starts over for that pause. Qdrant does not report a percent while it builds the segment. When the pause ends, the log says knowledge-base writes resumed.
+
+### Optimize stuck segments
+
+Pressing the button writes `Optimize stuck segments: checking.` Then one of `refused`, `started`, `failed`, or, if the button was pressed while another job was still running, `not started`. A refusal names the reason: already in progress, segment files could not be read, nothing is stuck, not enough free space, or not enough spare memory. The collection is left unchanged. The same sentences are on the Repair status line.
 
 ### The embed server is not ready
 
@@ -426,6 +444,10 @@ A call that gets HTTP 408, 429, 500, 502, 503, or 504 is logged as `embedder cal
 HTTP 400 is one input the embedder refused, not a dead server. The log says `splitting one chunk of <file> (<path>) that did not fit the embedder`. If that one chunk is still refused, the log says `skipping one chunk of <file> (<path>) the embedder rejected`. That chunk counts as bad. The rest of the file continues.
 
 `the embed server is not running` means a call was ready and the server process was already gone.
+
+## Next major milestone
+
+**Speed up segment optimization.** After the write hold, the slow part is Qdrant building the search graph for a segment that is already large. The graph stays in memory, the indexed-point count stays flat until the segment is committed, and Qdrant does not publish a percent. This version shows that wait and refuses an unsafe rewrite. It does not make the build itself faster. That is the next major goal, and it is the open milestone on the [Nomad TURBO Index repository](https://github.com/Vibe-Dragon/Nomad-TURBO-Index).
 
 ## Stock contract
 

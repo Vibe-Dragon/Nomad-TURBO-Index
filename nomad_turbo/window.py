@@ -36,6 +36,7 @@ from nomad_turbo.runtime import gpu_rows
 from nomad_turbo.scan import scan_library
 from nomad_turbo.session import Session
 from nomad_turbo.slots import (
+    MAX_BOOST_PERCENT,
     clamp_boost_percent,
     embed_call_budget,
     host_memory_mib,
@@ -215,6 +216,11 @@ class _Window:
         self.thread: threading.Thread | None = None
         self.delete_thread: threading.Thread | None = None
         self.repair_thread: threading.Thread | None = None
+        self.optimize_thread: threading.Thread | None = None
+        self.optimize_starting = False
+        self._optimize_pause = None
+        self._optimize_live = None
+        self._optimize_code = None
         self.repair_stop = threading.Event()
         self.repair_board = None
         self.repair_starting = False
@@ -224,6 +230,7 @@ class _Window:
         self.qdrant_ready = False
         self.qdrant_vectors = None
         self._qdrant_error = None
+        self._qdrant_problem = ""
         self._followed: dict[int, str] = {}
         self._column_manual: dict[str, bool] = {}
         self._column_width: dict[str, int] = {}
@@ -315,6 +322,15 @@ class _Window:
 
         self.status.set_ellipsize(Pango.EllipsizeMode.END)
         self.status.set_lines(2)
+        # Hidden until indexing actually waits. A shown bar would steal list space
+        # from the short-window layout, and Qdrant publishes no percent to draw.
+        self.index_optimize = gtk.ProgressBar()
+        self.index_optimize.set_show_text(True)
+        self.index_optimize.set_text("Not waiting on an optimization.")
+        self.index_optimize.set_hexpand(True)
+        self.index_optimize.set_no_show_all(True)
+        self.index_optimize.set_tooltip_text(TIPS["index_optimize"])
+        index.pack_start(self.index_optimize, False, False, 0)
 
         def headed(title: str, tip: str, cell, **props):
             column = gtk.TreeViewColumn(title, cell, **props)
@@ -456,31 +472,28 @@ class _Window:
         slider_label = gtk.Label(label="Embed batch")
         slider_label.set_tooltip_text(TIPS["slider"])
         slider_label.set_valign(gtk.Align.CENTER)
-        self.scale = gtk.Scale.new_with_range(gtk.Orientation.HORIZONTAL, 10, 110, 5)
+        self.scale = gtk.Scale.new_with_range(gtk.Orientation.HORIZONTAL, 10, MAX_BOOST_PERCENT, 5)
         self.scale.set_value(session.get_percent())
         self.scale.set_hexpand(True)
-        # The live percent sits above the thumb. 100 and 110 are one tenth of
-        # the track apart, so 110% is a label past the end instead of a mark.
+        # The live percent sits above the thumb. The overclock end is a label
+        # past the track so it stays clear of the 100% mark.
         self.scale.set_draw_value(True)
         self.scale.set_value_pos(gtk.PositionType.TOP)
         self.scale.set_size_request(-1, 52)
         self.scale.set_valign(gtk.Align.CENTER)
         for mark in (10, 100):
             self.scale.add_mark(mark, gtk.PositionType.BOTTOM, f"{mark}%")
-        self.scale.add_mark(110, gtk.PositionType.BOTTOM, None)
+        self.scale.add_mark(MAX_BOOST_PERCENT, gtk.PositionType.BOTTOM, None)
         self.scale.set_tooltip_text(TIPS["slider"])
         self.scale.connect("format-value", lambda _scale, value: f"{int(round(value))}%")
         self.scale.connect("value-changed", self.on_slider)
-        self.scale_end = gtk.Label(label="110%")
+        self.scale_end = gtk.Label(label=f"{MAX_BOOST_PERCENT}%")
         self.scale_end.set_valign(gtk.Align.END)
         self.scale_end.set_tooltip_text(TIPS["slider"])
         bars = gtk.Box(orientation=gtk.Orientation.HORIZONTAL, spacing=8)
         bars.pack_start(self.current_label, True, True, 0)
         bars.pack_start(self.current_bar, True, True, 0)
         bars.pack_start(self.overall, True, True, 0)
-        bars.pack_start(slider_label, False, False, 0)
-        bars.pack_start(self.scale, True, True, 0)
-        bars.pack_start(self.scale_end, False, False, 0)
         lower.pack_start(bars, False, False, 0)
 
         self.usage = gtk.Label(label="")
@@ -538,6 +551,10 @@ class _Window:
         buttons.pack_start(self.keep_check, False, False, 0)
         for button in (self.start_button, self.stop_button, self.rescan_button, self.export_button):
             buttons.pack_start(button, False, False, 0)
+        # Between Export log and Delete index, so the file and library bars keep the row above.
+        buttons.pack_start(slider_label, False, False, 0)
+        buttons.pack_start(self.scale, True, True, 0)
+        buttons.pack_start(self.scale_end, False, False, 0)
         buttons.pack_end(self.delete_button, False, False, 0)
         lower.pack_start(buttons, False, False, 0)
         self.index_buttons = buttons
@@ -718,7 +735,8 @@ class _Window:
         self.gtk.main()
 
     def _watch_qdrant(self) -> None:
-        from nomad_turbo.qdrant_status import probe_qdrant
+        from nomad_turbo import segment_guard
+        from nomad_turbo.qdrant_status import indexing_qdrant_problem, probe_qdrant
 
         while not self.qdrant_stop.is_set():
             try:
@@ -732,6 +750,20 @@ class _Window:
                 self.qdrant_ready = view.ready
                 if view.vectors is not None:
                     self.qdrant_vectors = view.vectors
+                try:
+                    temp_open = segment_guard.optimization_open(self.install)
+                except Exception:
+                    temp_open = False
+                code, bar, detail, pulse = segment_guard.describe_optimizer_state(
+                    view.collection_status,
+                    view.optimizer_error,
+                    temp_open,
+                )
+                self._optimize_live = (bar, detail, pulse)
+                if code != self._optimize_code:
+                    self._optimize_code = code
+                    segment_guard.report_optimize(code, detail)
+                self._note_qdrant_problem(indexing_qdrant_problem(view))
             except Exception as exc:
                 message = f"{exc.__class__.__name__}: {exc}"
                 if message != self._qdrant_error:
@@ -739,10 +771,31 @@ class _Window:
                     log.warning("qdrant status check failed: %s", message)
                 self.qdrant_text = "Qdrant status could not be read. Not ready for changes."
                 self.qdrant_ready = False
+                self._note_qdrant_problem(f"Qdrant status could not be read. {message}")
             else:
                 self._qdrant_error = None
             if self.qdrant_stop.wait(5):
                 return
+
+    def _note_qdrant_problem(self, problem: str) -> None:
+        """One log line when a run hits a Qdrant problem, and one when it clears."""
+        from nomad_turbo.qdrant_status import indexing_problem_line
+
+        try:
+            phase = self.session.view().get("phase") or ""
+        except Exception:
+            phase = ""
+        line, self._qdrant_problem = indexing_problem_line(
+            self._qdrant_problem,
+            phase in ("waiting", "running"),
+            problem,
+        )
+        if not line:
+            return
+        if line.startswith("Qdrant problem while indexing"):
+            log.warning(line)
+        else:
+            log.info(line)
 
     def on_signal(self, _signum, _frame) -> None:
         self.qdrant_stop.set()
@@ -753,11 +806,16 @@ class _Window:
         self.session.stop.set()
         self.repair_stop.set()
 
+    def _optimize_busy(self) -> bool:
+        thread = getattr(self, "optimize_thread", None)
+        starting = getattr(self, "optimize_starting", False)
+        return bool(starting or (thread is not None and thread.is_alive()))
+
     def _work_alive(self) -> bool:
         indexing = self.thread is not None and self.thread.is_alive()
         deleting = self.delete_thread is not None and self.delete_thread.is_alive()
         repairing = self.repair_thread is not None and self.repair_thread.is_alive()
-        return indexing or deleting or repairing or self.repair_starting
+        return indexing or deleting or repairing or self.repair_starting or self._optimize_busy()
 
     def on_raise(self, _signum, _frame) -> None:
         self.raise_requested = True
@@ -1429,6 +1487,8 @@ class _Window:
             self.refresh_repair()
             self.refresh_qdrant()
             self.refresh_tray(view, snap)
+            self._paint_index_optimize(view.get("optimize_hold") or "")
+            self._paint_repair_optimize()
             self._tell_if_finished(view)
             self._buttons(view["phase"])
         except Exception:
@@ -1451,7 +1511,9 @@ class _Window:
     def _buttons(self, phase: str) -> None:
         running = phase in ("waiting", "running") and self.thread is not None and self.thread.is_alive()
         deleting = self.delete_thread is not None and self.delete_thread.is_alive()
-        repairing = (self.repair_thread is not None and self.repair_thread.is_alive()) or self.repair_starting
+        file_repairing = (self.repair_thread is not None and self.repair_thread.is_alive()) or self.repair_starting
+        optimizing = self._optimize_busy()
+        repairing = file_repairing or optimizing
         library_idle = self.rows_ready and not running and not repairing and not deleting
         changes = changes_allowed(self.qdrant_ready)
         self.start_button.set_sensitive(library_idle and changes)
@@ -1466,9 +1528,12 @@ class _Window:
             self.repair_start.set_sensitive(idle_repair)
             self._gate_tip(self.repair_scan, self.repair_scan_tip)
             self._gate_tip(self.repair_start, self.repair_start_tip)
-            self.repair_stop_button.set_sensitive(repairing)
+            self.repair_stop_button.set_sensitive(file_repairing)
             self.repair_quick.set_sensitive(not repairing)
             self.repair_complete.set_sensitive(not repairing)
+            if hasattr(self, "optimize_segments"):
+                self.optimize_segments.set_sensitive(idle_repair)
+                self._gate_tip(self.optimize_segments, self.optimize_segments_tip)
 
     def refresh_rows(self):
         book = self.session.get_book()
@@ -1752,7 +1817,7 @@ class _Window:
         from gi.repository import Pango
 
         self.repair_status.set_ellipsize(Pango.EllipsizeMode.END)
-        self.repair_status.set_lines(2)
+        self.repair_status.set_lines(4)
 
         self.repair_store = gtk.ListStore(*repair_store_types())
         tree = gtk.TreeView(model=self.repair_store)
@@ -1911,6 +1976,10 @@ class _Window:
         self.repair_start.connect("clicked", lambda *_args: self.on_repair_start())
         self.repair_stop_button.connect("clicked", lambda *_args: self.repair_stop.set())
         self.repair_stop_button.set_sensitive(False)
+        self.optimize_segments = gtk.Button(label="Optimize stuck segments")
+        self.optimize_segments_tip = TIPS["repair_optimize"]
+        self.optimize_segments.set_tooltip_text(TIPS["repair_optimize"])
+        self.optimize_segments.connect("clicked", lambda *_args: self.on_optimize_segments())
         buttons.pack_start(self.repair_quick, False, False, 0)
         buttons.pack_start(self.repair_complete, False, False, 0)
         buttons.pack_start(self.repair_scan, False, False, 0)
@@ -1918,6 +1987,17 @@ class _Window:
         buttons.pack_start(self.repair_stop_button, False, False, 0)
         buttons.set_tooltip_text(TIPS["repair_page"])
         lower.pack_start(buttons, False, False, 0)
+        # Own row so the file-repair buttons keep their width on a short window.
+        optimize_row = gtk.Box(orientation=gtk.Orientation.HORIZONTAL, spacing=8)
+        optimize_row.pack_start(self.optimize_segments, False, False, 0)
+        self.repair_optimize_bar = gtk.ProgressBar()
+        self.repair_optimize_bar.set_show_text(True)
+        self.repair_optimize_bar.set_text("Not optimizing")
+        self.repair_optimize_bar.set_hexpand(True)
+        self.repair_optimize_bar.set_valign(gtk.Align.CENTER)
+        self.repair_optimize_bar.set_tooltip_text(TIPS["repair_optimize_bar"])
+        optimize_row.pack_start(self.repair_optimize_bar, True, True, 0)
+        lower.pack_start(optimize_row, False, False, 0)
         self.repair_buttons = buttons
         self.repair_pane = self._make_pane()
         self.repair_pane.pack1(scrolled, True, True)
@@ -1990,6 +2070,122 @@ class _Window:
             button.set_tooltip_text(normal)
         else:
             button.set_tooltip_text(TIPS["qdrant_gate"])
+
+    def on_optimize_segments(self) -> None:
+        """Force optimization of stuck segments. The file-repair list can be empty."""
+        from nomad_turbo import segment_guard
+
+        if self._work_alive() or self.scanning or not changes_allowed(self.qdrant_ready):
+            why = []
+            if self._work_alive():
+                why.append("indexing, repair, or another optimize is still running")
+            if self.scanning:
+                why.append("a library scan is still running")
+            if not changes_allowed(self.qdrant_ready):
+                why.append("Qdrant is not ready for changes")
+            segment_guard.report_optimize(
+                "not started",
+                "The button was pressed but " + ", and ".join(why) + ". The collection was left unchanged.",
+            )
+            return
+        self.optimize_starting = True
+        segment_guard.report_optimize(
+            "checking",
+            "Reading segment sizes. Points and the collection stay.",
+        )
+        self._set_repair_status("Checking stuck segments. The result is written to the log.")
+        self._show(self.repair_optimize_bar, "Checking stuck segments")
+        self.repair_optimize_bar.set_fraction(0)
+        self.stack.set_visible_child_name("repair")
+        self.optimize_thread = threading.Thread(
+            target=self._optimize_segments,
+            name="nomad-turbo-optimize",
+            daemon=True,
+        )
+        self.optimize_thread.start()
+
+    def _optimize_segments(self) -> None:
+        import importlib
+
+        import nomad_turbo.segment_guard as segment_guard
+
+        try:
+            importlib.reload(segment_guard)
+            facts = segment_guard.measure_repair_facts(self.install)
+            result = segment_guard.apply_force_optimization(
+                facts,
+                segment_guard.LiveOptimizeBoundary(self.install),
+            )
+        except Exception as exc:
+            log.exception("optimize stuck segments failed")
+            result = segment_guard.ForceResult(
+                False,
+                False,
+                "Optimize stuck segments failed: "
+                f"{exc}. The collection was left unchanged.",
+            )
+        segment_guard.report_optimize(
+            "started" if result.ok else ("failed" if result.requested else "refused"),
+            result.reason,
+        )
+        self.glib.idle_add(self._apply_optimize_result, result)
+
+    def _apply_optimize_result(self, result) -> bool:
+        from nomad_turbo.segment_guard import optimize_bar_after_click
+
+        self._set_repair_status(result.reason)
+        text, pulse = optimize_bar_after_click(result.ok, result.requested, result.reason)
+        bar = self.repair_optimize_bar
+        if pulse:
+            bar.set_fraction(0)
+            bar.pulse()
+        else:
+            bar.set_fraction(0)
+        self._show(bar, text)
+        bar.set_tooltip_text(result.reason)
+        self.optimize_starting = False
+        return False
+
+    def _paint_index_optimize(self, reason: str) -> None:
+        from nomad_turbo.segment_guard import pause_caption, track_optimize_pause
+
+        bar = getattr(self, "index_optimize", None)
+        if bar is None:
+            return
+        now = time.monotonic()
+        pause = track_optimize_pause(self._optimize_pause, reason, now)
+        changed = self._optimize_pause is None or pause.generation != self._optimize_pause.generation
+        self._optimize_pause = pause
+        if not pause.active and pause.generation == 0:
+            if bar.get_visible():
+                bar.hide()
+            return
+        if not bar.get_visible():
+            bar.show()
+        text, fraction = pause_caption(pause, now)
+        if changed:
+            bar.set_fraction(0)
+        if fraction is None:
+            bar.pulse()
+        else:
+            bar.set_fraction(min(1.0, max(0.0, fraction)))
+        self._show(bar, text)
+
+    def _paint_repair_optimize(self) -> None:
+        if self._optimize_busy():
+            return
+        live = self._optimize_live
+        bar = getattr(self, "repair_optimize_bar", None)
+        if live is None or bar is None:
+            return
+        text, detail, pulse = live
+        if pulse:
+            bar.pulse()
+        else:
+            bar.set_fraction(0)
+        self._show(bar, text)
+        if detail:
+            bar.set_tooltip_text(detail)
 
     def on_repair_scan(self) -> None:
         if self._work_alive() or self.scanning or not self.qdrant_ready:

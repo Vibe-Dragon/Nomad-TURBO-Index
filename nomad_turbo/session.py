@@ -19,6 +19,7 @@ class Session:
         self.phase = "idle"
         self.error = ""
         self.note = ""
+        self.optimize_hold = ""
         self._book: ProgressBook | None = None
         self.active_slots = 0
         self.total_mib = 0
@@ -61,6 +62,7 @@ class Session:
                 "phase": self.phase,
                 "error": self.error,
                 "note": self.note,
+                "optimize_hold": self.optimize_hold,
                 "active_slots": self.active_slots,
                 "total_mib": self.total_mib,
                 "used_before": self.used_before,
@@ -77,6 +79,11 @@ class Session:
     def set_note(self, note: str) -> None:
         with self._lock:
             self.note = note
+
+    def set_optimize_hold(self, reason: str) -> None:
+        """segment or space while indexing is waiting on a rewrite. Empty otherwise."""
+        with self._lock:
+            self.optimize_hold = reason if reason in ("segment", "space") else ""
 
     def bind_book(self, book: ProgressBook) -> None:
         with self._lock:

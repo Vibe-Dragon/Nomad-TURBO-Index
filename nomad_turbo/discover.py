@@ -53,8 +53,8 @@ class Install:
     # File-list height on each page. 0 leaves the spare space with the list.
     index_pane: int = 0
     repair_pane: int = 0
-    # 10–110 slider. None means "use reserve_ratio", which is at most 100.
-    # 110 is an overclock and is never the default for a new install.
+    # 10–150 slider. None means "use reserve_ratio", which is at most 100.
+    # 150 is an overclock and is never the default for a new install.
     boost_percent: int | None = None
     # Separate host-meter window. None leaves the place to the window manager.
     host_x: int | None = None

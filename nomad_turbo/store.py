@@ -392,7 +392,7 @@ def upsert(install: Install, points: list[dict]) -> None:
                 except StoreError as exc:
                     if not store_write_again(str(exc), attempt):
                         raise
-                    log.warning("qdrant write timed out. Trying that batch again.")
+                    log.warning("qdrant write timed out. Trying that batch again. %s", exc)
                     time.sleep(2)
 
 
@@ -403,7 +403,8 @@ def count_source(install: Install, source: str) -> int | None:
             {"filter": {"must": [{"key": "source", "match": {"value": source}}]}, "exact": False},
             timeout=20,
         )
-    except StoreError:
+    except StoreError as exc:
+        log.warning("Qdrant problem while indexing: could not count points for %s: %s", source, exc)
         return None
     return int(body.get("result", {}).get("count", 0))
 
@@ -424,7 +425,12 @@ def existing_paths(install: Install, source: str, limit_pages: int = 20) -> set[
             payload["offset"] = offset
         try:
             body = _request(base, payload, timeout=30)
-        except StoreError:
+        except StoreError as exc:
+            log.warning(
+                "Qdrant problem while indexing: could not list stored paths for %s: %s",
+                source,
+                exc,
+            )
             return None
         result = body.get("result", {})
         for point in result.get("points") or []:

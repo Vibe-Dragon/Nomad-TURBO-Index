@@ -180,31 +180,66 @@ def _announce_hold(session: Session | None, reason: str) -> None:
         message = "A download just finished. Waiting for its knowledge-base update before writing."
     elif reason == "disk":
         message = "The disk is busy. Slowing knowledge-base writes."
+    elif reason == "segment":
+        message = (
+            "Indexing is paused so a segment can be optimized. "
+            "A plain segment is past the 4 GiB vector cap. "
+            "New points are waiting. Points already stored stay. "
+            "The optimization bar on this page starts over for this pause. "
+            "Qdrant does not report a percent while it builds the segment."
+        )
+    elif reason == "space":
+        message = (
+            "Indexing is paused so a segment can be optimized. "
+            "Free space is under twice the segment that would be copied. "
+            "New points are waiting. Points already stored stay. "
+            "The optimization bar on this page starts over for this pause."
+        )
     else:
         message = "Knowledge-base writes resumed."
     log.info(message)
     _hold_announced = reason
+    hold = reason if reason in ("segment", "space") else ""
+    setter = getattr(session, "set_optimize_hold", None) if session is not None else None
+    if callable(setter):
+        setter(hold)
     if session is not None and reason:
         session.set_note(message)
     elif session is not None:
         session.set_note("Indexing.")
 
 
-def _wait_to_write(install: Install, stop: threading.Event, session: Session | None) -> bool:
-    """Hold Qdrant writes during a download. A stalled disk only delays the next one.
+def _segment_hold(install: Install) -> str:
+    """Wait while a segment rewrite would not fit. Import is local so a new Start sees it."""
+    from nomad_turbo import segment_guard
+
+    return segment_guard.segment_upsert_hold(segment_guard.cached_write_facts(install)).reason
+
+
+def _wait_to_write(
+    install: Install,
+    stop: threading.Event,
+    session: Session | None,
+    interval: float = 5.0,
+) -> bool:
+    """Hold Qdrant writes during a download or while a segment cannot be rewritten.
 
     A download holds until it is gone and the settle period has passed. A
     stalled disk waits five seconds, then the write goes ahead so indexing
-    does not stop for the whole run.
+    does not stop for the whole run. A segment that is past the vector cap,
+    or free space under twice that segment, keeps waiting. Points stay.
     """
     while not stop.is_set():
-        reason = _library_hold(install)
+        # Segment and space are hard holds. A disk stall must not skip them.
+        segment = _segment_hold(install)
+        library = _library_hold(install)
+        reason = segment or library
         if not reason:
             if _hold_announced:
                 _announce_hold(session, "")
             return True
         _announce_hold(session, reason)
-        if stop.wait(5):
+        if stop.wait(interval):
             return False
         if reason == "disk":
             return not stop.is_set()
@@ -1073,7 +1108,7 @@ def _consume_articles(install, pool, work, stop, session, seen, pull, retire=Non
                 continue
             ready = feed.push_vectors(vectors)
             if ready:
-                pipe.submit(lambda batch=ready: _store_ready(install, work, seen, session, batch))
+                pipe.submit(lambda batch=ready: _store_ready(install, work, seen, session, batch, stop))
     except Exception as exc:
         error = exc
     finally:

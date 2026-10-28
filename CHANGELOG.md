@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+## 1.1.0
+
+### Major
+
+- Indexing pauses before a new upsert when a plain segment is past the 4 GiB vector cap, or when free space is under twice the segment that would be copied. Points already stored stay. The pause is what stops that segment from growing past the size a later rewrite can copy.
+- The embed-batch slider goes to 150%. 10% to 100% stay inside the budget detected on the computer running Turbo. Above 100% is an overclock. 150% adds half of the safe call, rounded down to a whole number of chunks. A new install still starts at 55%. Moving the slider during a run changes the next embed call. The call already in flight is left alone. One embed server stays up.
+
+### Moderate
+
+- Repair has **Optimize stuck segments**. It asks Qdrant to rewrite an oversized or fully-deleted segment only when no optimization is already running, free space is at least twice that segment, and the in-memory graph fits in spare memory. Otherwise the click is refused and the collection is left unchanged. The reason is on the Repair status line and in the log.
+- The Index page shows an optimization bar while indexing is paused for that rewrite. Each new pause starts the clock over. The Repair page shows whether an optimization is running, waiting for an update, refused, or in error. Qdrant does not report a percent for the in-memory build, so the bar moves without one.
+- While indexing is running, a Qdrant problem is written to the log once. That covers an optimizer error, a red collection, a collection that stops answering, a failed status check, a failed point count, and a failed read of stored paths. When the collection is answering again, the log says so.
+
+### Minor
+
+- **Embed batch** sits on the button row, between **Export log** and **Delete index**, so the file bar and the library bar have the row above.
+- Every Optimize click is written to the log: checking, refused, started, failed, or not started.
+- The next major milestone is **Speed up segment optimization**. Segment builds are the bottleneck after the write hold. That work is not in this version.
+
 ## 1.0.3
 
 ### Minor

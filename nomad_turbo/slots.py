@@ -26,6 +26,11 @@ OVERHEAD_RATIO = 0.04
 HOST_FLOOR_MIN_MIB = 2048
 HOST_FLOOR_RATIO = 0.25
 
+# Slider ends. 10 through 100 stay inside the detected budget.
+# 150 is the overclock and is never the default for a new install.
+MIN_BOOST_PERCENT = 10
+MAX_BOOST_PERCENT = 150
+
 # MiB kept for the embed model beside the batch. This is the weight file
 # and a little runtime, not a graphics card.
 MODEL_RESERVE_MIB = 768
@@ -62,7 +67,7 @@ def dedicate_percent(reserve_ratio: float) -> int:
 def reserve_ratio_from_percent(percent: int) -> float:
     """Chat reserve left over after the indexing share. 100% leaves no reserve.
 
-    The embed-call slider can go to 110%. That overclock is stored on
+    The embed-call slider can go to 150%. That overclock is stored on
     Install.boost_percent, not as a negative reserve. This helper still
     clamps to 10–100 for the older process-count math.
     """
@@ -71,15 +76,15 @@ def reserve_ratio_from_percent(percent: int) -> float:
 
 
 def clamp_boost_percent(percent: int) -> int:
-    """Slider percent. 10 through 100 stay inside the budget. 110 is the overclock."""
-    return min(110, max(10, int(percent)))
+    """Slider percent. 10 through 100 stay inside the budget. 150 is the overclock."""
+    return min(MAX_BOOST_PERCENT, max(MIN_BOOST_PERCENT, int(percent)))
 
 
 def install_boost_percent(install: object) -> int:
     """Saved slider percent.
 
     A config that never stored boost_percent stays at or below 100.
-    110% is not the default for a new install.
+    150% is not the default for a new install.
     """
     raw = getattr(install, "boost_percent", None)
     if raw is None:
@@ -138,7 +143,8 @@ def embed_call_budget(
 
     100% is the safe size from GPU memory when a GPU is present, otherwise
     from system RAM and the CPU count. 10% through 100% scale that size.
-    110% is an overclock: strictly more chunks than 100% on the same inputs.
+    Above 100% is an overclock: strictly more chunks than 100% on the same
+    inputs. 150% adds half of the safe call, rounded down to a whole number.
     The same inputs always return the same count. There is no single chunk
     ceiling for every machine, and no GPU model name is used.
     """

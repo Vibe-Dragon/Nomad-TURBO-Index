@@ -32,6 +32,11 @@ TIPS: dict[str, str] = {
         "Progress of the file being indexed. The library bar beside it is the whole library, weighed by file size."
     ),
     "library_bar": "Share of the library finished, by file size, and the ETA for what is left.",
+    "index_optimize": (
+        "Shown while indexing is paused so a segment can be optimized. "
+        "The clock starts over each time a new pause begins. "
+        "Qdrant does not report how far the segment build is, so the bar moves without a percent."
+    ),
     "stats": (
         "Articles per minute swing with page length. Chunks per minute is the steadier pace. "
         "Skipped pages had no text. Bad pages could not be read or parsed. "
@@ -39,7 +44,8 @@ TIPS: dict[str, str] = {
     ),
     "slider": (
         "How many chunks the next embed call sends, as a percent of the budget detected on the computer running Turbo. "
-        "10% to 100% stays inside that budget. 110% is an overclock past that budget. "
+        "10% to 100% stays inside that budget. 150% is an overclock past that budget. "
+        "Moving it during a run changes the next embed call. "
         "One embed server stays up. A call that is already running is left alone."
     ),
     "usage": (
@@ -105,7 +111,8 @@ TIPS: dict[str, str] = {
         "Complete also lists sources in the index when Qdrant is answering. "
         "Start repair pauses file embedding, then deletes points for files that are gone. "
         "Points for a file that is still on disk stay there. "
-        "The tray icon turns blue while a repair is running. Stop is here and in the tray."
+        "The tray icon turns blue while a repair is running. Stop is here and in the tray. "
+        "Optimize stuck segments rewrites an oversized or fully-deleted segment when that is safe."
     ),
     "repair_quick": (
         "Compare files on disk with ingest rows and checkpoints. "
@@ -139,5 +146,20 @@ TIPS: dict[str, str] = {
     "repair_stop": (
         "Stop between files, or between scan steps. A delete that was already sent runs until the index finishes it. "
         "Listing sources runs until Qdrant answers. This does not delete the whole index."
+    ),
+    "repair_optimize": (
+        "Rewrite stuck index segments when that is safe. "
+        "An oversized plain segment, or fully-deleted segments still on disk, can be optimized. "
+        "This stays available when the file list is empty. "
+        "It runs only when free space is at least twice the segment, no optimization is already running, "
+        "and the in-memory graph fits in spare memory. Otherwise the index is left unchanged and the reason is shown. "
+        "File embedding pauses only while this runs, then resumes. Points and the collection stay. "
+        "The result is written to the log."
+    ),
+    "repair_optimize_bar": (
+        "Whether Qdrant is optimizing. Already optimizing means a build is open and this button will not start another. "
+        "Waiting for an update means Qdrant will not run until Optimize stuck segments sends one. "
+        "Not started means the click was refused and the reason is on the status line and in the log. "
+        "Qdrant does not report a percent for a segment build."
     ),
 }

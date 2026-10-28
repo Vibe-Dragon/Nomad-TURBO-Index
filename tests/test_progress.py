@@ -391,9 +391,10 @@ class ProgressTest(unittest.TestCase):
         self.assertIn("Nomad TURBO Index", text)
         self.assertIn("bars.pack_start(self.current_bar", text)
         self.assertIn("bars.pack_start(self.overall", text)
-        self.assertIn("bars.pack_start(self.scale", text)
+        self.assertNotIn("bars.pack_start(self.scale", text)
         self.assertLess(text.index("bars.pack_start(self.current_bar"), text.index("bars.pack_start(self.overall"))
-        self.assertLess(text.index("bars.pack_start(self.overall"), text.index("bars.pack_start(self.scale"))
+        self.assertLess(text.index("self.export_button"), text.index("buttons.pack_start(self.scale"))
+        self.assertLess(text.index("buttons.pack_start(self.scale"), text.index("buttons.pack_end(self.delete_button"))
         self.assertIn("repair_bars.pack_start(self.repair_current_bar", text)
         self.assertIn("repair_bars.pack_start(self.repair_overall", text)
         self.assertIn('add_titled(page, "about", "About")', text)
@@ -472,9 +473,10 @@ def _source_layout_ok() -> str:
         "shared index row": (
             "bars.pack_start(self.current_bar" in text
             and "bars.pack_start(self.overall" in text
-            and "bars.pack_start(self.scale" in text
+            and "bars.pack_start(self.scale" not in text
             and text.index("bars.pack_start(self.current_bar") < text.index("bars.pack_start(self.overall")
-            and text.index("bars.pack_start(self.overall") < text.index("bars.pack_start(self.scale")
+            and text.index("self.export_button") < text.index("buttons.pack_start(self.scale")
+            and text.index("buttons.pack_start(self.scale") < text.index("buttons.pack_end(self.delete_button")
         ),
         "shared repair row": (
             "repair_bars.pack_start(self.repair_current_bar" in text
@@ -873,8 +875,12 @@ class AboutAndLayoutTest(unittest.TestCase):
         self.assertIn("Project NOMAD 1.35.1", changelog)
         self.assertIn("shared rows", changelog)
         notes = changelog.split(f"## {__version__}", 1)[1].split("\n## ", 1)[0]
-        self.assertIn("Host", notes)
-        self.assertIn("disk", notes)
+        self.assertIn("150%", notes)
+        self.assertIn("Optimize stuck segments", notes)
+        self.assertIn("Speed up segment optimization", notes)
+        previous = changelog.split("## 1.0.3", 1)[1].split("\n## ", 1)[0]
+        self.assertIn("Host", previous)
+        self.assertIn("disk", previous)
         self.assertIn("about_facts()", window)
         self.assertEqual(_source_layout_ok(), "ok")
 

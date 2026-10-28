@@ -1,7 +1,7 @@
 """Older share dialog. The Index window slider is the control that ships.
 
 Cancel leaves turbo off. This dialog stops at 100%. The window slider is
-what offers the 110% overclock. Neither one starts indexing by itself.
+what offers the 150% overclock. Neither one starts indexing by itself.
 """
 
 from __future__ import annotations

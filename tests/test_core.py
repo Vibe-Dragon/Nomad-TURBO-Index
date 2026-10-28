@@ -535,9 +535,10 @@ class SpeedTest(unittest.TestCase):
         hardware = dict(gpu_total_mib=8192, host_total_mib=16384, cpu_count=8)
         low = embed_call_budget(10, **hardware)
         high = embed_call_budget(100, **hardware)
-        over = embed_call_budget(110, **hardware)
+        over = embed_call_budget(150, **hardware)
         self.assertLessEqual(low, high)
         self.assertGreater(over, high)
+        self.assertGreater(over, embed_call_budget(110, **hardware))
         widths = [embed_call_budget(percent, **hardware) for percent in range(10, 101)]
         self.assertEqual(widths, sorted(widths))
 
@@ -694,6 +695,36 @@ class SpeedTest(unittest.TestCase):
         self.assertTrue(store.store_write_again("qdrant unreachable: timed out", 1))
         self.assertFalse(store.store_write_again("qdrant unreachable: timed out", 2))
         self.assertFalse(store.store_write_again("qdrant 400: bad request", 0))
+
+    def test_a_failed_point_count_is_written_to_the_log(self):
+        install = Install(
+            admin_container="admin",
+            admin_image="admin",
+            network="net",
+            redis_host="redis",
+            redis_port=6379,
+            redis_container="redis",
+            mysql_container="mysql",
+            qdrant_url="http://127.0.0.1:6333",
+            ollama_image="ollama",
+            ollama_container="ollama",
+            models_dir="/models",
+            storage_host="/storage",
+        )
+        original = store._request
+
+        def explode(*_args, **_kwargs):
+            raise store.StoreError("qdrant unreachable: timed out")
+
+        store._request = explode
+        try:
+            with self.assertLogs("nomad_turbo", level="WARNING") as caught:
+                self.assertIsNone(store.count_source(install, "library/file.zim"))
+        finally:
+            store._request = original
+        self.assertIn("Qdrant problem while indexing:", "\n".join(caught.output))
+        self.assertIn("could not count points", "\n".join(caught.output))
+        self.assertIn("timed out", "\n".join(caught.output))
 
     def test_a_missing_segment_cap_is_four_gigabytes(self):
         cap = 4 * 1024 * 1024

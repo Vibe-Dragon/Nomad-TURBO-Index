@@ -3,10 +3,13 @@ from datetime import datetime, timezone
 
 import nomad_turbo.qdrant_status as qdrant_status
 from nomad_turbo.qdrant_status import (
+    QdrantView,
     activity_from_text,
     changes_allowed,
     describe_qdrant,
     growth_line,
+    indexing_problem_line,
+    indexing_qdrant_problem,
     read_vector_count,
     uptime_text,
 )
@@ -107,6 +110,44 @@ class QdrantStatusTest(unittest.TestCase):
         self.assertEqual(read_vector_count((24556160).to_bytes(8, "little") + b"\x00"), 24556160)
         self.assertIn("could not be read", growth_line(10, None))
         self.assertIn("holds 4 vectors", growth_line(None, 4))
+
+    def test_a_qdrant_problem_during_indexing_is_logged_once(self):
+        ready = QdrantView(text="Qdrant is ready for changes.", ready=True, collection_status="green")
+        self.assertEqual(indexing_qdrant_problem(ready), "")
+        yellow = QdrantView(
+            text="Qdrant is ready for changes.",
+            ready=True,
+            collection_status="yellow",
+        )
+        self.assertEqual(indexing_qdrant_problem(yellow), "")
+        failed = QdrantView(
+            text="Qdrant is still writing. Do not restart it or delete the index.\nCollection did not answer.",
+            ready=False,
+        )
+        self.assertEqual(
+            indexing_qdrant_problem(failed),
+            "Qdrant is still writing. Do not restart it or delete the index.",
+        )
+        broken = QdrantView(
+            text="Qdrant is ready for changes.",
+            ready=True,
+            optimizer_error="segment build failed",
+        )
+        self.assertEqual(indexing_qdrant_problem(broken), "Optimizer error: segment build failed.")
+        red = QdrantView(text="Qdrant is ready for changes.", ready=True, collection_status="red")
+        self.assertIn("error state", indexing_qdrant_problem(red))
+
+        quiet, remembered = indexing_problem_line("", False, "Optimizer error: segment build failed.")
+        self.assertEqual((quiet, remembered), ("", ""))
+        first, remembered = indexing_problem_line("", True, "Optimizer error: segment build failed.")
+        self.assertIn("Qdrant problem while indexing:", first)
+        self.assertIn("segment build failed", first)
+        again, remembered = indexing_problem_line(remembered, True, "Optimizer error: segment build failed.")
+        self.assertEqual(again, "")
+        self.assertIn("segment build failed", remembered)
+        cleared, remembered = indexing_problem_line(remembered, True, "")
+        self.assertIn("Qdrant problem cleared", cleared)
+        self.assertEqual(remembered, "")
 
     def test_changes_wait_until_the_collection_answers(self):
         self.assertFalse(changes_allowed(False))

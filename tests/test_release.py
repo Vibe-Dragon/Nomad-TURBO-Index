@@ -24,7 +24,7 @@ from nomad_turbo.discover import Install
 from nomad_turbo.pool import EmbedPool
 from nomad_turbo.progress import usage_text
 from nomad_turbo.session import Session
-from nomad_turbo.slots import embed_call_budget, install_boost_percent
+from nomad_turbo.slots import MAX_BOOST_PERCENT, embed_call_budget, install_boost_percent
 from nomad_turbo.store import collection_ready
 from nomad_turbo.tips import TIPS
 from nomad_turbo import cli
@@ -119,8 +119,8 @@ class HardwareBudgetTest(unittest.TestCase):
         second = embed_call_budget(**kwargs)
         self.assertEqual(first, second)
         self.assertEqual(
-            embed_call_budget(110, gpu_total_mib=8192, host_total_mib=32768, cpu_count=8),
-            embed_call_budget(110, gpu_total_mib=8192, host_total_mib=32768, cpu_count=8),
+            embed_call_budget(MAX_BOOST_PERCENT, gpu_total_mib=8192, host_total_mib=32768, cpu_count=8),
+            embed_call_budget(MAX_BOOST_PERCENT, gpu_total_mib=8192, host_total_mib=32768, cpu_count=8),
         )
 
     def test_a_larger_gpu_budget_is_not_a_smaller_call(self):
@@ -142,15 +142,19 @@ class HardwareBudgetTest(unittest.TestCase):
     def test_overclock_is_past_the_safe_size_and_is_not_the_default(self):
         hardware = dict(gpu_total_mib=8192, host_total_mib=16384, cpu_count=8)
         safe = embed_call_budget(100, **hardware)
-        over = embed_call_budget(110, **hardware)
-        self.assertGreater(over, safe)
-        widths = [embed_call_budget(percent, **hardware) for percent in range(10, 111)]
+        mid = embed_call_budget(110, **hardware)
+        over = embed_call_budget(MAX_BOOST_PERCENT, **hardware)
+        self.assertGreater(mid, safe)
+        self.assertGreater(over, mid)
+        self.assertEqual(MAX_BOOST_PERCENT, 150)
+        widths = [embed_call_budget(percent, **hardware) for percent in range(10, MAX_BOOST_PERCENT + 1)]
         self.assertEqual(widths, sorted(widths))
         self.assertIsNone(Install.__dataclass_fields__["boost_percent"].default)
         missing = type("Cfg", (), {"boost_percent": None, "reserve_ratio": 0.45})()
         saved = install_boost_percent(missing)
         self.assertLessEqual(saved, 100)
         self.assertNotEqual(saved, 110)
+        self.assertNotEqual(saved, 150)
         full = install_boost_percent(type("Cfg", (), {"boost_percent": None, "reserve_ratio": 0.0})())
         self.assertEqual(full, 100)
 
@@ -183,6 +187,7 @@ class HardwareBudgetTest(unittest.TestCase):
                 cpu_count=8,
             ),
         )
+        self.assertGreater(pool.batch_width(150), pool.batch_width(110))
         self.assertGreater(pool.batch_width(110), pool.batch_width(100))
         cpu = EmbedPool(
             _Install(),
@@ -205,19 +210,21 @@ class HardwareBudgetTest(unittest.TestCase):
             ),
         )
 
-    def test_the_slider_can_save_110_and_a_new_session_is_not_forced_there(self):
+    def test_the_slider_can_save_150_and_a_new_session_is_not_forced_there(self):
         session = Session(55)
         self.assertEqual(session.get_percent(), 55)
         session.set_percent(110)
         self.assertEqual(session.get_percent(), 110)
+        session.set_percent(150)
+        self.assertEqual(session.get_percent(), 150)
         session.set_percent(500)
-        self.assertEqual(session.get_percent(), 110)
+        self.assertEqual(session.get_percent(), 150)
         session.set_percent(1)
         self.assertEqual(session.get_percent(), 10)
 
     def test_the_usage_line_shows_the_chunk_count(self):
-        line = usage_text(set_percent=110, chunks=70, server_up=False)
-        self.assertIn("110%", line)
+        line = usage_text(set_percent=150, chunks=70, server_up=False)
+        self.assertIn("150%", line)
         self.assertIn("70 chunks per call", line)
         self.assertIn("Overclock", line)
 
@@ -245,7 +252,8 @@ class TooltipTest(unittest.TestCase):
         slider = TIPS["slider"]
         self.assertIn("10%", slider)
         self.assertIn("100%", slider)
-        self.assertIn("110%", slider)
+        self.assertIn("150%", slider)
+        self.assertIn("next embed call", slider)
         self.assertIn("overclock", slider.lower())
         self.assertIn("budget", slider.lower())
         self.assertIn("chunk count", TIPS["usage"].lower())

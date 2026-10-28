@@ -23,7 +23,13 @@ from nomad_turbo.discover import DiscoverError, config_path, discover, load_inst
 from nomad_turbo.engine import execute
 from nomad_turbo.prompt import display_available
 from nomad_turbo.runtime import gpu_rows
-from nomad_turbo.slots import embed_call_budget, host_memory_mib, install_boost_percent, pick_gpu
+from nomad_turbo.slots import (
+    MAX_BOOST_PERCENT,
+    embed_call_budget,
+    host_memory_mib,
+    install_boost_percent,
+    pick_gpu,
+)
 
 
 def _log_path() -> Path:
@@ -110,7 +116,7 @@ def cmd_plan() -> int:
         cpu_count=cpus,
     )
     over = embed_call_budget(
-        110,
+        MAX_BOOST_PERCENT,
         gpu_total_mib=gpu_total,
         host_total_mib=host_total,
         cpu_count=cpus,
@@ -141,7 +147,7 @@ def cmd_plan() -> int:
     print(f"embed server: one llama-server on {where}")
     print(f"hardware-derived chunks per call at {percent}%: {width}")
     print(f"safe 100% call size from detected hardware: {full} chunks")
-    print(f"110% overclock call size: {over} chunks")
+    print(f"{MAX_BOOST_PERCENT}% overclock call size: {over} chunks")
     print("The slider changes only that call size. The server stays up.")
     if install.slots:
         print(f"config slots={install.slots} is ignored")
