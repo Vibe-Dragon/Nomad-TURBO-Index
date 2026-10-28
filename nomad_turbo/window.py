@@ -135,8 +135,9 @@ class _MemoryLog(logging.Handler):
 
 
 def _configure_logging(memory: _MemoryLog) -> Path:
-    path = state_dir() / "session.log"
-    path.parent.mkdir(parents=True, exist_ok=True)
+    from nomad_turbo.logbook import prepare_session_logs
+
+    path, _previous = prepare_session_logs(state_dir())
     formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
     file_handler = logging.FileHandler(path, mode="w")
     file_handler.setLevel(logging.DEBUG)
@@ -221,7 +222,7 @@ class _Window:
         self._optimize_pause = None
         self._optimize_live = None
         self._optimize_code = None
-        self._tune_ceiling = None
+        self._tune_hold = None
         self._tune_applying = False
         self._tune_logged = ""
         self.repair_stop = threading.Event()
@@ -294,6 +295,11 @@ class _Window:
         header = gtk.Box(orientation=gtk.Orientation.HORIZONTAL, spacing=8)
         header.set_hexpand(True)
         header.pack_start(switcher, False, False, 0)
+        self.log_help_button = gtk.Button(label="Log help")
+        self.log_help_button.set_tooltip_text(TIPS["log_help"])
+        self.log_help_button.set_valign(gtk.Align.CENTER)
+        self.log_help_button.connect("clicked", self.on_log_help)
+        header.pack_start(self.log_help_button, False, False, 0)
         self.host_button = gtk.ToggleButton(label="Host")
         self.host_button.set_tooltip_text(TIPS["host"])
         self.host_button.set_valign(gtk.Align.CENTER)
@@ -778,7 +784,8 @@ class _Window:
                 self._optimize_live = (bar, detail, pulse)
                 if code != self._optimize_code:
                     self._optimize_code = code
-                    segment_guard.report_optimize(code, detail)
+                    level, line = segment_guard.optimize_watch_line(code, detail)
+                    log.log(level, line)
                 self._note_qdrant_problem(indexing_qdrant_problem(view))
             except Exception as exc:
                 message = f"{exc.__class__.__name__}: {exc}"
@@ -1323,7 +1330,7 @@ class _Window:
     def on_tune_auto(self, button) -> None:
         active = bool(button.get_active())
         self.scale.set_sensitive(not active)
-        self._tune_ceiling = None
+        self._tune_hold = None
         self.install.tune_auto = active
         try:
             save_install(self.install)
@@ -1335,7 +1342,7 @@ class _Window:
         percent = clamp_boost_percent(int(round(scale.get_value())))
         self.session.set_percent(percent)
         if not self._tune_applying:
-            self._tune_ceiling = None
+            self._tune_hold = None
         self.refresh_usage()
         if self.save_timer:
             self.glib.source_remove(self.save_timer)
@@ -1421,8 +1428,79 @@ class _Window:
         note = self.session.view().get("note") or "Knowledge index deleted. Indexing has not started."
         self.glib.idle_add(self._show, self.status, note)
 
+    def _choose_export_source(self):
+        """Current session, or the previous one. None when the user cancels."""
+        gtk = self.gtk
+        previous = self.log_path.with_name("session-previous.log")
+        has_previous = previous.is_file() and previous.stat().st_size > 0
+        dialog = gtk.Dialog(
+            title="Export log",
+            parent=self.window,
+            flags=gtk.DialogFlags.MODAL,
+        )
+        dialog.add_button("Cancel", gtk.ResponseType.CANCEL)
+        dialog.add_button("Continue", gtk.ResponseType.OK)
+        box = dialog.get_content_area()
+        box.set_border_width(12)
+        box.set_spacing(8)
+        note = gtk.Label(
+            label=(
+                "The log file keeps every line. The checkboxes only hide lines in the window. "
+                "Older sessions are not kept."
+            )
+        )
+        note.set_xalign(0)
+        note.set_line_wrap(True)
+        note.set_max_width_chars(48)
+        current = gtk.RadioButton.new_with_label(None, "Current session")
+        last = gtk.RadioButton.new_with_label_from_widget(current, "Last session")
+        last.set_sensitive(has_previous)
+        if not has_previous:
+            last.set_tooltip_text("No earlier session is saved yet.")
+        box.pack_start(note, False, False, 0)
+        box.pack_start(current, False, False, 0)
+        box.pack_start(last, False, False, 0)
+        dialog.show_all()
+        response = dialog.run()
+        chosen = previous if last.get_active() and has_previous else self.log_path
+        dialog.destroy()
+        if response != gtk.ResponseType.OK:
+            return None
+        return chosen
+
+    def on_log_help(self, *_args) -> None:
+        from nomad_turbo.logbook import log_help_text
+
+        gtk = self.gtk
+        dialog = gtk.Dialog(
+            title="What the log lines mean",
+            parent=self.window,
+            flags=gtk.DialogFlags.MODAL,
+        )
+        dialog.set_default_size(560, 480)
+        dialog.add_button("Close", gtk.ResponseType.CLOSE)
+        scroll = gtk.ScrolledWindow()
+        scroll.set_policy(gtk.PolicyType.AUTOMATIC, gtk.PolicyType.AUTOMATIC)
+        view = gtk.TextView()
+        view.set_editable(False)
+        view.set_cursor_visible(False)
+        view.set_wrap_mode(gtk.WrapMode.WORD)
+        view.set_left_margin(12)
+        view.set_right_margin(12)
+        view.set_top_margin(12)
+        view.set_bottom_margin(12)
+        view.get_buffer().set_text(log_help_text())
+        scroll.add(view)
+        dialog.get_content_area().pack_start(scroll, True, True, 0)
+        dialog.show_all()
+        dialog.run()
+        dialog.destroy()
+
     def on_export(self, *_args) -> None:
         gtk = self.gtk
+        source = self._choose_export_source()
+        if source is None:
+            return
         chooser = gtk.FileChooserDialog(
             title="Export log",
             parent=self.window,
@@ -1434,7 +1512,10 @@ class _Window:
                 gtk.ResponseType.OK,
             ),
         )
-        chooser.set_current_name("nomad-turbo-log.txt")
+        name = "nomad-turbo-log.txt"
+        if source.name == "session-previous.log":
+            name = "nomad-turbo-previous-log.txt"
+        chooser.set_current_name(name)
         chooser.set_do_overwrite_confirmation(True)
         response = chooser.run()
         target = chooser.get_filename()
@@ -1442,7 +1523,7 @@ class _Window:
         if response != gtk.ResponseType.OK or not target:
             return
         try:
-            shutil.copyfile(self.log_path, target)
+            shutil.copyfile(source, target)
         except OSError as exc:
             self.status.set_text(f"Could not export the log: {exc}")
             return
@@ -1766,9 +1847,11 @@ class _Window:
             running=running,
             optimizing=bool(view.get("optimize_hold")),
             gpu_free_mib=free,
-            ceiling=self._tune_ceiling,
+            hold=self._tune_hold,
+            call_count=self.session.embed_call_count(),
+            now=time.monotonic(),
         )
-        self._tune_ceiling = advice.ceiling
+        self._tune_hold = advice.hold
         self._show(self.tune_label, advice.text)
         self.tune_label.set_tooltip_text(f"{TIPS['tune']} {advice.text}".strip())
         if not advice.move or advice.percent == view["percent"]:

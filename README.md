@@ -179,7 +179,7 @@ The slider runs from 10% to 100% of that budget. Above 100% is an overclock, up 
 
 Moving the slider during a run changes the next embed call. The usage line updates as you move it. The call that is already in flight finishes at the old size. When the next call starts, the log says how many chunks it will send and the percent you set. The server is not restarted.
 
-The line under the buttons recommends from finished embed calls, not from the card's listed memory. After three full calls it says whether chunks are keeping up, whether this setting is slower than a smaller one, or whether the embed server struggled. A segment rewrite is called out on its own, because a larger batch will not speed that wait. **Auto**, beside the slider, raises the setting while those calls keep up and steps back when a larger call is slower or fails. The setting it stops on is the fastest one measured. If the calls are still keeping up at 150%, that is the top of the slider, not proof the card has more room. Card memory only stops the climb when the live reading has little free memory left. Auto does not start a second server.
+The line under the buttons recommends from finished embed calls, not from the card's listed memory. After three full calls it says whether chunks are keeping up, whether this setting is slower than a smaller one, or whether the embed server struggled. A segment rewrite is called out on its own, because a larger batch will not speed that wait. **Auto**, beside the slider, raises the setting while those calls keep up and steps down when a larger call is clearly slower or fails. A slowdown smaller than about a fifth is left alone. It then waits about a minute and a half, and through more finished calls, before trying one step higher again, so it does not bounce. If the pace of the work changes a lot, it tries sooner. One odd slow call does not cut the batch. A probe that keeps up waits again before the next step. If the calls are still keeping up at 150%, that is the top of the slider, not proof the card has more room. Card memory only stops the climb when the live reading has little free memory left. Auto does not start a second server.
 
 ```python
 full = safe_call_chunks(
@@ -233,7 +233,7 @@ A GPU is used when the machine has one. With no GPU, the call size comes from sy
 
 ### What does the slider do, and what is 150%?
 
-The slider is a share of the budget detected on your computer. 10% to 100% stays inside that budget. 150% is an overclock past it: half again the safe call, rounded down to whole chunks. A new install starts at 55%. One embed server stays up. Moving the slider during a run changes the next call. The call already running is left alone. Past 100% can be slower when the card is already busy. **Auto** next to the slider follows finished calls and stops at the fastest size those calls measured.
+The slider is a share of the budget detected on your computer. 10% to 100% stays inside that budget. 150% is an overclock past it: half again the safe call, rounded down to whole chunks. A new install starts at 55%. One embed server stays up. Moving the slider during a run changes the next call. The call already running is left alone. Past 100% can be slower when the card is already busy. **Auto** next to the slider follows finished calls in both directions. It steps down when a larger call is clearly slower or fails, then waits about a minute and a half before trying one step higher again. A small slowdown does not move it. If the pace of the work changes a lot, it tries sooner.
 
 ### Will this stay current when I update NOMAD?
 
@@ -359,9 +359,11 @@ A very long page is read and split before its chunks are stored. The article cou
 
 The Log row shows and hides the log. **Errors**, **Info**, and **Debug** only change which lines the pane draws. The log file still records every line. **Follow** jumps to the newest line and stays there. Scroll up to hold your place. Turn Follow off and the page stays where it is while new lines arrive.
 
-**Export log** saves that file, including lines the checkboxes are hiding. The suggested name is `nomad-turbo-log.txt`.
+Opening the window starts a new session log. The log that was already there is kept as the last session. Older session logs are deleted. **Export log** asks whether to save the current session or that last one, including lines the checkboxes are hiding. The suggested name is `nomad-turbo-log.txt`, or `nomad-turbo-previous-log.txt` for the last session. If the window crashed, open it again and export the last session.
 
-On a long run the pane drops lines it has already shown, so the window still answers the close button. The file keeps the session.
+**Log help**, beside About, opens a window that explains the lines Turbo writes on purpose. A warning or traceback that window does not name is the program reporting what it hit.
+
+On a long run the pane drops lines it has already shown, so the window still answers the close button. The session file keeps the lines.
 
 ## Repair
 
@@ -432,6 +434,8 @@ If it is still not taking the write, Turbo stays on that file. The status line s
 ### Indexing paused for a segment
 
 When a plain segment is past the 4 GiB vector cap, the log says indexing is paused so a segment can be optimized, and that a plain segment is past the cap. When free space is under twice the segment that would be copied, the log says that instead. New points wait. Points already stored stay. The optimization bar starts over for that pause. Qdrant does not report a percent while it builds the segment. When the pause ends, the log says knowledge-base writes resumed.
+
+While the window is open, a change in optimization state is one short line: not running, a segment build is open, the collection is yellow, waiting for an update, or status unknown. An optimizer error is a warning and keeps Qdrant's full message.
 
 ### Optimize stuck segments
 

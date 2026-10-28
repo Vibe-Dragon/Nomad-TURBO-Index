@@ -6,6 +6,7 @@ Facts are built in the test. Nothing here opens the live collection.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import tempfile
 import threading
@@ -911,6 +912,17 @@ class OptimizeMessageTest(unittest.TestCase):
         self.assertIn("already in progress", detail.lower())
         self.assertIn("not reported a percent", detail.lower())
         self.assertIn("will not start another", detail.lower())
+        level, line = segment_guard.optimize_watch_line(code, detail)
+        self.assertEqual(level, logging.INFO)
+        self.assertEqual(line, "Optimize: a segment build is open. No percent reported.")
+        self.assertNotIn("\n", line)
+        error_level, error_line = segment_guard.optimize_watch_line(
+            "error",
+            "Qdrant reported an optimizer error: disk full. A segment build is open.",
+        )
+        self.assertEqual(error_level, logging.WARNING)
+        self.assertIn("disk full", error_line)
+        self.assertIn("segment build is open", error_line)
         waiting = segment_guard.describe_optimizer_state("grey", "", False)
         self.assertEqual(waiting[0], "waiting")
         self.assertFalse(waiting[3])

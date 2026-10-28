@@ -21,6 +21,7 @@ class Session:
         self.note = ""
         self.optimize_hold = ""
         self._embed_calls: list[tuple[int, int, float, bool]] = []
+        self._embed_call_count = 0
         self._book: ProgressBook | None = None
         self.active_slots = 0
         self.total_mib = 0
@@ -84,6 +85,7 @@ class Session:
     def note_embed_call(self, percent: int, chunks: int, seconds: float, ok: bool) -> None:
         """Remember one embed call so the batch advice can follow the pace, not the card."""
         with self._lock:
+            self._embed_call_count += 1
             self._embed_calls.append((int(percent), int(chunks), float(seconds), bool(ok)))
             if len(self._embed_calls) > 48:
                 del self._embed_calls[:-48]
@@ -91,6 +93,11 @@ class Session:
     def embed_calls(self) -> list[tuple[int, int, float, bool]]:
         with self._lock:
             return list(self._embed_calls)
+
+    def embed_call_count(self) -> int:
+        """How many embed calls have been recorded. The kept list is only the latest."""
+        with self._lock:
+            return self._embed_call_count
 
     def set_optimize_hold(self, reason: str) -> None:
         """segment or space while indexing is waiting on a rewrite. Empty otherwise."""

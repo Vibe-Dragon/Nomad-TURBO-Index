@@ -55,9 +55,10 @@ TIPS: dict[str, str] = {
         "A segment rewrite is not something a larger batch will speed up."
     ),
     "tune_auto": (
-        "Raise the batch while full embed calls keep up, and step back when a larger call "
-        "is slower or the embed server struggles. The highest setting that still keeps up "
-        "is the measured line. 150% is only the top of the slider. "
+        "Raise the batch while full embed calls keep up, and step down when a larger call "
+        "is clearly slower or the embed server struggles. A small slowdown is left alone. "
+        "Auto tries one step higher again after a short wait, and sooner when the pace of the work changes a lot. "
+        "150% is only the top of the slider. "
         "One embed server stays up. A call already running is left alone."
     ),
     "usage": (
@@ -78,7 +79,14 @@ TIPS: dict[str, str] = {
         "that started on Always stays Manual."
     ),
     "rescan": "Read the library again and refresh this list. This does not pause NOMAD or start indexing.",
-    "export": "Save the whole session log, including lines the checkboxes are hiding.",
+    "export": (
+        "Save the current session log, or the previous session if one is saved. "
+        "The file includes lines the checkboxes are hiding. Older sessions are not kept."
+    ),
+    "log_help": (
+        "Open a window that explains the log lines Turbo writes on purpose. "
+        "An unforeseen error still prints its own message."
+    ),
     "delete": (
         "Remove stored knowledge points and ingest rows. You must type DELETE. "
         "Indexing does not start. ZIM files and uploads stay on disk."

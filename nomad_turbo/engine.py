@@ -176,28 +176,36 @@ def _announce_hold(session: Session | None, reason: str) -> None:
         return
     if reason == "download":
         message = "A ZIM download is in progress. Knowledge-base writes are waiting."
+        logged = message
     elif reason == "settle":
         message = "A download just finished. Waiting for its knowledge-base update before writing."
+        logged = message
     elif reason == "disk":
         message = "The disk is busy. Slowing knowledge-base writes."
+        logged = message
     elif reason == "segment":
-        message = (
+        logged = (
             "Indexing is paused so a segment can be optimized. "
-            "A plain segment is past the 4 GiB vector cap. "
-            "New points are waiting. Points already stored stay. "
+            "A plain segment is past the 4 GiB vector cap. New points are waiting."
+        )
+        message = (
+            f"{logged} Points already stored stay. "
             "The optimization bar on this page starts over for this pause. "
             "Qdrant does not report a percent while it builds the segment."
         )
     elif reason == "space":
-        message = (
+        logged = (
             "Indexing is paused so a segment can be optimized. "
-            "Free space is under twice the segment that would be copied. "
-            "New points are waiting. Points already stored stay. "
+            "Free space is under twice the segment that would be copied. New points are waiting."
+        )
+        message = (
+            f"{logged} Points already stored stay. "
             "The optimization bar on this page starts over for this pause."
         )
     else:
         message = "Knowledge-base writes resumed."
-    log.info(message)
+        logged = message
+    log.info(logged)
     _hold_announced = reason
     hold = reason if reason in ("segment", "space") else ""
     setter = getattr(session, "set_optimize_hold", None) if session is not None else None

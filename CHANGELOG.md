@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 1.1.2
+
+### Moderate
+
+- **Auto** follows finished embed calls in both directions. It steps down when a larger call is clearly slower or the embed server struggles. A slowdown smaller than about a fifth is left alone. It tries one step higher again after about a minute and a half and more finished calls, and sooner when the pace of the work changes a lot. A probe that keeps up waits again before the next step. One odd slow call does not cut the batch. Card memory still stops a climb when little is free. 150% remains only the top of the slider.
+- Routine optimization lines in the log are one sentence. An optimizer error keeps the full detail. **Errors**, **Info**, and **Debug** still only hide lines in the pane. Each window start keeps the previous session log and removes older ones. **Export log** can save the current session or that previous one. **Log help**, beside About, explains the lines Turbo writes on purpose.
+
 ## 1.1.1
 
 ### Moderate

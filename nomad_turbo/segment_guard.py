@@ -208,10 +208,34 @@ def format_bytes(size: int | None) -> str:
 
 
 def report_optimize(stage: str, detail: str) -> str:
-    """Write one Optimize line to the Turbo log and return that line."""
+    """Write one Optimize line to the Turbo log and return that line.
+
+    A click keeps its reason. A failure is a warning so the Errors filter shows it.
+    """
     line = f"Optimize stuck segments: {stage}. {detail}".strip()
-    log.info(line)
+    if stage in {"failed", "error"}:
+        log.warning(line)
+    else:
+        log.info(line)
     return line
+
+
+def optimize_watch_line(code: str, detail: str) -> tuple[int, str]:
+    """Level and one log line for a status change.
+
+    The repair bar keeps the long detail as its tip. The log gets one sentence,
+    except an error, which keeps the full detail.
+    """
+    if code == "error":
+        return logging.WARNING, f"Optimize stuck segments: error. {detail}".strip()
+    briefs = {
+        "idle": "Optimize: not running.",
+        "running": "Optimize: a segment build is open. No percent reported.",
+        "pending": "Optimize: collection is yellow. No build is open.",
+        "waiting": "Optimize: waiting for an update. Nothing was sent.",
+        "unknown": "Optimize: status unknown. Nothing was changed.",
+    }
+    return logging.INFO, briefs.get(code, f"Optimize: {code}.")
 
 
 @dataclass(frozen=True)

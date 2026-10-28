@@ -59,6 +59,7 @@ PAGE_TIPS = (
     "stop",
     "rescan",
     "export",
+    "log_help",
     "delete",
     "repair_quick",
     "repair_complete",
