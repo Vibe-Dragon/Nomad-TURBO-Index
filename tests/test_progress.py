@@ -875,9 +875,12 @@ class AboutAndLayoutTest(unittest.TestCase):
         self.assertIn("Project NOMAD 1.35.1", changelog)
         self.assertIn("shared rows", changelog)
         notes = changelog.split(f"## {__version__}", 1)[1].split("\n## ", 1)[0]
-        self.assertIn("150%", notes)
-        self.assertIn("Optimize stuck segments", notes)
-        self.assertIn("Speed up segment optimization", notes)
+        self.assertIn("Auto", notes)
+        self.assertIn("finished embed calls", notes)
+        released = changelog.split("## 1.1.0", 1)[1].split("\n## ", 1)[0]
+        self.assertIn("150%", released)
+        self.assertIn("Optimize stuck segments", released)
+        self.assertIn("Speed up segment optimization", released)
         previous = changelog.split("## 1.0.3", 1)[1].split("\n## ", 1)[0]
         self.assertIn("Host", previous)
         self.assertIn("disk", previous)

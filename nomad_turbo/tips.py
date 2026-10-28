@@ -46,7 +46,19 @@ TIPS: dict[str, str] = {
         "How many chunks the next embed call sends, as a percent of the budget detected on the computer running Turbo. "
         "10% to 100% stays inside that budget. 150% is an overclock past that budget. "
         "Moving it during a run changes the next embed call. "
-        "One embed server stays up. A call that is already running is left alone."
+        "One embed server stays up. A call that is already running is left alone. "
+        "The line under the buttons says whether finished calls are keeping up."
+    ),
+    "tune": (
+        "What the last full embed calls say about this batch size. "
+        "It follows chunks per second on those calls. It does not guess from the card. "
+        "A segment rewrite is not something a larger batch will speed up."
+    ),
+    "tune_auto": (
+        "Raise the batch while full embed calls keep up, and step back when a larger call "
+        "is slower or the embed server struggles. The highest setting that still keeps up "
+        "is the measured line. 150% is only the top of the slider. "
+        "One embed server stays up. A call already running is left alone."
     ),
     "usage": (
         "The chunk count this setting will send on the next embed call, "

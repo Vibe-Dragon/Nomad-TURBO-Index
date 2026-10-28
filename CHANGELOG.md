@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.1.1
+
+### Moderate
+
+- The line under the Index buttons recommends a batch size from finished embed calls. **Auto**, beside the slider, raises the call while those calls keep up and steps back when a larger call is slower or the embed server struggles. The stop is the fastest size measured. 150% remains only the top of the slider. The advice does not guess from the card.
+
 ## 1.1.0
 
 ### Major

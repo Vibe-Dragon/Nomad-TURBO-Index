@@ -179,6 +179,8 @@ The slider runs from 10% to 100% of that budget. Above 100% is an overclock, up 
 
 Moving the slider during a run changes the next embed call. The usage line updates as you move it. The call that is already in flight finishes at the old size. When the next call starts, the log says how many chunks it will send and the percent you set. The server is not restarted.
 
+The line under the buttons recommends from finished embed calls, not from the card's listed memory. After three full calls it says whether chunks are keeping up, whether this setting is slower than a smaller one, or whether the embed server struggled. A segment rewrite is called out on its own, because a larger batch will not speed that wait. **Auto**, beside the slider, raises the setting while those calls keep up and steps back when a larger call is slower or fails. The setting it stops on is the fastest one measured. If the calls are still keeping up at 150%, that is the top of the slider, not proof the card has more room. Card memory only stops the climb when the live reading has little free memory left. Auto does not start a second server.
+
 ```python
 full = safe_call_chunks(
     gpu_total_mib=gpu_total_mib,
@@ -231,7 +233,7 @@ A GPU is used when the machine has one. With no GPU, the call size comes from sy
 
 ### What does the slider do, and what is 150%?
 
-The slider is a share of the budget detected on your computer. 10% to 100% stays inside that budget. 150% is an overclock past it: half again the safe call, rounded down to whole chunks. A new install starts at 55%. One embed server stays up. Moving the slider during a run changes the next call. The call already running is left alone. Past 100% can be slower when the card is already busy.
+The slider is a share of the budget detected on your computer. 10% to 100% stays inside that budget. 150% is an overclock past it: half again the safe call, rounded down to whole chunks. A new install starts at 55%. One embed server stays up. Moving the slider during a run changes the next call. The call already running is left alone. Past 100% can be slower when the card is already busy. **Auto** next to the slider follows finished calls and stops at the fastest size those calls measured.
 
 ### Will this stay current when I update NOMAD?
 

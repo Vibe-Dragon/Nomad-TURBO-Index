@@ -221,6 +221,9 @@ class _Window:
         self._optimize_pause = None
         self._optimize_live = None
         self._optimize_code = None
+        self._tune_ceiling = None
+        self._tune_applying = False
+        self._tune_logged = ""
         self.repair_stop = threading.Event()
         self.repair_board = None
         self.repair_starting = False
@@ -521,6 +524,13 @@ class _Window:
         self.stats.set_tooltip_text(TIPS["stats"])
         lower.pack_start(self.stats, False, False, 0)
 
+        self.tune_label = gtk.Label(label="A recommendation shows after indexing finishes a few embed calls.")
+        self.tune_label.set_xalign(0)
+        self.tune_label.set_hexpand(True)
+        self.tune_label.set_ellipsize(Pango.EllipsizeMode.END)
+        self.tune_label.set_tooltip_text(TIPS["tune"])
+        lower.pack_start(self.tune_label, False, False, 0)
+
         self.keep_check = gtk.CheckButton(
             label="Stay on after the last file, and index new files as they arrive"
         )
@@ -552,6 +562,12 @@ class _Window:
         for button in (self.start_button, self.stop_button, self.rescan_button, self.export_button):
             buttons.pack_start(button, False, False, 0)
         # Between Export log and Delete index, so the file and library bars keep the row above.
+        self.tune_auto = gtk.CheckButton(label="Auto")
+        self.tune_auto.set_tooltip_text(TIPS["tune_auto"])
+        self.tune_auto.set_active(bool(getattr(install, "tune_auto", False)))
+        self.tune_auto.connect("toggled", self.on_tune_auto)
+        self.scale.set_sensitive(not self.tune_auto.get_active())
+        buttons.pack_start(self.tune_auto, False, False, 0)
         buttons.pack_start(slider_label, False, False, 0)
         buttons.pack_start(self.scale, True, True, 0)
         buttons.pack_start(self.scale_end, False, False, 0)
@@ -1304,9 +1320,22 @@ class _Window:
         except Exception:
             log.exception("could not save the stay-on setting")
 
+    def on_tune_auto(self, button) -> None:
+        active = bool(button.get_active())
+        self.scale.set_sensitive(not active)
+        self._tune_ceiling = None
+        self.install.tune_auto = active
+        try:
+            save_install(self.install)
+        except Exception:
+            log.exception("could not save the auto batch setting")
+        self._apply_tune()
+
     def on_slider(self, scale) -> None:
         percent = clamp_boost_percent(int(round(scale.get_value())))
         self.session.set_percent(percent)
+        if not self._tune_applying:
+            self._tune_ceiling = None
         self.refresh_usage()
         if self.save_timer:
             self.glib.source_remove(self.save_timer)
@@ -1712,6 +1741,46 @@ class _Window:
             card = "No GPU detected. The embed server will use the CPU."
         self._show(self.card, card)
         self.card.set_tooltip_text(f"{TIPS['card']} {card}".strip())
+        self._apply_tune()
+
+    def _apply_tune(self) -> None:
+        """Show the live batch advice. Auto moves the slider only after finished calls earn it."""
+        from nomad_turbo.tune import EmbedSample, tune_advice
+
+        if self._tune_applying or not hasattr(self, "tune_label"):
+            return
+        view = self.session.view()
+        running = view["phase"] in ("waiting", "running") and self.thread is not None and self.thread.is_alive()
+        gpu = self.live_gpu
+        free = None
+        if gpu and gpu[1]:
+            free = max(0, int(gpu[1]) - int(gpu[2]))
+        samples = [
+            EmbedSample(percent, chunks, seconds, ok)
+            for percent, chunks, seconds, ok in self.session.embed_calls()
+        ]
+        advice = tune_advice(
+            samples,
+            view["percent"],
+            auto=bool(self.tune_auto.get_active()) if hasattr(self, "tune_auto") else False,
+            running=running,
+            optimizing=bool(view.get("optimize_hold")),
+            gpu_free_mib=free,
+            ceiling=self._tune_ceiling,
+        )
+        self._tune_ceiling = advice.ceiling
+        self._show(self.tune_label, advice.text)
+        self.tune_label.set_tooltip_text(f"{TIPS['tune']} {advice.text}".strip())
+        if not advice.move or advice.percent == view["percent"]:
+            return
+        if advice.text != self._tune_logged:
+            self._tune_logged = advice.text
+            log.info("embed batch: %s", advice.text)
+        self._tune_applying = True
+        try:
+            self.scale.set_value(advice.percent)
+        finally:
+            self._tune_applying = False
 
     def refresh_log(self) -> None:
         show_info = self.info_check.get_active()

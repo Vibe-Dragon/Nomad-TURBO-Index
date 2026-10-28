@@ -39,6 +39,8 @@ class Install:
     dimension: int = 768
     reserve_ratio: float = 0.45
     keep_control: bool = False
+    # Auto moves the embed slider from finished calls. Off until the user turns it on.
+    tune_auto: bool = False
     per_slot_mib: int = 1024
     max_slots: int = 64
     slots: int | None = None
@@ -232,6 +234,7 @@ def load_install() -> Install:
     for key in (
         "reserve_ratio",
         "keep_control",
+        "tune_auto",
         "log_open",
         "log_follow",
         "column_widths",

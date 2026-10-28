@@ -209,6 +209,12 @@ def _announce_hold(session: Session | None, reason: str) -> None:
         session.set_note("Indexing.")
 
 
+def _note_embed_call(session, percent: int, chunks: int, seconds: float, ok: bool) -> None:
+    note = getattr(session, "note_embed_call", None)
+    if callable(note):
+        note(percent, chunks, seconds, ok)
+
+
 def _segment_hold(install: Install) -> str:
     """Wait while a segment rewrite would not fit. Import is local so a new Start sees it."""
     from nomad_turbo import segment_guard
@@ -1078,6 +1084,7 @@ def _consume_articles(install, pool, work, stop, session, seen, pull, retire=Non
             if not pool.urls:
                 raise RuntimeError("the embed server is not running")
             texts = feed.next_inputs(width)
+            started = time.monotonic()
             try:
                 vectors = embed(pool.urls[0], install.embed_model, texts)
             except ChunkRejected as exc:
@@ -1106,6 +1113,13 @@ def _consume_articles(install, pool, work, stop, session, seen, pull, retire=Non
                         exc.detail,
                     )
                 continue
+            except Exception:
+                _note_embed_call(session, percent, len(texts), time.monotonic() - started, False)
+                raise
+            else:
+                # A short leftover batch is not the size the slider asked for.
+                if len(texts) >= max(4, width // 2):
+                    _note_embed_call(session, percent, len(texts), time.monotonic() - started, True)
             ready = feed.push_vectors(vectors)
             if ready:
                 pipe.submit(lambda batch=ready: _store_ready(install, work, seen, session, batch, stop))

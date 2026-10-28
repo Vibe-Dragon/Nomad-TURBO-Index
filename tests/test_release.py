@@ -35,6 +35,8 @@ ROOT = Path(__file__).resolve().parents[1]
 PAGE_TIPS = (
     "qdrant",
     "slider",
+    "tune",
+    "tune_auto",
     "usage",
     "col_file",
     "col_kind",
