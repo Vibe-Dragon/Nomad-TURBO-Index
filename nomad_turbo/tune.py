@@ -1,11 +1,12 @@
 """Live embed-batch advice from finished calls, not from the card's spec sheet.
 
 Auto raises the slider while full calls keep up, and steps down as soon as a
-larger call is slower or the embed server fails one. After a step down it
-waits through more calls before trying one step higher again, so it does not
-bounce. If the pace of the work changes, that wait ends early. 150% is only
-the top of the slider. A call already in flight is left alone. One server
-stays up.
+larger call is slower than the nearest smaller size it still remembers, or the
+embed server fails one. A long stay at one size does not erase that neighbor.
+After a step down it waits through more calls before trying one step higher
+again, so it does not bounce. A step that is not faster does not keep going.
+If the pace of the work changes, that wait ends early. 150% is only the top
+of the slider. A call already in flight is left alone. One server stays up.
 """
 
 from __future__ import annotations
@@ -110,6 +111,111 @@ def _lower_pace(samples: list[EmbedSample], percent: int) -> tuple[int, float] |
     return found
 
 
+def _same_work(pace: float, remembered: float) -> bool:
+    """True when two paces are close enough to be the same kind of page."""
+    if pace <= 0 or remembered <= 0:
+        return False
+    ratio = pace / remembered
+    return PACE_SHIFT <= ratio <= (1 / PACE_SHIFT)
+
+
+def _remember_paces(samples: list[EmbedSample], memory: dict[int, float]) -> None:
+    """Store the last full pace at each percent.
+
+    The recent-call list forgets a size once the slider sits elsewhere. This
+    map is what lets Auto step down from 150% an hour later. A new visit
+    replaces a pace only after three fresh calls, so one odd call does not.
+    """
+    run_percent: int | None = None
+    run: list[EmbedSample] = []
+
+    def finish() -> None:
+        ok = [sample for sample in run if sample.ok]
+        if run_percent is None or len(ok) < CALLS_BEFORE_MOVE:
+            return
+        pace = _pace(ok[-CALLS_BEFORE_MOVE:])
+        if pace is not None:
+            memory[run_percent] = pace
+
+    for sample in samples:
+        if sample.percent != run_percent:
+            finish()
+            run_percent = sample.percent
+            run = []
+        run.append(sample)
+    finish()
+
+
+def _nearest_lower(memory: dict[int, float], percent: int) -> tuple[int, float] | None:
+    """The closest smaller size with a stored pace. Not the fastest one."""
+    nearest: int | None = None
+    found: float | None = None
+    for candidate, remembered in memory.items():
+        if candidate >= percent or remembered <= 0:
+            continue
+        if nearest is None or candidate > nearest:
+            nearest = candidate
+            found = remembered
+    if nearest is None or found is None:
+        return None
+    return nearest, found
+
+
+def _measured_here(samples: list[EmbedSample], percent: int) -> bool:
+    """True when this advice still has three finished calls at that percent."""
+    ok = [sample for sample in samples if sample.percent == percent and sample.ok]
+    return len(ok) >= CALLS_BEFORE_MOVE
+
+
+def _parent_pace(memory: dict[int, float], percent: int, pace: float) -> float | None:
+    """Pace of the nearest larger size measured on this same pace of work."""
+    nearest: int | None = None
+    found: float | None = None
+    for candidate, remembered in memory.items():
+        if candidate <= percent or not _same_work(pace, remembered):
+            continue
+        if nearest is None or candidate < nearest:
+            nearest = candidate
+            found = remembered
+    return found
+
+
+def _work_slowed(memory: dict[int, float], percent: int, pace: float) -> bool:
+    """True when every remembered smaller size belongs to a faster kind of page."""
+    lowers = [remembered for candidate, remembered in memory.items() if candidate < percent and remembered > 0]
+    if not lowers:
+        return False
+    return all(pace / remembered < PACE_SHIFT for remembered in lowers)
+
+
+def _decline_target(
+    memory: dict[int, float],
+    samples: list[EmbedSample],
+    percent: int,
+    pace: float,
+) -> tuple[int, float] | None:
+    """The nearest smaller size, when this one is clearly slower than it.
+
+    A fast sample from early in a climb does not veto a later size. The size
+    just measured still counts when the drop is large, because that drop is
+    the batch, not a different kind of page. A step that did not beat the size
+    just above it does not keep going.
+    """
+    nearest = _nearest_lower(memory, percent)
+    if nearest is None:
+        return None
+    candidate, remembered = nearest
+    fresh = _measured_here(samples, candidate)
+    if not fresh and not _same_work(pace, remembered):
+        return None
+    parent = _parent_pace(memory, percent, pace)
+    if parent is not None and pace <= parent:
+        return None
+    if pace >= remembered * SLOW_RATIO:
+        return None
+    return candidate, remembered
+
+
 def _hold_open(hold: TuneHold | None, pace: float | None, call_count: int, now: float) -> bool:
     """True while Auto should not climb past the hold."""
     if hold is None:
@@ -146,12 +252,16 @@ def tune_advice(
     hold: TuneHold | None = None,
     call_count: int = 0,
     now: float = 0.0,
+    memory: dict[int, float] | None = None,
 ) -> TuneAdvice:
     """Recommend a batch, and move it only when auto is on and a change is earned.
 
-    A step down is immediate once three full calls are about a fifth slower, or
-    on one failed call. The next step up waits on the clock and the call count,
-    unless the pace of the work has changed a lot. Manual use leaves the hold unchanged.
+    A step down is immediate once three full calls are about a fifth slower than
+    the nearest smaller size still remembered, or on one failed call. The recent
+    call list can forget a size. `memory` keeps that pace and is updated in place.
+    The next step up waits on the clock and the call count, unless the pace of
+    the work has changed a lot. A step down that is not faster does not keep
+    going. Manual use leaves the hold unchanged.
     """
     percent = clamp_boost_percent(percent)
     now = float(now)
@@ -178,6 +288,9 @@ def tune_advice(
             False,
             hold,
         )
+    if memory is None:
+        memory = {}
+    _remember_paces(samples, memory)
     stint = _stint(samples, percent)
     pace = _pace([sample for sample in stint if sample.ok])
     if auto and _hold_open(hold, pace, call_count, now) and hold is not None and percent > hold.above:
@@ -213,19 +326,32 @@ def tune_advice(
             hold,
         )
     pace = _pace(ok)
-    previous = _lower_pace(samples, percent)
-    if previous is not None and pace is not None and pace < previous[1] * SLOW_RATIO:
-        lower = clamp_boost_percent(percent - PERCENT_STEP)
-        text = f"This batch is slower than {previous[0]}%. Trying a smaller one."
-        if not auto or lower == percent:
-            text = f"This batch is slower than {previous[0]}%. A smaller size is faster."
-            return TuneAdvice(text, percent, False, hold)
-        return TuneAdvice(
-            text,
-            lower,
-            True,
-            _step_down_hold(call_count, now, lower, previous[1], failed=False),
-        )
+    if pace is not None:
+        slowed = _decline_target(memory, samples, percent, pace)
+        if slowed is not None:
+            baseline, baseline_pace = slowed
+            lower = clamp_boost_percent(percent - PERCENT_STEP)
+            if not auto or lower == percent:
+                text = f"This batch is slower than {baseline}%. A smaller size is faster."
+                return TuneAdvice(text, percent, False, hold)
+            return TuneAdvice(
+                f"This batch is slower than {baseline}%. Trying a smaller one.",
+                lower,
+                True,
+                _step_down_hold(call_count, now, lower, baseline_pace, failed=False),
+            )
+        # One remeasure when the old smaller sizes are from a faster kind of
+        # page. A same-work size already above this one means that remeasure
+        # happened, so a change of page cannot walk the slider down.
+        if auto and _parent_pace(memory, percent, pace) is None and _work_slowed(memory, percent, pace):
+            lower = clamp_boost_percent(percent - PERCENT_STEP)
+            if lower != percent:
+                return TuneAdvice(
+                    "The pace of the work changed. Trying a smaller batch.",
+                    lower,
+                    True,
+                    _step_down_hold(call_count, now, lower, pace, failed=False),
+                )
     if gpu_free_mib is not None and gpu_free_mib < GPU_HEADROOM_MIB:
         return TuneAdvice(
             "Card memory is nearly full. A larger batch may be refused.",

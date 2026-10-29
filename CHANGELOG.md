@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## 1.1.3
+
+### Moderate
+
+- **Auto** remembers the pace of the size just below the current one, from finished embed calls. A long stay at one size no longer forgets that neighbor. It steps down when the current calls are clearly slower than that neighbor. A fast sample from earlier in the climb does not pull the slider down. A step that is not faster does not keep going. A small slowdown is still left alone. 150% remains only the top of the slider.
 
 ## 1.1.2
 

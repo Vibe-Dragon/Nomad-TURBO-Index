@@ -143,3 +143,88 @@ class TuneAdviceTest(unittest.TestCase):
         self.assertEqual(len(session.embed_calls()), 48)
         self.assertEqual(session.embed_calls()[-1][0], 55)
         self.assertEqual(session.embed_call_count(), 60)
+
+    def test_a_forgotten_smaller_size_still_pulls_a_slow_batch_down(self):
+        memory: dict[int, float] = {}
+        _advice(_calls(135, 3, 1.0), 135, memory=memory)
+        self.assertAlmostEqual(memory[135], 10.0)
+        advice = _advice(_calls(150, 3, 1.4), 150, memory=memory)
+        self.assertTrue(advice.move)
+        self.assertEqual(advice.percent, 145)
+        self.assertIn("135%", advice.text)
+        self.assertNotIn(135, [sample.percent for sample in _calls(150, 3, 1.4)])
+
+    def test_a_fast_early_size_does_not_veto_the_size_just_below(self):
+        advice = _advice(_calls(95, 3, 10 / 8.0), 95, memory={65: 10.0, 90: 8.5})
+        self.assertGreaterEqual(advice.percent, 95)
+        self.assertNotIn("smaller", advice.text)
+        self.assertNotIn("65%", advice.text)
+
+    def test_a_large_drop_against_the_size_just_measured_steps_down(self):
+        memory: dict[int, float] = {}
+        samples = _calls(145, 3, 1.0) + _calls(150, 3, 2.5)
+        advice = _advice(samples, 150, memory=memory)
+        self.assertEqual(advice.percent, 145)
+        self.assertIn("145%", advice.text)
+        self.assertNotIn("pace of the work", advice.text)
+        self.assertIsNotNone(advice.hold)
+        self.assertAlmostEqual(advice.hold.pace, 10.0)
+        back = _advice(
+            _calls(145, 3, 1.0),
+            145,
+            memory=memory,
+            hold=advice.hold,
+            call_count=3,
+            now=0,
+        )
+        self.assertFalse(back.move)
+        self.assertEqual(back.percent, 145)
+
+    def test_a_small_gap_against_a_remembered_size_stays_put(self):
+        advice = _advice(_calls(150, 3, 1.1), 150, memory={135: 10.0})
+        self.assertEqual(advice.percent, 150)
+        self.assertIn("slider goes no higher", advice.text)
+
+    def test_a_step_that_is_not_faster_does_not_keep_going(self):
+        memory = {135: 10.0}
+        first = _advice(_calls(150, 3, 10 / 7.0), 150, memory=memory)
+        self.assertEqual(first.percent, 145)
+        second = _advice(
+            _calls(145, 3, 10 / 7.0),
+            145,
+            memory=memory,
+            hold=first.hold,
+            call_count=3,
+            now=0,
+        )
+        self.assertFalse(second.move)
+        self.assertEqual(second.percent, 145)
+
+    def test_a_faster_step_keeps_going_when_the_neighbor_is_still_clearly_faster(self):
+        advice = _advice(_calls(145, 3, 10 / 7.5), 145, memory={135: 10.0, 150: 6.0})
+        self.assertTrue(advice.move)
+        self.assertEqual(advice.percent, 140)
+        self.assertIn("135%", advice.text)
+
+    def test_a_different_pace_of_work_does_not_walk_the_slider_down(self):
+        memory = {100: 40.0}
+        advice = _advice(_calls(150, 3, 1.0), 150, memory=memory, call_count=10)
+        self.assertEqual(advice.percent, 145)
+        self.assertIn("pace of the work", advice.text)
+        self.assertIsNotNone(advice.hold)
+        held = _advice(
+            _calls(145, 3, 1.0),
+            145,
+            memory=memory,
+            hold=advice.hold,
+            call_count=3,
+            now=0,
+        )
+        self.assertFalse(held.move)
+        self.assertEqual(held.percent, 145)
+
+    def test_manual_reports_a_remembered_faster_size_without_moving(self):
+        advice = _advice(_calls(150, 3, 1.4), 150, auto=False, memory={135: 10.0})
+        self.assertFalse(advice.move)
+        self.assertEqual(advice.percent, 150)
+        self.assertIn("smaller size is faster", advice.text)

@@ -223,6 +223,7 @@ class _Window:
         self._optimize_live = None
         self._optimize_code = None
         self._tune_hold = None
+        self._pace_memory: dict[int, float] = {}
         self._tune_applying = False
         self._tune_logged = ""
         self.repair_stop = threading.Event()
@@ -1850,6 +1851,7 @@ class _Window:
             hold=self._tune_hold,
             call_count=self.session.embed_call_count(),
             now=time.monotonic(),
+            memory=self._pace_memory,
         )
         self._tune_hold = advice.hold
         self._show(self.tune_label, advice.text)

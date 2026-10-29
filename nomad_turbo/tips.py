@@ -56,7 +56,8 @@ TIPS: dict[str, str] = {
     ),
     "tune_auto": (
         "Raise the batch while full embed calls keep up, and step down when a larger call "
-        "is clearly slower or the embed server struggles. A small slowdown is left alone. "
+        "is clearly slower than the nearest smaller size still remembered, or the embed server struggles. "
+        "A long stay at one setting does not forget those sizes. A small slowdown is left alone. "
         "Auto tries one step higher again after a short wait, and sooner when the pace of the work changes a lot. "
         "150% is only the top of the slider. "
         "One embed server stays up. A call already running is left alone."
