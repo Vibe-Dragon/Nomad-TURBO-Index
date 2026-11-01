@@ -2,6 +2,8 @@
 
 Nomad TURBO Index speeds up a stock [Project NOMAD](https://github.com/Crosstalk-Solutions/project-nomad) knowledge base from outside the admin container. It detects the machine it is on and sizes one embed call from that hardware. This copy was tested with Project NOMAD 1.35.1.
 
+![Nomad TURBO Index](docs/screenshot.png)
+
 ## How Turbo indexing differs from stock NOMAD
 
 - Turbo runs outside the admin container and does not patch it.
