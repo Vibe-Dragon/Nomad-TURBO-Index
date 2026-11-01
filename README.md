@@ -348,7 +348,7 @@ Short pages leave the graphics card waiting between calls. The embed server then
 
 Qdrant builds a new segment when the one it is writing fills. That build is CPU work: the payload indexes, then the search graph. Turbo waits until each batch is stored, so the embed server sits idle and GPU use falls until the build finishes. The collection can show yellow while those new points are not in the search graph yet. Closing a browser does not stop the build. Leave Qdrant running. A restart replays the unfinished write and can use more memory than the build did.
 
-If a plain segment grows past 4 GiB of vectors, or free space is under twice the segment that would be copied, indexing pauses before the next upsert. Points already stored stay. The optimization bar on the Index page is that pause. Making this rewrite faster is the next major milestone, **Speed up segment optimization**. This version does not change how Qdrant builds the graph.
+If a plain segment grows past 4 GiB of vectors, or free space is under twice the segment that would be copied, indexing pauses before the next upsert. Points already stored stay. The optimization bar on the Index page is that pause. Making this rewrite faster is **Speed up segment optimization**. That work is on the back burner. It has not been a large bottleneck. This version does not change how Qdrant builds the graph.
 
 ### CPU stays high after the Knowledge Base page is closed, and the article count stops
 
@@ -468,9 +468,13 @@ HTTP 400 is one input the embedder refused, not a dead server. The log says `spl
 
 `the embed server is not running` means a call was ready and the server process was already gone.
 
-## Next major milestone
+## Next large efforts
 
-**Speed up segment optimization.** After the write hold, the slow part is Qdrant building the search graph for a segment that is already large. The graph stays in memory, the indexed-point count stays flat until the segment is committed, and Qdrant does not publish a percent. This version shows that wait and refuses an unsafe rewrite. It does not make the build itself faster. That is the next major goal, and it is the open milestone on the [Nomad TURBO Index repository](https://github.com/Vibe-Dragon/Nomad-TURBO-Index).
+**Optimize OCR** is next. A PDF or a picture is still read the way it is now. Every page keeps its text layer, the page image is still read, and words the text layer does not have are still added. The row still says OCR, the bar still shows the page, and the file is still not handed to NOMAD. The read should take less time. That is the open milestone [Optimize OCR](https://github.com/Vibe-Dragon/Nomad-TURBO-Index/milestone/2).
+
+A web UI comes after that. It should look and work the same as the desktop window. A Project NOMAD install should be able to add it, as a Docker container or the same kind of extra service, so it can run on a headless server. The desktop window stays. Installing it does not start indexing. That is the open milestone [Headless web UI](https://github.com/Vibe-Dragon/Nomad-TURBO-Index/milestone/3).
+
+**Speed up segment optimization** stays open and is on the back burner. The rewrite has not been a large bottleneck. After the write hold, Qdrant still builds the search graph for a large segment in memory, the indexed-point count stays flat until the segment is committed, and Qdrant does not publish a percent. This version shows that wait and refuses an unsafe rewrite. It does not make the build itself faster. That milestone is [Speed up segment optimization](https://github.com/Vibe-Dragon/Nomad-TURBO-Index/milestone/1).
 
 ## Stock contract
 
