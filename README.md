@@ -277,6 +277,8 @@ Yes. This project is under the MIT License. The terms are in the `LICENSE` file.
 
 The `.deb` is the one-file installer for Debian, Ubuntu, and Linux Mint. Open it from the file manager and install it. That does not start indexing and does not delete anything already stored.
 
+The current package is the `nomad-turbo_*_all.deb` file at the top of this repository. Older packages are in `old-versions/`.
+
 The package depends on Python 3 and GTK. It does not depend on a specific NVIDIA driver or a specific graphics card. After install, the menu entry **Nomad TURBO Index** runs `/usr/bin/nomad-turbo`. Docker has to be usable by your user, and NOMAD has to be running. Turbo finds that install when it starts.
 
 To build the package from this tree:
