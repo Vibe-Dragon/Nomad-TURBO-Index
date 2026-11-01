@@ -43,6 +43,8 @@ class Install:
     keep_control: bool = False
     # Hide indexed rows in the file list. Off shows them at the bottom.
     hide_finished: bool = False
+    # Which unfinished file comes next. The list itself stays a folder tree.
+    index_order: str = "library"
     # Auto moves the embed chunk count from finished calls. Off until the user turns it on.
     tune_auto: bool = False
     per_slot_mib: int = 1024
@@ -248,6 +250,7 @@ def load_install() -> Install:
         "reserve_ratio",
         "keep_control",
         "hide_finished",
+        "index_order",
         "tune_auto",
         "log_open",
         "log_follow",

@@ -16,10 +16,18 @@ TIPS: dict[str, str] = {
         "Qdrant is not ready for changes yet. This stays off until the collection answers."
     ),
     "col_file": (
-        "Blue names are ZIM files. Amber names are uploads. Hover a row for its full path. "
-        "A red asterisk to the left of the name means that file is prioritized."
+        "Blue names are ZIM files. Amber names are uploads. "
+        "kb_uploads and zim are folders: click the arrow to open or close one. "
+        "A closed folder does not list its files until it is opened. "
+        "The file being indexed stays in the row above the list. "
+        "Hover a row for its full path. "
+        "A red asterisk to the left of the name means that file is prioritized. "
+        "A green triangle on a folder-tree row means that file is the one indexing."
     ),
-    "col_type": "The file type: zim, pdf, docx, epub, txt, md, rtf, or an image extension such as jpg or png.",
+    "col_type": (
+        "The file type: zim, pdf, docx, epub, txt, md, rtf, or an image extension such as jpg or png. "
+        "A folder row says folder."
+    ),
     "col_status": "Waiting, indexing, OCR, indexed, partial, failed, or needs NOMAD.",
     "col_progress": "How far this file is through its articles.",
     "col_articles": "Articles stored so far, and the total when it is known.",
@@ -32,11 +40,16 @@ TIPS: dict[str, str] = {
         "After Measure, a file with a known article count keeps the ETA from its sample."
     ),
     "order": (
-        "The order unfinished files are indexed in, and the order of this list. "
-        "The file already in progress stays at the top and keeps going. "
-        "Prioritized files come next, in this same order. Finished files stay at the bottom."
+        "The order unfinished files are indexed in. "
+        "The file already in progress keeps going. "
+        "Prioritized files come next, in this same order. "
+        "The list is the kb_uploads and zim folders, not this order. "
+        "The choice is remembered after Turbo is closed."
     ),
-    "hide_finished": "Hide files that are already indexed. While this is off, those files stay at the bottom of the list.",
+    "hide_finished": (
+        "Hide files that are already indexed. "
+        "A folder that only holds those files is hidden too."
+    ),
     "measure": (
         "Index each unfinished file for about five minutes, priority files first, "
         "then go on to the next. Reading a PDF or picture with OCR happens first and "
@@ -44,7 +57,18 @@ TIPS: dict[str, str] = {
         "Each sample starts at the recommended batch when Auto is on, "
         "or stays on the batch you set when Auto is off. "
         "The ETAs update from those samples. "
-        "If a run is already going, indexing resumes afterward. Stop ends the pass."
+        "If a run is already going, indexing resumes afterward. "
+        "Started while idle, this stops when the samples are done. "
+        "Then index, while a measurement is already going, keeps indexing after those samples. "
+        "Stop ends the pass."
+    ),
+    "then_index": (
+        "While a measurement is already going, keep indexing after the samples. "
+        "This does nothing until Measure has started. "
+        "It does not start a measurement and it does not restart the one that is running. "
+        "The sample clock and the files already sampled stay as they are. "
+        "Measure by itself still stops when it was started while nothing was running. "
+        "Stop ends the pass."
     ),
     "index_now": (
         "Finish the embed call already running, save that file, and index this one next. "
@@ -60,15 +84,6 @@ TIPS: dict[str, str] = {
         "Saved facts for this file: size, location, dates, article and chunk counts, "
         "slowest and fastest speeds, the last measured ETA, and whether it is prioritized. "
         "These stay after Turbo is closed. A file that leaves the library is forgotten."
-    ),
-    "file_now": (
-        "The file being indexed right now. "
-        "While a PDF or picture is being read, this line names that file."
-    ),
-    "file_bar": (
-        "Progress of the file being indexed. While OCR is reading a PDF or picture, "
-        "the bar shows the page it is on. "
-        "The library bar beside it is the whole library, weighed by file size."
     ),
     "library_bar": "Share of the library finished, by file size, and the ETA for what is left.",
     "index_optimize": (
@@ -107,10 +122,9 @@ TIPS: dict[str, str] = {
         "One embed server stays up. A call already running is left alone."
     ),
     "usage": (
-        "The chunk count this setting will send on the next embed call, "
-        "and whether the one embed server is running."
+        "How many embed servers are running. Turbo keeps one. "
+        "The chunk count for the next call is in the field beside Recommended."
     ),
-    "card": "Video memory in use on the card. Turbo's embed server is part of this number.",
     "keep": (
         "Off: when the queue is empty, Turbo stops and the ingest policy returns "
         "to the value found at Start. When the run started on Manual, stock NOMAD "
@@ -126,7 +140,7 @@ TIPS: dict[str, str] = {
     "rescan": "Read the library again and refresh this list. This does not pause NOMAD or start indexing.",
     "export": (
         "Save the current session log, or the previous session if one is saved. "
-        "The file includes lines the checkboxes are hiding. Older sessions are not kept."
+        "The file includes lines the log buttons are hiding. Older sessions are not kept."
     ),
     "log_help": (
         "Open a window that explains the log lines Turbo writes on purpose. "
@@ -137,16 +151,17 @@ TIPS: dict[str, str] = {
         "Indexing does not start. ZIM files and uploads stay on disk."
     ),
     "errors": (
-        "Warnings and errors. Unchecking this only hides them in the pane. The log file still records them."
+        "Warnings and errors. Turning this off only hides them in the pane. The log file still records them."
     ),
-    "info": "Ordinary progress lines. Unchecking this only hides them in the pane.",
+    "info": "Ordinary progress lines. Turning this off only hides them in the pane.",
     "debug": (
         "Detail lines, including one line per article. "
-        "The pane starts with these hidden. Checking Debug shows them here. "
+        "The pane starts with these hidden. Turning Debug on shows them here. "
         "The log file still records them either way."
     ),
     "follow": (
-        "On jumps to the newest line and stays there. Scroll up to hold your place. "
+        "On jumps to the newest line and stays there, including when several lines arrive together. "
+        "Scroll away to hold your place. That place stays until you return to the end or turn this on again. "
         "Off keeps the page where it is while new lines arrive."
     ),
     "log": (
@@ -160,15 +175,18 @@ TIPS: dict[str, str] = {
     "nomad_repo": "Open the Project NOMAD repository.",
     "version": "This copy of Nomad TURBO Index. About names the Project NOMAD version it was tested with.",
     "host": (
-        "Show or hide the host meters beside the pages. The vertical bar sets the width of that pane. "
+        "Show or hide the host system graphs beside the pages. "
+        "The vertical bar sets the width of that pane. "
         "Whether it is open, and that width, are remembered."
     ),
     "host_disk": (
-        "Used space and size of each disk the library uses, and how fast that disk is reading and writing. "
-        "A folder on its own disk, such as Qdrant, is a separate line."
+        "Read and write for each disk indexing uses, and for the disk that holds the knowledge base. "
+        "The blue line is read. The red line is write. "
+        "A folder on its own disk is its own graph."
     ),
     "legend": (
         "Blue names are ZIM files. Amber names are files you uploaded. "
+        "kb_uploads and zim open and close. The file being indexed stays above that tree. "
         "Drag a column edge to resize it. The bar above the log changes the list height. "
         "The controls stay under the list."
     ),

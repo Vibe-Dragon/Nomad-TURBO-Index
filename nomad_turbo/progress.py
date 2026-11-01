@@ -10,7 +10,7 @@ from collections import deque
 from dataclasses import dataclass
 
 from nomad_turbo.catalog import CatalogRow, origin_for, row_color, status_word
-from nomad_turbo.schedule import file_eta_view, file_type_label, pace_text, sum_known_etas
+from nomad_turbo.schedule import file_eta_view, file_type_label, pace_text
 
 
 def format_eta(seconds: float | None) -> str:
@@ -214,16 +214,45 @@ def log_line_visible(
     return show_debug
 
 
-def log_should_stick(follow: bool, value: float, page_size: float, upper: float) -> bool:
-    """Keep the newest line in view only when Follow is on and the reader is already there.
+def log_should_stick(
+    follow: bool,
+    value: float,
+    page_size: float,
+    upper: float,
+    *,
+    away: bool = False,
+) -> bool:
+    """Keep the newest line in view when Follow is on and the reader has not left.
 
-    Scrolling up holds the place. A view that is not on screen yet still follows.
+    Being behind the end because new lines arrived is still following. ``away``
+    is set only when the user scrolled off the end. Follow off does not jump.
+    A view that is not on screen yet still follows. The position arguments are
+    accepted so callers can pass the adjustment; they do not decide this.
     """
-    if not follow:
+    del value, page_size, upper
+    if not follow or away:
         return False
-    if page_size <= 0 or upper <= page_size:
-        return True
-    return value + page_size >= upper - 24
+    return True
+
+
+def host_bar_position(pane_width: int, requested: int, *, main_min: int) -> int:
+    """Main-side width of the vertical host bar.
+
+    The bar will not move left of ``main_min``. When the pane is narrower than
+    that floor, the main side keeps the pane and the host side shrinks to
+    nothing. ``requested`` is the main-side width a drag or a saved split asked
+    for. This does not change the window's size request.
+    """
+    width = max(0, int(pane_width))
+    floor = max(0, int(main_min))
+    if floor > width:
+        floor = width
+    position = int(requested)
+    if position < floor:
+        position = floor
+    if position > width:
+        position = width
+    return position
 
 
 def follow_target(active: int | None, count: int, lookahead: int = 3) -> int | None:
@@ -284,6 +313,13 @@ def format_file_rate(articles_per_second: float | None, chunks_per_second: float
     if chunks_per_second:
         parts.append(f"{chunks_per_second:,.0f} chk/s")
     return " · ".join(parts) if parts else "—"
+
+
+def embed_server_text(running: int) -> str:
+    """How many embed servers are up. The chunk count stays in the batch field."""
+    count = max(0, int(running))
+    noun = "embed server" if count == 1 else "embed servers"
+    return f"{count} {noun}"
 
 
 def usage_text(*, chunks: int, server_up: bool, slots_ignored: bool = False, set_percent: int | None = None) -> str:
@@ -372,6 +408,20 @@ class BoardSnap:
     bad: int = 0
     chunks_per_second: float | None = None
     chunks_stored: int = 0
+    structure_epoch: int = 0
+
+
+class LibraryItem:
+    """A file as the folder tree needs it. Progress fields stay on the book."""
+
+    __slots__ = ("source", "name", "origin", "state", "size_bytes")
+
+    def __init__(self, source: str, name: str, origin: str, state: str, size_bytes: int) -> None:
+        self.source = source
+        self.name = name
+        self.origin = origin
+        self.state = state
+        self.size_bytes = size_bytes
 
 
 class _Row:
@@ -405,6 +455,74 @@ class ProgressBook:
         self.skipped = 0
         self.bad = 0
         self._stats = None
+        self._structure_epoch = 0
+        self._running = None
+        self._reset_totals()
+        for source in self._order:
+            self._install_contrib(self._rows[source])
+        self._running = self._find_running()
+
+    @property
+    def structure_epoch(self) -> int:
+        """Bumps when a file is added, removed, or changes state. Not on article ticks."""
+        return self._structure_epoch
+
+    def _reset_totals(self) -> None:
+        self._chunks_stored = 0
+        self._done_files = 0
+        self._included_size = 0
+        self._done_bytes = 0.0
+        self._unknown = 0
+        self._eta_pending = 0
+        self._eta_missing = 0
+        self._eta_sum = 0
+
+    def _contrib_of(self, row: _Row) -> tuple:
+        """What one file adds to the library bar. The caller holds the book lock."""
+        chunks = int(row.chunks or 0)
+        done_files = 1 if row.state == "indexed" else 0
+        if row.state == "deferred":
+            return (chunks, done_files, 0, 0.0, 0, 0, 0, 0)
+        weight = max(int(row.size_bytes), 1)
+        done_bytes = weight * _fraction(row.state, row.articles, row.total)
+        unknown = 1 if row.state != "indexed" and not row.total else 0
+        if row.state == "indexed":
+            return (chunks, done_files, weight, done_bytes, unknown, 0, 0, 0)
+        eta = _eta_seconds(row)
+        if eta is None:
+            return (chunks, done_files, weight, done_bytes, unknown, 1, 1, 0)
+        return (chunks, done_files, weight, done_bytes, unknown, 1, 0, int(eta))
+
+    def _apply_parts(self, parts: tuple, sign: int) -> None:
+        self._chunks_stored += sign * parts[0]
+        self._done_files += sign * parts[1]
+        self._included_size += sign * parts[2]
+        self._done_bytes += sign * parts[3]
+        self._unknown += sign * parts[4]
+        self._eta_pending += sign * parts[5]
+        self._eta_missing += sign * parts[6]
+        self._eta_sum += sign * parts[7]
+
+    def _clear_contrib(self, row: _Row) -> None:
+        old = getattr(row, "_contrib", None)
+        if old is None:
+            return
+        self._apply_parts(old, -1)
+        row._contrib = None
+
+    def _install_contrib(self, row: _Row) -> None:
+        """Replace this file's share of the bar. The caller holds the book lock."""
+        self._clear_contrib(row)
+        parts = self._contrib_of(row)
+        row._contrib = parts
+        self._apply_parts(parts, 1)
+
+    def _find_running(self) -> _Row | None:
+        for source in self._order:
+            row = self._rows[source]
+            if row.state == "running":
+                return row
+        return None
 
     def note_article(self, kind: str) -> None:
         """Count one page that was not stored. A bad page is also skipped."""
@@ -428,7 +546,8 @@ class ProgressBook:
         moment = time.monotonic() if now is None else now
         with self._lock:
             row = self._rows.get(source)
-            if row is None:
+            created = row is None
+            if created:
                 row = _Row(
                     CatalogRow(
                         source=source,
@@ -441,6 +560,7 @@ class ProgressBook:
                 )
                 self._rows[source] = row
                 self._order.append(source)
+            previous_state = row.state
             previous = row.articles
             incoming = max(0, int(articles or 0))
             self._advanced += max(0, incoming - previous)
@@ -459,7 +579,12 @@ class ProgressBook:
                     row.total = max(row.articles, 1)
                 row.articles = max(row.articles, row.total or row.articles)
             row.rate.push(moment, row.articles)
-            self._bytes.push(moment, self._done_bytes_unlocked())
+            self._install_contrib(row)
+            self._bytes.push(moment, self._done_bytes)
+            if created or previous_state != row.state:
+                self._structure_epoch += 1
+                if created or previous_state == "running" or row.state == "running":
+                    self._running = self._find_running()
             remembered = self._progress_fact(row)
         if remembered is not None:
             self._write_progress(remembered)
@@ -488,18 +613,30 @@ class ProgressBook:
                     )
                 )
                 self._order.append(source)
+                self._install_contrib(self._rows[source])
+                self._structure_epoch += 1
                 return True
             if size_bytes and row.size_bytes <= 1:
-                row.size_bytes = int(size_bytes)
+                new_size = int(size_bytes)
+                if new_size != row.size_bytes:
+                    row.size_bytes = new_size
+                    self._install_contrib(row)
+                    self._structure_epoch += 1
             return False
 
     def drop(self, source: str) -> None:
         stats = None
         with self._lock:
-            if source not in self._rows:
+            row = self._rows.get(source)
+            if row is None:
                 return
+            was_running = self._running is row
+            self._clear_contrib(row)
             del self._rows[source]
             self._order = [item for item in self._order if item != source]
+            if was_running:
+                self._running = self._find_running()
+            self._structure_epoch += 1
             stats = self._stats
         if stats is not None and stats.forget(source):
             stats.save()
@@ -507,6 +644,14 @@ class ProgressBook:
     def listed(self) -> list[tuple[str, str]]:
         with self._lock:
             return [(source, self._rows[source].state) for source in self._order]
+
+    def state_of(self, source: str) -> str | None:
+        """One file's state. None when the library does not list it."""
+        with self._lock:
+            row = self._rows.get(source)
+            if row is None:
+                return None
+            return row.state
 
     def mark_all_unindexed(self) -> None:
         with self._lock:
@@ -525,6 +670,13 @@ class ProgressBook:
             self._chunk_rate = RateTracker()
             self.skipped = 0
             self.bad = 0
+            self._running = None
+            self._reset_totals()
+            for row in self._rows.values():
+                row._contrib = None
+            for source in self._order:
+                self._install_contrib(self._rows[source])
+            self._structure_epoch += 1
 
     def attach_stats(self, stats) -> None:
         with self._lock:
@@ -542,10 +694,15 @@ class ProgressBook:
                     saved_rates[source] = float(saved.measured_article_rate)
         with self._lock:
             self._stats = stats
+            changed = False
             for source, rate in saved_rates.items():
                 row = self._rows.get(source)
-                if row is not None:
+                if row is not None and row.measured_rate != rate:
                     row.measured_rate = rate
+                    self._install_contrib(row)
+                    changed = True
+            if changed:
+                self._structure_epoch += 1
 
     def keep_measured_rate(self, source: str) -> None:
         """Remember this file's article pace after Measure leaves it."""
@@ -554,8 +711,13 @@ class ProgressBook:
             if row is None:
                 return
             rate = row.rate.per_second()
-            if rate:
+            if rate and row.measured_rate != rate:
                 row.measured_rate = rate
+                self._structure_epoch += 1
+            elif rate:
+                row.measured_rate = rate
+            if rate:
+                self._install_contrib(row)
             eta_seconds = None
             if rate:
                 _text, eta_seconds = file_eta_view(
@@ -606,111 +768,157 @@ class ProgressBook:
         stats.note_rates(source, art_rate, chk_rate, measured=measured, eta_seconds=eta_seconds if measured else None)
 
     def snapshot(self, now: float | None = None) -> BoardSnap:
+        """Every file. The ordering pass uses this. The window tick uses pulse."""
         moment = time.monotonic() if now is None else now
         with self._lock:
-            files: list[FileSnap] = []
-            done_files = 0
-            included_size = 0
-            done_bytes = 0.0
-            unknown = 0
+            return self._compose_unlocked(moment, full=True)
+
+    def pulse(self, now: float | None = None) -> BoardSnap:
+        """The bars and the file that is indexing. Totals stay on the book."""
+        moment = time.monotonic() if now is None else now
+        with self._lock:
+            return self._compose_unlocked(moment, full=False)
+
+    def file_snap(self, source: str, now: float | None = None) -> FileSnap | None:
+        """One file, for the details window. None when the library does not list it."""
+        moment = time.monotonic() if now is None else now
+        with self._lock:
+            row = self._rows.get(source)
+            if row is None:
+                return None
+            return _file_snap(row, moment)
+
+    def files_for(self, sources, now: float | None = None) -> dict[str, FileSnap]:
+        """Snaps for the files a folder is showing. Missing sources are left out."""
+        moment = time.monotonic() if now is None else now
+        with self._lock:
+            found = {}
+            for source in sources:
+                row = self._rows.get(source)
+                if row is not None:
+                    found[source] = _file_snap(row, moment)
+            return found
+
+    def library_items(self) -> tuple[int, list[LibraryItem]]:
+        """Folder-tree rows and the epoch they belong to. Progress text stays out."""
+        with self._lock:
+            items = []
             for source in self._order:
                 row = self._rows[source]
-                fraction = _fraction(row.state, row.articles, row.total)
-                if row.state == "indexed":
-                    done_files += 1
-                if row.state != "deferred":
-                    weight = max(row.size_bytes, 1)
-                    included_size += weight
-                    done_bytes += weight * fraction
-                    if row.state != "indexed" and not row.total:
-                        unknown += 1
-                art_rate = row.rate.per_second()
-                chk_rate = row.chunk_rate.per_second()
-                running = row.state == "running"
-                if row.state == "indexed":
-                    count = "indexed"
-                elif row.total:
-                    count = f"{row.articles:,} / {row.total:,}"
-                elif row.articles:
-                    count = f"{row.articles:,}"
-                else:
-                    count = "—"
-                eta, eta_seconds = file_eta_view(
-                    state=row.state,
-                    articles=row.articles,
-                    total=row.total,
-                    live_rate=art_rate if running else None,
-                    measured_rate=row.measured_rate,
-                )
-                art_minute = (art_rate * 60) if running and art_rate else None
-                chk_live = chk_rate if running and chk_rate else None
-                files.append(
-                    FileSnap(
-                        source=row.source,
-                        name=row.name,
-                        origin=row.origin,
-                        status=status_word(row.state),
-                        percent=int(round(fraction * 100)),
-                        count=count,
-                        eta=eta,
-                        color=row_color(row.origin, row.state),
-                        state=row.state,
-                        chunks=row.chunks,
-                        chunks_text=f"{row.chunks:,}" if row.chunks else "—",
-                        size_bytes=row.size_bytes,
-                        size_text=format_bytes(row.size_bytes),
-                        articles=row.articles,
-                        articles_per_minute=art_minute,
-                        chunks_per_second=chk_live,
-                        rate_text=format_file_rate(art_rate if running else None, chk_rate if running else None),
-                        eta_seconds=eta_seconds,
-                        file_type=file_type_label(row.name),
-                        art_text=pace_text(running, art_minute),
-                        chk_text=pace_text(running, chk_live),
-                        total_articles=row.total,
-                        mtime=row.mtime,
-                        walk_index=row.walk_index,
-                    )
-                )
-            overall = (done_bytes / included_size) if included_size else 0.0
-            rate = self._bytes.per_second()
-            remaining_bytes = max(0.0, included_size - done_bytes)
-            summed = sum_known_etas([(item.state, item.eta_seconds) for item in files])
-            if overall >= 0.999 and unknown == 0:
-                text = "100% · nothing left to index"
-                eta_seconds = 0
-            elif summed is not None:
-                eta_seconds = summed
-                text = f"{overall:.0%} of library size · about {format_eta(summed)}"
-            elif not rate or remaining_bytes <= 0:
-                eta_seconds = None
-                text = f"{overall:.0%} of library size · ETA measuring"
-            else:
-                eta_seconds = remaining_bytes / rate
-                text = f"{overall:.0%} of library size · about {format_eta(eta_seconds)}"
-            if unknown and overall < 0.999:
-                text += f" · {unknown} files not measured yet"
-            return BoardSnap(
-                files,
-                overall,
-                text,
-                done_files,
-                len(self._order),
-                self._article_rate.per_second(),
-                self.skipped,
-                self.bad,
-                self._chunk_rate.per_second(),
-                sum(item.chunks for item in self._rows.values()),
-            )
+                items.append(LibraryItem(source, row.name, row.origin, row.state, int(row.size_bytes)))
+            return self._structure_epoch, items
 
-    def _done_bytes_unlocked(self) -> float:
-        total = 0.0
-        for row in self._rows.values():
-            if row.state == "deferred":
-                continue
-            weight = max(row.size_bytes, 1)
-            total += weight * _fraction(row.state, row.articles, row.total)
-        return total
+    def _compose_unlocked(self, moment: float, *, full: bool) -> BoardSnap:
+        """Caller holds the book lock. full copies every file. A pulse copies the running one.
+
+        Bar totals come from the running share of each file. An article tick updates
+        that one share, so the tick does not walk the library.
+        """
+        files: list[FileSnap] = []
+        if full:
+            for source in self._order:
+                files.append(_file_snap(self._rows[source], moment))
+        elif self._running is not None:
+            files.append(_file_snap(self._running, moment))
+        included = self._included_size
+        done_bytes = self._done_bytes
+        unknown = self._unknown
+        overall = (done_bytes / included) if included else 0.0
+        rate = self._bytes.per_second()
+        remaining_bytes = max(0.0, included - done_bytes)
+        if self._eta_missing:
+            summed = None
+        elif self._eta_pending == 0:
+            summed = 0
+        else:
+            summed = self._eta_sum
+        if overall >= 0.999 and unknown == 0:
+            text = "100% · nothing left to index"
+        elif summed is not None:
+            text = f"{overall:.0%} of library size · about {format_eta(summed)}"
+        elif not rate or remaining_bytes <= 0:
+            text = f"{overall:.0%} of library size · ETA measuring"
+        else:
+            text = f"{overall:.0%} of library size · about {format_eta(remaining_bytes / rate)}"
+        if unknown and overall < 0.999:
+            text += f" · {unknown} files not measured yet"
+        return BoardSnap(
+            files,
+            overall,
+            text,
+            self._done_files,
+            len(self._order),
+            self._article_rate.per_second(),
+            self.skipped,
+            self.bad,
+            self._chunk_rate.per_second(),
+            self._chunks_stored,
+            self._structure_epoch,
+        )
+
+
+def _eta_seconds(row: _Row) -> int | None:
+    """Seconds left for one file. Indexed files report 0 and the sum skips them."""
+    running = row.state == "running"
+    _text, seconds = file_eta_view(
+        state=row.state,
+        articles=row.articles,
+        total=row.total,
+        live_rate=row.rate.per_second() if running else None,
+        measured_rate=row.measured_rate,
+    )
+    return seconds
+
+
+def _file_snap(row: _Row, _moment: float) -> FileSnap:
+    """One list row. The caller holds the book lock."""
+    fraction = _fraction(row.state, row.articles, row.total)
+    art_rate = row.rate.per_second()
+    chk_rate = row.chunk_rate.per_second()
+    running = row.state == "running"
+    if row.state == "indexed":
+        count = "indexed"
+    elif row.total:
+        count = f"{row.articles:,} / {row.total:,}"
+    elif row.articles:
+        count = f"{row.articles:,}"
+    else:
+        count = "—"
+    eta, eta_seconds = file_eta_view(
+        state=row.state,
+        articles=row.articles,
+        total=row.total,
+        live_rate=art_rate if running else None,
+        measured_rate=row.measured_rate,
+    )
+    art_minute = (art_rate * 60) if running and art_rate else None
+    chk_live = chk_rate if running and chk_rate else None
+    return FileSnap(
+        source=row.source,
+        name=row.name,
+        origin=row.origin,
+        status=status_word(row.state),
+        percent=int(round(fraction * 100)),
+        count=count,
+        eta=eta,
+        color=row_color(row.origin, row.state),
+        state=row.state,
+        chunks=row.chunks,
+        chunks_text=f"{row.chunks:,}" if row.chunks else "—",
+        size_bytes=row.size_bytes,
+        size_text=format_bytes(row.size_bytes),
+        articles=row.articles,
+        articles_per_minute=art_minute,
+        chunks_per_second=chk_live,
+        rate_text=format_file_rate(art_rate if running else None, chk_rate if running else None),
+        eta_seconds=eta_seconds,
+        file_type=file_type_label(row.name),
+        art_text=pace_text(running, art_minute),
+        chk_text=pace_text(running, chk_live),
+        total_articles=row.total,
+        mtime=row.mtime,
+        walk_index=row.walk_index,
+    )
 
 
 def format_run_stats(phase: str, elapsed: int | None, snap: BoardSnap | None) -> str:

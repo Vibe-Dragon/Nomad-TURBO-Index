@@ -30,6 +30,7 @@ from nomad_turbo.progress import (
     follow_target,
     log_line_visible,
     log_lines_to_drop,
+    host_bar_position,
     log_should_stick,
     initial_log_split,
     fitted_list_position,
@@ -163,6 +164,82 @@ class ProgressTest(unittest.TestCase):
         self.assertEqual(later.files[1].eta, "20s")
         self.assertIn("about", later.overall_text)
         self.assertAlmostEqual(later.articles_per_second, 100.0)
+        pulse = book.pulse(now=10)
+        self.assertEqual(pulse.overall_text, later.overall_text)
+        self.assertAlmostEqual(pulse.overall_fraction, later.overall_fraction)
+        self.assertEqual(pulse.done_files, later.done_files)
+        self.assertEqual(pulse.chunks_stored, later.chunks_stored)
+        self.assertEqual([item.source for item in pulse.files], ["b.zim"])
+        self.assertEqual(pulse.files[0].eta, later.files[1].eta)
+
+    def test_pulse_skips_idle_files_until_the_library_changes(self):
+        book = ProgressBook(
+            [
+                CatalogRow("a.zim", "a.zim", "zim", "zim", 1000, "indexed", 10, 10, chunks=3),
+                CatalogRow("b.zim", "b.zim", "zim", "zim", 3000, "running", 1000, 4000, chunks=4),
+                CatalogRow("c.pdf", "c.pdf", "upload", "pdf", 50, "pending"),
+            ]
+        )
+        book.update("b.zim", articles=1000, total=4000, chunks=4, state="running", now=0)
+        book.update("b.zim", articles=2000, total=4000, chunks=8, state="running", now=10)
+        epoch = book.structure_epoch
+        book.update("b.zim", articles=2100, total=4000, chunks=9, state="running", now=12)
+        self.assertEqual(book.structure_epoch, epoch)
+        snap = book.snapshot(now=12)
+        pulse = book.pulse(now=12)
+        self.assertEqual(pulse.overall_text, snap.overall_text)
+        self.assertAlmostEqual(pulse.overall_fraction, snap.overall_fraction)
+        self.assertEqual(pulse.done_files, snap.done_files)
+        self.assertEqual(pulse.total_files, snap.total_files)
+        self.assertEqual(pulse.chunks_stored, snap.chunks_stored)
+        self.assertEqual(pulse.skipped, snap.skipped)
+        self.assertEqual([item.source for item in pulse.files], ["b.zim"])
+        self.assertEqual(pulse.files[0].count, snap.files[1].count)
+        self.assertEqual(pulse.files[0].eta, snap.files[1].eta)
+        empty = ProgressBook([])
+        self.assertEqual(empty.pulse(now=0).overall_text, empty.snapshot(now=0).overall_text)
+        self.assertEqual(empty.pulse(now=0).files, [])
+        book.update("b.zim", articles=4000, total=4000, chunks=10, state="indexed", now=20)
+        self.assertGreater(book.structure_epoch, epoch)
+        idle = book.pulse(now=20)
+        full = book.snapshot(now=20)
+        self.assertEqual(idle.files, [])
+        self.assertEqual(idle.overall_text, full.overall_text)
+        self.assertEqual(idle.done_files, full.done_files)
+        added = book.structure_epoch
+        self.assertTrue(
+            book.ensure_present(
+                "/app/storage/zim/new.zim",
+                name="new.zim",
+                origin="zim",
+                kind="zim",
+                size_bytes=20,
+            )
+        )
+        self.assertGreater(book.structure_epoch, added)
+
+    def test_bar_totals_follow_one_file_without_drifting_from_the_snapshot(self):
+        rows = [
+            CatalogRow(f"f{i}.md", f"f{i}.md", "upload", "text", 1000 + i, "pending")
+            for i in range(30)
+        ]
+        rows.append(CatalogRow("run.zim", "run.zim", "zim", "zim", 5000, "running", 10, 100, chunks=3))
+        rows.append(CatalogRow("skip.pdf", "skip.pdf", "upload", "pdf", 80, "deferred"))
+        book = ProgressBook(rows)
+        book.update("run.zim", articles=40, total=100, chunks=20, state="running", now=5)
+        book.update("f1.md", articles=1, total=1, chunks=2, state="indexed", now=6)
+        book.ensure_present("new.md", name="new.md", origin="upload", kind="text", size_bytes=80)
+        book.drop("f2.md")
+        pulse = book.pulse(now=6)
+        snap = book.snapshot(now=6)
+        self.assertEqual(pulse.overall_text, snap.overall_text)
+        self.assertEqual(pulse.done_files, snap.done_files)
+        self.assertEqual(pulse.chunks_stored, snap.chunks_stored)
+        self.assertAlmostEqual(pulse.overall_fraction, snap.overall_fraction)
+        self.assertEqual([item.source for item in pulse.files], ["run.zim"])
+        book.mark_all_unindexed()
+        self.assertEqual(book.pulse(now=7).overall_text, book.snapshot(now=7).overall_text)
+        self.assertEqual(book.pulse(now=7).files, [])
 
     def test_a_flat_library_rate_stays_on_measuring(self):
         book = ProgressBook(
@@ -300,6 +377,22 @@ class ProgressTest(unittest.TestCase):
         idle = usage_text(chunks=64, server_up=False, slots_ignored=True)
         self.assertIn("Embed server: idle.", idle)
         self.assertIn("slots setting is ignored", idle)
+        from nomad_turbo.engine import resume_log
+        from nomad_turbo.progress import embed_server_text
+
+        self.assertEqual(embed_server_text(0), "0 embed servers")
+        self.assertEqual(embed_server_text(1), "1 embed server")
+        self.assertEqual(embed_server_text(2), "2 embed servers")
+        fresh = resume_log("a.zim", 0, 0, set())
+        self.assertIn("from article 0", fresh)
+        self.assertIn("0 paths already stored", fresh)
+        continued = resume_log("a.zim", 24010, 43692, None)
+        self.assertIn("from article 24010", continued)
+        self.assertIn("43692 points already stored", continued)
+        self.assertIn("article paths not re-listed", continued)
+        self.assertNotIn("0 paths", continued)
+        self.assertIn("point count unavailable", resume_log("a.zim", 3, None, None))
+        self.assertIn("2 paths already stored", resume_log("a.zim", 4, 10, {"p", "q"}))
 
     def test_log_filters(self):
         self.assertTrue(log_line_visible(logging.INFO, True, False))
@@ -312,8 +405,18 @@ class ProgressTest(unittest.TestCase):
         self.assertFalse(log_line_visible(logging.WARNING, True, True, False))
         self.assertFalse(log_should_stick(False, 0, 100, 100))
         self.assertTrue(log_should_stick(True, 400, 100, 500))
-        self.assertFalse(log_should_stick(True, 100, 100, 500))
+        # Behind the end only because new lines arrived. That is still following.
+        self.assertTrue(log_should_stick(True, 100, 100, 500, away=False))
+        self.assertFalse(log_should_stick(True, 100, 100, 500, away=True))
+        self.assertFalse(log_should_stick(False, 400, 100, 500, away=False))
         self.assertTrue(log_should_stick(True, 0, 0, 0))
+        # The host bar will not leave the main area narrower than the squeeze limit.
+        self.assertEqual(host_bar_position(1000, 200, main_min=480), 480)
+        self.assertEqual(host_bar_position(1000, 480, main_min=480), 480)
+        self.assertEqual(host_bar_position(1000, 700, main_min=480), 700)
+        self.assertEqual(host_bar_position(1000, 1400, main_min=480), 1000)
+        self.assertEqual(host_bar_position(400, 10, main_min=480), 400)
+        self.assertEqual(host_bar_position(0, 10, main_min=50), 0)
         self.assertEqual(log_lines_to_drop(100), 0)
         self.assertEqual(log_lines_to_drop(4000), 0)
         self.assertEqual(log_lines_to_drop(4001), 1)
@@ -493,8 +596,11 @@ class ProgressTest(unittest.TestCase):
         self.assertNotIn("self.repair_pane", text)
         self.assertNotIn("pack2(self._portion(lower)", text)
         self.assertIn("min-height: 6px", text)
-        self.assertIn('gtk.CheckButton(label="Host")', text)
+        self.assertIn('gtk.ToggleButton(label="Host system graphs")', text)
+        self.assertNotIn("gtk.CheckButton", text)
+        self.assertNotIn("gtk.RadioButton", text)
         self.assertIn("self.install.host_open", text)
+        self.assertIn("self.install.index_order", text)
         self.assertIn("set_min_content_height(48)", text)
         self.assertNotIn("pack1(scrolled, True, False)", text)
         self.assertEqual(text.count("set_min_content_height(1)"), 2)
@@ -510,12 +616,31 @@ class ProgressTest(unittest.TestCase):
         )
         self.assertIn("https://github.com/Vibe-Dragon/Nomad-TURBO-Index", text)
         self.assertIn("Nomad TURBO Index", text)
-        self.assertIn("bars.pack_start(self.current_bar", text)
-        self.assertIn("bars.pack_start(self.overall", text)
+        self.assertIn("lower.pack_start(self.overall, False, False, 0)", text)
+        self.assertNotIn("self.current_bar", text)
+        self.assertNotIn("self.current_label", text)
         self.assertNotIn("bars.pack_start(self.scale", text)
-        self.assertLess(text.index("bars.pack_start(self.current_bar"), text.index("bars.pack_start(self.overall"))
-        self.assertLess(text.index("self.export_button"), text.index("buttons.pack_start(self.chunk_entry"))
-        self.assertLess(text.index("buttons.pack_start(self.chunk_entry"), text.index("buttons.pack_end(self.delete_button"))
+        self.assertLess(
+            text.index("self.rescan_button,"),
+            text.index("self.measure_button,"),
+        )
+        self.assertLess(
+            text.index("self.measure_button,"),
+            text.index("self.then_index_button)"),
+        )
+        self.assertLess(
+            text.index("self.then_index_button)"),
+            text.index("self.chunk_entry,"),
+        )
+        self.assertLess(
+            text.index("self.log_export_group.pack_start(self.export_button"),
+            text.index("self.log_export_group.pack_start(self.log_help_button"),
+        )
+        self.assertLess(
+            text.index("self.recommend_button,"),
+            text.index("self.server_label,"),
+        )
+        self.assertLess(text.index("self.chunk_entry,"), text.index("self.delete_pad"))
         self.assertIn("repair_bars.pack_start(self.repair_current_bar", text)
         self.assertIn("repair_bars.pack_start(self.repair_overall", text)
         self.assertIn('add_titled(page, "about", "About")', text)
@@ -594,13 +719,17 @@ def _source_layout_ok() -> str:
         "version import": "from nomad_turbo import __version__" in text,
         "no second version literal": f'"{__version__}"' not in text,
         "about builder": "about_facts()" in text and 'add_titled(page, "about", "About")' in text,
-        "shared index row": (
-            "bars.pack_start(self.current_bar" in text
-            and "bars.pack_start(self.overall" in text
+        "library bar full width": (
+            "lower.pack_start(self.overall, False, False, 0)" in text
+            and "self.current_bar" not in text
+            and "self.current_label" not in text
             and "bars.pack_start(self.scale" not in text
-            and text.index("bars.pack_start(self.current_bar") < text.index("bars.pack_start(self.overall")
-            and text.index("self.export_button") < text.index("buttons.pack_start(self.chunk_entry")
-            and text.index("buttons.pack_start(self.chunk_entry") < text.index("buttons.pack_end(self.delete_button")
+            and text.index("self.rescan_button,") < text.index("self.measure_button,")
+            and text.index("self.measure_button,") < text.index("self.then_index_button)")
+            and text.index("self.then_index_button)") < text.index("self.chunk_entry,")
+            and text.index("self.log_export_group.pack_start(self.export_button")
+            < text.index("self.log_export_group.pack_start(self.log_help_button")
+            and text.index("self.chunk_entry,") < text.index("self.delete_pad")
         ),
         "shared repair row": (
             "repair_bars.pack_start(self.repair_current_bar" in text
@@ -813,7 +942,7 @@ def _floor_reach(app, window, gtk, page_name: str, button) -> dict:
 
 
 def _overlaps(spans: dict) -> str:
-    names = [name for name in ("current_bar", "overall", "chunk_entry", "buttons") if spans.get(name)]
+    names = [name for name in ("overall", "chunk_entry", "buttons") if spans.get(name)]
     hits = []
     for index, left in enumerate(names):
         a = spans[left]
@@ -912,7 +1041,6 @@ def layout_report(floor: bool = True) -> str:
         index_stuck = abs(_bottom_gap(app.index_controls, app.index_page))
         log_gap = _log_header_gap(app)
         spans = {
-            "current_bar": _span(app.current_bar, window),
             "overall": _span(app.overall, window),
             "chunk_entry": _span(app.chunk_entry, window),
             "buttons": _span(app.index_buttons, window),
@@ -934,6 +1062,8 @@ def layout_report(floor: bool = True) -> str:
             "body": app.about_body.get_text().replace("\n", " | "),
             "index_list": str(index_list),
             "index_page": str(index_page),
+            "overall_width": str(app.overall.get_allocated_width()),
+            "list_width": str(app.index_list.get_allocated_width()),
             "repair_list": str(repair_list),
             "repair_page": str(repair_page),
             "overlap": _overlaps(spans),
@@ -1030,7 +1160,8 @@ class AboutAndLayoutTest(unittest.TestCase):
         self.assertIn("About", readme)
         self.assertIn("package version", readme)
         self.assertIn("at least half", readme)
-        self.assertIn("share one row", readme)
+        self.assertIn("Then index does nothing until", readme)
+        self.assertNotIn("is a checkbox", readme)
         for phrase in _ABOUT_PHRASES:
             self.assertIn(phrase, facts["body"])
         self.assertIn("About", changelog)
@@ -1038,8 +1169,16 @@ class AboutAndLayoutTest(unittest.TestCase):
         self.assertIn("Project NOMAD 1.35.1", changelog)
         self.assertIn("shared rows", changelog)
         notes = changelog.split(f"## {__version__}", 1)[1].split("\n## ", 1)[0]
-        self.assertIn("Auto", notes)
-        self.assertIn("finished embed calls", notes)
+        self.assertIn("Then index", notes)
+        self.assertIn("Follow", notes)
+        self.assertIn("vertical bar", notes)
+        self.assertIn("tree mark", notes)
+        self.assertIn("buttons rather than checkboxes", notes)
+        self.assertIn("Repair", notes)
+        previous_notes = changelog.split("## 1.1.4", 1)[1].split("\n## ", 1)[0]
+        self.assertIn("Auto", previous_notes)
+        self.assertIn("finished embed calls", previous_notes)
+        self.assertLess(changelog.index("## 1.1.5"), changelog.index("## 1.1.4"))
         released = changelog.split("## 1.1.0", 1)[1].split("\n## ", 1)[0]
         self.assertIn("150%", released)
         self.assertIn("Optimize stuck segments", released)
@@ -1116,7 +1255,11 @@ class AboutAndLayoutTest(unittest.TestCase):
                 self.assertGreaterEqual(index_list * 2, index_page, report)
                 self.assertGreaterEqual(repair_list * 2, repair_page, report)
                 self.assertIn("+", report.get("overlap", ""), report)
-                self.assertEqual(report.get("host_kind"), "CheckButton", report)
+                overall_width = int(report.get("overall_width", "0"))
+                list_width = int(report.get("list_width", "0"))
+                self.assertGreater(list_width, 200, report)
+                self.assertGreaterEqual(overall_width, list_width - 8, report)
+                self.assertEqual(report.get("host_kind"), "ToggleButton", report)
                 self.assertEqual(report.get("host_shown"), "0", report)
                 self.assertEqual(report.get("list_parent"), "Box", report)
                 self.assertGreaterEqual(int(report.get("log_gap", "999")), 0, report)
@@ -1191,6 +1334,236 @@ class WindowScanNamesTest(unittest.TestCase):
                 if isinstance(item, ast.FunctionDef) and item.name in {"_scan", "_repair_scan"}:
                     found.append((item.name, [arg.arg for arg in item.args.args]))
         self.assertEqual(found, [("_scan", ["self"]), ("_repair_scan", ["self", "mode"])])
+
+
+def _note_text(env_name: str, text: str) -> None:
+    path = os.environ.get(env_name)
+    if not path:
+        return
+    Path(path).write_text(text if text.endswith("\n") else text + "\n", encoding="utf-8")
+
+
+def _widget_inside(widget, pane) -> bool:
+    if widget is None or pane is None or not widget.get_mapped():
+        return False
+    point = widget.translate_coordinates(pane, 0, 0)
+    if point is None:
+        return False
+    x, y = int(point[0]), int(point[1])
+    width = int(widget.get_allocated_width())
+    height = int(widget.get_allocated_height())
+    if width < 8 or height < 8:
+        return False
+    pane_width = int(pane.get_allocated_width())
+    pane_height = int(pane.get_allocated_height())
+    return x >= -1 and y >= -1 and x + width <= pane_width + 2 and y + height <= pane_height + 2
+
+
+def _log_at_end(app) -> bool:
+    adjustment = app.log_scroll.get_vadjustment()
+    value = float(adjustment.get_value())
+    page = float(adjustment.get_page_size())
+    upper = float(adjustment.get_upper())
+    if page <= 1 or upper <= page + 1:
+        return False
+    return value + page >= upper - 4
+
+
+class HostBarAndFollowTest(unittest.TestCase):
+    def test_the_host_bar_stops_and_follow_keeps_the_newest_line(self):
+        import gi
+
+        gi.require_version("Gtk", "3.0")
+        from gi.repository import GLib, Gtk
+
+        ready = Gtk.init_check()
+        if isinstance(ready, tuple):
+            ready = ready[0]
+        lines = [
+            "clamp_under=" + str(host_bar_position(1000, 100, main_min=360)),
+            "clamp_over=" + str(host_bar_position(1000, 2000, main_min=360)),
+            "clamp_narrow=" + str(host_bar_position(300, 10, main_min=360)),
+        ]
+        self.assertEqual(host_bar_position(1000, 100, main_min=360), 360)
+        self.assertEqual(host_bar_position(1000, 2000, main_min=360), 1000)
+        self.assertEqual(host_bar_position(300, 10, main_min=360), 300)
+        if not ready:
+            reason = "Gtk.init_check failed"
+            lines.append("mode=unmapped")
+            lines.append("reason=" + reason)
+            _note_text("NOMAD_TURBO_GTK_LOG", reason + "\n")
+            _note_text("NOMAD_TURBO_SPLIT_LOG", "\n".join(lines))
+            return
+
+        from nomad_turbo.session import Session
+        from nomad_turbo.window import _MemoryLog, _Window
+
+        previous_state = os.environ.get("NOMAD_TURBO_STATE")
+        previous_config = os.environ.get("NOMAD_TURBO_CONFIG")
+        state = tempfile.TemporaryDirectory(prefix="nomad-turbo-split-")
+        os.environ["NOMAD_TURBO_STATE"] = str(Path(state.name) / "state")
+        os.environ["NOMAD_TURBO_CONFIG"] = str(Path(state.name) / "config.json")
+        app = None
+        try:
+            app = _Window(_stub_install(), Session(55), _MemoryLog(), Path(state.name) / "session.log", Gtk, GLib)
+            window = app.window
+            window.set_opacity(0)
+            window.show_all()
+            window.unmaximize()
+            window.resize(1180, 820)
+            size = (0, 0)
+            for _ in range(40):
+                _pump(Gtk, 0.05)
+                alloc = window.get_allocation()
+                size = (alloc.width, alloc.height)
+                if abs(size[0] - 1180) <= 80 and abs(size[1] - 820) <= 80 and app.start_button.get_allocated_width() > 20:
+                    break
+            mapped = abs(size[0] - 1180) <= 80 and abs(size[1] - 820) <= 80 and app.start_button.get_allocated_width() > 20
+            if not mapped:
+                lines.append("mode=unmapped")
+                lines.append(f"reason=window mapped {size[0]}x{size[1]}")
+                _note_text("NOMAD_TURBO_SPLIT_LOG", "\n".join(lines))
+                return
+
+            app.host_button.set_active(True)
+            _pump(Gtk, 0.3)
+            pane = app.host_pane
+            pane._user_drag = True
+            pane._button_down = True
+            pane.set_position(0)
+            _pump(Gtk, 0.45)
+            squeeze = int(app._main_squeeze())
+            position = int(pane.get_position())
+            main_width = int(app.content_pane.get_allocated_width())
+            wide_pane = int(pane.get_allocated_width())
+            wide_host = int(app.host_panel.widget.get_allocated_width())
+            request = window.get_size_request()
+            app.stack.set_visible_child_name("repair")
+            _pump(Gtk, 0.25)
+            repair_inside = _widget_inside(app.repair_start, app.content_pane)
+            app.stack.set_visible_child_name("index")
+            _pump(Gtk, 0.2)
+            index_inside = _widget_inside(app.start_button, app.content_pane)
+            log_inside = _widget_inside(app.follow_check, app.content_pane)
+            window.resize(480, 280)
+            for _ in range(25):
+                _pump(Gtk, 0.05)
+            pane._user_drag = True
+            pane.set_position(0)
+            _pump(Gtk, 0.35)
+            floor = window.get_allocation()
+            host_widget = app.host_panel.widget
+            lines.extend(
+                [
+                    "mode=mapped",
+                    f"squeeze={squeeze}",
+                    f"position={position}",
+                    f"main_width={main_width}",
+                    f"pane_width={wide_pane}",
+                    f"host_width={wide_host}",
+                    f"request={int(request.width)}x{int(request.height)}",
+                    f"index_inside={1 if index_inside else 0}",
+                    f"repair_inside={1 if repair_inside else 0}",
+                    f"log_inside={1 if log_inside else 0}",
+                    "index_control=Start indexing",
+                    "repair_control=Start repair",
+                    "log_control=Follow",
+                    f"floor_window={int(floor.width)}x{int(floor.height)}",
+                    f"floor_main={int(app.content_pane.get_allocated_width())}",
+                    f"floor_host={int(host_widget.get_allocated_width())}",
+                    f"floor_host_request={int(host_widget.get_size_request().width)}",
+                    f"floor_position={int(pane.get_position())}",
+                ]
+            )
+            _note_text("NOMAD_TURBO_SPLIT_LOG", "\n".join(lines))
+            self.assertGreaterEqual(main_width, squeeze - 2, lines)
+            self.assertLessEqual(abs(main_width - position), 8, lines)
+            self.assertTrue(index_inside, lines)
+            self.assertTrue(repair_inside, lines)
+            self.assertTrue(log_inside, lines)
+            self.assertLessEqual(int(request.width), 480)
+            self.assertLessEqual(int(request.height), 280)
+            self.assertGreaterEqual(int(app.content_pane.get_allocated_width()), min(squeeze, int(pane.get_allocated_width())) - 4)
+            self.assertLess(int(host_widget.get_size_request().width), 220)
+
+            # Follow stays on the newest line when several batches arrive before the idle scroll.
+            app.stack.set_visible_child_name("index")
+            window.resize(1180, 820)
+            app.host_button.set_active(False)
+            _pump(Gtk, 0.4)
+            app.follow_check.set_active(True)
+            app._log_away = False
+            memory = app.memory
+            for index in range(90):
+                memory.emit(logging.LogRecord("nomad_turbo", logging.INFO, __file__, 1, f"prime {index}", (), None))
+            app.refresh_log()
+            _pump(Gtk, 0.3)
+            self.assertTrue(_log_at_end(app), "primed log did not reach the end")
+            last = "burst-end"
+            for batch in range(4):
+                for index in range(12):
+                    memory.emit(
+                        logging.LogRecord(
+                            "nomad_turbo",
+                            logging.INFO,
+                            __file__,
+                            1,
+                            f"batch {batch} line {index}",
+                            (),
+                            None,
+                        )
+                    )
+                if batch == 3:
+                    memory.emit(logging.LogRecord("nomad_turbo", logging.INFO, __file__, 1, last, (), None))
+                app.refresh_log()
+            _pump(Gtk, 0.4)
+            self.assertTrue(_log_at_end(app))
+            shown = app.log_buffer.get_text(app.log_buffer.get_start_iter(), app.log_buffer.get_end_iter(), False)
+            self.assertTrue(shown.rstrip().endswith(last), shown[-80:])
+
+            # The reader left the end. New lines hold that place.
+            app._log_user = True
+            app.log_scroll.get_vadjustment().set_value(0)
+            self.assertTrue(app._log_away)
+            memory.emit(logging.LogRecord("nomad_turbo", logging.INFO, __file__, 1, "held-away", (), None))
+            app.refresh_log()
+            _pump(Gtk, 0.3)
+            held = app.log_buffer.get_text(app.log_buffer.get_start_iter(), app.log_buffer.get_end_iter(), False)
+            self.assertIn("held-away", held)
+            self.assertLess(float(app.log_scroll.get_vadjustment().get_value()), 30)
+            self.assertFalse(_log_at_end(app))
+
+            # Follow off does not jump, and turning it on does.
+            app.follow_check.set_active(False)
+            app.log_scroll.get_vadjustment().set_value(0)
+            memory.emit(logging.LogRecord("nomad_turbo", logging.INFO, __file__, 1, "follow-off", (), None))
+            app.refresh_log()
+            _pump(Gtk, 0.3)
+            self.assertLess(float(app.log_scroll.get_vadjustment().get_value()), 30)
+            app.follow_check.set_active(True)
+            _pump(Gtk, 0.3)
+            self.assertFalse(app._log_away)
+            self.assertTrue(_log_at_end(app))
+        finally:
+            if app is not None:
+                try:
+                    app.drop_tray()
+                except Exception:
+                    pass
+                try:
+                    app.window.destroy()
+                except Exception:
+                    pass
+                _pump(Gtk, 0.05)
+            if previous_state is None:
+                os.environ.pop("NOMAD_TURBO_STATE", None)
+            else:
+                os.environ["NOMAD_TURBO_STATE"] = previous_state
+            if previous_config is None:
+                os.environ.pop("NOMAD_TURBO_CONFIG", None)
+            else:
+                os.environ["NOMAD_TURBO_CONFIG"] = previous_config
+            state.cleanup()
 
 
 if __name__ == "__main__":

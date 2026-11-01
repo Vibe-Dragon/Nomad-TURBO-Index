@@ -1,7 +1,7 @@
 """Session log files and the text for the log-help window.
 
 Each window start keeps the previous session and drops anything older.
-The checkboxes do not change what these files record.
+The log buttons do not change what these files record.
 """
 
 from __future__ import annotations
@@ -94,7 +94,11 @@ def log_help_text() -> str:
         ),
         (
             "Indexing",
-            "\"indexing <file> from article\" is the file being written. "
+            "\"indexing <file> from article <n>\" is where this file continues. "
+            "The parentheses are article paths already stored when that list was read. "
+            "A file that already has many points continues from its checkpoint, and the line gives that point count. "
+            "Those paths are not listed again. "
+            "\"point count unavailable\" means Qdrant did not answer the count. "
             "\"skipping <file>, points already stored\" means that file was already in the index. "
             "\"qdrant write timed out. Trying that batch again.\" means the write is retried, and the line includes the error. "
             "\"qdrant is not taking writes. Staying on <file>\" means Turbo is waiting on that article. "

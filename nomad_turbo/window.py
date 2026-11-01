@@ -19,7 +19,6 @@ from nomad_turbo.discover import load_install, save_install, state_dir
 from nomad_turbo.file_stats import STATS_NAME, FileStats, compose_detail, detail_lines, library_location
 from nomad_turbo.progress import (
     ProgressBook,
-    format_current_file,
     ocr_list_cells,
     format_run_stats,
     LOG_PANE_LINES,
@@ -27,9 +26,10 @@ from nomad_turbo.progress import (
     restored_log_top,
     log_line_visible,
     log_lines_to_drop,
+    host_bar_position,
     log_should_stick,
     preferred_column_width,
-    usage_text,
+    embed_server_text,
 )
 from nomad_turbo.qdrant_status import changes_allowed
 from nomad_turbo.repair import format_repair_current
@@ -47,16 +47,26 @@ from nomad_turbo.schedule import (
     COL_NAME,
     COL_PROGRESS,
     COL_SIZE,
+    COL_SOURCE,
     COL_STATUS,
     COL_TYPE,
     INDEX_HEADERS,
     ORDER_CHOICES,
+    normalize_order,
+    FOLDER,
+    FOLDER_HOLD,
+    INDEXING_COLOR,
+    INDEXING_MARK,
     PRIORITY_COLOR,
+    PRIORITY_MARK,
     file_type_label,
-    files_for_list_order,
+    folder_store_row,
+    hold_store_row,
     index_store_row,
-    list_display_order,
+    library_tree,
+    row_mark,
     row_menu_labels,
+    then_index_action,
 )
 from nomad_turbo.session import Session
 from nomad_turbo.slots import (
@@ -121,6 +131,8 @@ def describe_index_controls(app) -> str:
         iterator = model.iter_next(iterator)
     lines.append("measure:")
     lines.append(app.measure_button.get_label() or "")
+    lines.append("then-index:")
+    lines.append(app.then_index_button.get_label() or "")
     lines.append("hide:")
     lines.append(app.hide_finished.get_label() or "")
     lines.append("menu:")
@@ -285,6 +297,121 @@ def _clear_own_pid() -> None:
         return
 
 
+def _wrap_box(*, spacing: int = 8, row_spacing: int = 4):
+    """A horizontal row that wraps. Its own minimum height is a single row."""
+    import gi
+
+    gi.require_version("Gtk", "3.0")
+    from gi.repository import Gdk, Gtk
+
+    if not hasattr(_wrap_box, "kind"):
+
+        class WrapBox(Gtk.Container):
+            def __init__(self, spacing, row_spacing):
+                super().__init__()
+                self.spacing = int(spacing)
+                self.row_spacing = int(row_spacing)
+                self._kids: list = []
+                self.set_has_window(False)
+                self.set_hexpand(True)
+                self.set_halign(Gtk.Align.FILL)
+                self.set_valign(Gtk.Align.START)
+
+            def do_add(self, widget):
+                self._kids.append(widget)
+                widget.set_parent(self)
+                self.queue_resize()
+
+            def do_remove(self, widget):
+                if widget in self._kids:
+                    self._kids.remove(widget)
+                widget.unparent()
+                self.queue_resize()
+
+            def do_forall(self, _include_internals, callback):
+                for child in list(self._kids):
+                    callback(child)
+
+            def do_get_request_mode(self):
+                return Gtk.SizeRequestMode.HEIGHT_FOR_WIDTH
+
+            def do_get_preferred_width(self):
+                minimum = 0
+                natural = 0
+                seen = 0
+                for child in self._kids:
+                    if not child.get_visible():
+                        continue
+                    child_min, child_nat = child.get_preferred_width()
+                    minimum = max(minimum, int(child_min))
+                    natural += int(child_nat)
+                    seen += 1
+                if seen:
+                    natural += self.spacing * (seen - 1)
+                return minimum, max(minimum, natural)
+
+            def do_get_preferred_height(self):
+                height = 0
+                for child in self._kids:
+                    if not child.get_visible():
+                        continue
+                    child_min, _child_nat = child.get_preferred_height()
+                    height = max(height, int(child_min))
+                return height, height
+
+            def do_get_preferred_height_for_width(self, width):
+                height = self._layout(int(width), False, 0, 0)
+                return height, height
+
+            def do_get_preferred_width_for_height(self, _height):
+                return self.do_get_preferred_width()
+
+            def do_size_allocate(self, allocation):
+                self.set_allocation(allocation)
+                self._layout(int(allocation.width), True, int(allocation.x), int(allocation.y))
+
+            def _child_box(self, child, row_width: int) -> tuple[int, int]:
+                child_min, child_nat = child.get_preferred_width()
+                minimum = max(0, int(child_min))
+                natural = max(minimum, int(child_nat))
+                width = natural if natural <= row_width else minimum
+                height, _natural_height = child.get_preferred_height_for_width(max(width, 1))
+                if int(height) <= 0:
+                    height, _natural_height = child.get_preferred_height()
+                return width, max(int(height), 0)
+
+            def _layout(self, row_width: int, allocate: bool, origin_x: int, origin_y: int) -> int:
+                x = origin_x
+                y = origin_y
+                row_h = 0
+                used = False
+                limit = origin_x + max(0, row_width)
+                for child in self._kids:
+                    if not child.get_visible():
+                        continue
+                    width, height = self._child_box(child, max(row_width, 1))
+                    if used and x > origin_x and x + width > limit:
+                        x = origin_x
+                        y += row_h + self.row_spacing
+                        row_h = 0
+                    if allocate:
+                        rect = Gdk.Rectangle()
+                        rect.x = int(x)
+                        rect.y = int(y)
+                        rect.width = max(int(width), 0)
+                        rect.height = max(int(height), 0)
+                        child.size_allocate(rect)
+                    x += width + self.spacing
+                    row_h = max(row_h, height)
+                    used = True
+                if not used:
+                    return 0
+                return (y + row_h) - origin_y
+
+        _wrap_box.kind = WrapBox
+    return _wrap_box.kind(spacing, row_spacing)
+
+
 class _Window:
     def __init__(self, install, session: Session, memory: _MemoryLog, log_path: Path, gtk, glib) -> None:
         self.install = install
@@ -325,9 +452,27 @@ class _Window:
         self._followed: dict[int, str] = {}
         self._column_manual: dict[str, bool] = {}
         self._column_width: dict[str, int] = {}
+        self._columns_by_key: dict[str, list] = {}
         self._fit_meta: list[tuple] = []
         self._sizing = False
+        self._open_folders: set[str] = set()
+        self._folder_iters: dict[str, object] = {}
+        self._file_iters: dict[str, object] = {}
+        self._folder_by_key: dict[str, object] = {}
+        self._root_folders: tuple = ()
+        self._shown_book = None
+        self._shown_epoch = None
+        self._shown_hide = None
+        self._shown_priority = None
+        self._tree_dirty = False
+        self._running_source = ""
+        self._tree_indexing = ""
         self._pane_lock = False
+        self._then_guard = False
+        self._choice_guard = False
+        self._log_away = False
+        self._log_pinning = 0
+        self._log_user = False
         self._log_split_ready = False
         self._log_settle = None
         self._log_placed_for = 0
@@ -407,17 +552,33 @@ class _Window:
         header = gtk.Box(orientation=gtk.Orientation.HORIZONTAL, spacing=8)
         header.set_hexpand(True)
         header.pack_start(switcher, False, False, 0)
-        self.log_help_button = gtk.Button(label="Log help")
-        self.log_help_button.set_tooltip_text(TIPS["log_help"])
-        self.log_help_button.set_valign(gtk.Align.CENTER)
-        self.log_help_button.connect("clicked", self.on_log_help)
-        header.pack_start(self.log_help_button, False, False, 0)
-        self.host_button = gtk.CheckButton(label="Host")
+        self.host_button = gtk.ToggleButton(label="Host system graphs")
         self.host_button.set_tooltip_text(TIPS["host"])
         self.host_button.set_valign(gtk.Align.CENTER)
         self.host_button.set_active(bool(getattr(install, "host_open", False)))
         self.host_button.connect("toggled", self.on_host)
         header.pack_start(self.host_button, False, False, 0)
+        order_label = gtk.Label(label="Order")
+        order_label.set_tooltip_text(TIPS["order"])
+        order_label.set_valign(gtk.Align.CENTER)
+        self.order_combo = gtk.ComboBoxText()
+        self.order_combo.set_tooltip_text(TIPS["order"])
+        self.order_combo.set_valign(gtk.Align.CENTER)
+        for choice, label in ORDER_CHOICES:
+            self.order_combo.append(choice, label)
+        saved_order = normalize_order(getattr(install, "index_order", None))
+        self.session.set_order(saved_order)
+        self.order_combo.set_active_id(saved_order)
+        self.order_combo.connect("changed", self.on_order)
+        self.hide_finished = gtk.ToggleButton(label="Hide finished")
+        self.hide_finished.set_active(bool(getattr(install, "hide_finished", False)))
+        self.hide_finished.set_halign(gtk.Align.START)
+        self.hide_finished.set_valign(gtk.Align.CENTER)
+        self.hide_finished.set_tooltip_text(TIPS["hide_finished"])
+        self.hide_finished.connect("toggled", self.on_hide_finished)
+        header.pack_start(order_label, False, False, 0)
+        header.pack_start(self.order_combo, False, False, 0)
+        header.pack_start(self.hide_finished, False, False, 0)
         self.version_label = gtk.Label(label=__version__)
         self.version_label.set_halign(gtk.Align.END)
         self.version_label.set_tooltip_text(TIPS["version"])
@@ -433,7 +594,15 @@ class _Window:
             link_label.set_width_chars(8)
         header.pack_end(project, False, False, 0)
         header.pack_end(self.version_label, False, False, 0)
-        root.pack_start(header, False, False, 0)
+        # Order names are wide. A short window clips this row instead of
+        # growing past the floor the controls were fitted to.
+        header_scroll = gtk.ScrolledWindow()
+        header_scroll.set_policy(gtk.PolicyType.AUTOMATIC, gtk.PolicyType.NEVER)
+        header_scroll.set_shadow_type(gtk.ShadowType.NONE)
+        header_scroll.set_min_content_width(1)
+        header_scroll.set_propagate_natural_width(False)
+        header_scroll.add(header)
+        root.pack_start(header_scroll, False, False, 0)
         # Above the pages, not in the log split, so this line does not ride the log bar.
         root.pack_start(self.qdrant_label, False, False, 0)
         index = gtk.Box(orientation=gtk.Orientation.VERTICAL, spacing=8)
@@ -469,144 +638,48 @@ class _Window:
             column.set_widget(label)
             return column
 
-        self.store = gtk.ListStore(*index_store_types())
-        tree = gtk.TreeView(model=self.store)
-        tree.set_headers_visible(True)
-        tree.set_tooltip_column(0)
-        name_cell = gtk.CellRendererText()
-        name_cell.set_property("ellipsize", Pango.EllipsizeMode.MIDDLE)
-        file_column = gtk.TreeViewColumn()
-        file_column.set_title(INDEX_HEADERS[0])
-        file_label = gtk.Label(label=INDEX_HEADERS[0])
-        file_label.set_tooltip_text(TIPS["col_file"])
-        file_label.show()
-        file_column.set_widget(file_label)
-        # The asterisk is its own cell, so ellipsizing the name cannot hide it.
-        mark_cell = gtk.CellRendererText()
-        mark_cell.set_property("foreground", PRIORITY_COLOR)
-        name_cell.set_property("ellipsize", Pango.EllipsizeMode.MIDDLE)
-        file_column.pack_start(mark_cell, False)
-        file_column.pack_start(name_cell, True)
-        file_column.add_attribute(mark_cell, "text", COL_MARK)
-        file_column.add_attribute(name_cell, "text", COL_NAME)
-        file_column.add_attribute(name_cell, "foreground", COL_COLOR)
-        self._add_column(
-            tree,
-            "index:File",
-            file_column,
-            text_index=COL_NAME,
-            minimum=180,
-            maximum=460,
-            expand=True,
-        )
-        self._add_column(
-            tree,
-            "index:File type",
-            headed(INDEX_HEADERS[1], TIPS["col_type"], gtk.CellRendererText(), text=COL_TYPE),
-            text_index=COL_TYPE,
-            minimum=64,
-            maximum=140,
-        )
-        self._add_column(
-            tree,
-            "index:Size",
-            headed(INDEX_HEADERS[2], TIPS["col_size"], gtk.CellRendererText(), text=COL_SIZE),
-            text_index=COL_SIZE,
-            minimum=70,
-            maximum=140,
-        )
-        self._add_column(
-            tree,
-            "index:Status",
-            headed(INDEX_HEADERS[3], TIPS["col_status"], gtk.CellRendererText(), text=COL_STATUS),
-            text_index=COL_STATUS,
-            minimum=80,
-            maximum=160,
-        )
-        self._add_column(
-            tree,
-            "index:Progress",
-            headed(
-                INDEX_HEADERS[4],
-                TIPS["col_progress"],
-                gtk.CellRendererProgress(),
-                value=COL_PROGRESS,
-            ),
-            text_index=None,
-            minimum=160,
-            maximum=280,
-        )
-        self._add_column(
-            tree,
-            "index:Articles",
-            headed(INDEX_HEADERS[5], TIPS["col_articles"], gtk.CellRendererText(), text=COL_ARTICLES),
-            text_index=COL_ARTICLES,
-            minimum=90,
-            maximum=240,
-        )
-        self._add_column(
-            tree,
-            "index:art/min",
-            headed(INDEX_HEADERS[6], TIPS["col_art_min"], gtk.CellRendererText(), text=COL_ART_MIN),
-            text_index=COL_ART_MIN,
-            minimum=70,
-            maximum=140,
-        )
-        self._add_column(
-            tree,
-            "index:Chunks",
-            headed(INDEX_HEADERS[7], TIPS["col_chunks"], gtk.CellRendererText(), text=COL_CHUNKS),
-            text_index=COL_CHUNKS,
-            minimum=80,
-            maximum=160,
-        )
-        self._add_column(
-            tree,
-            "index:chk/s",
-            headed(INDEX_HEADERS[8], TIPS["col_chk_s"], gtk.CellRendererText(), text=COL_CHK_S),
-            text_index=COL_CHK_S,
-            minimum=70,
-            maximum=120,
-        )
-        self._add_column(
-            tree,
-            "index:ETA",
-            headed(INDEX_HEADERS[9], TIPS["col_eta"], gtk.CellRendererText(), text=COL_ETA),
-            text_index=COL_ETA,
-            minimum=70,
-            maximum=140,
-        )
+        self.store = gtk.TreeStore(*index_store_types())
+        self.now_store = gtk.ListStore(*index_store_types())
+        # Headers stay on the current-file row. The folder tree scrolls under it.
+        self.now_tree = self._make_index_tree(headed, self.now_store, headers=True, fit=False)
+        self.now_tree.set_hexpand(True)
+        self.file_tree = self._make_index_tree(headed, self.store, headers=False, fit=True)
+        self.file_tree.set_enable_tree_lines(True)
+        # Fill a folder before it opens, so the arrow never shows an empty row.
+        self.file_tree.connect("test-expand-row", self._on_test_expand)
+        self.file_tree.connect("row-expanded", self._on_folder_expanded)
+        self.file_tree.connect("row-collapsed", self._on_folder_collapsed)
         scrolled = gtk.ScrolledWindow()
         scrolled.set_policy(gtk.PolicyType.AUTOMATIC, gtk.PolicyType.AUTOMATIC)
-        scrolled.add(tree)
+        scrolled.set_overlay_scrolling(True)
+        scrolled.add(self.file_tree)
         # The header sets the real minimum. A 48px content floor makes the
         # paned slide the list out of a short pane instead of shrinking it.
         scrolled.set_min_content_height(1)
         scrolled.set_vexpand(True)
-        self.file_tree = tree
-        tree.connect("button-press-event", self.on_file_press)
+        scrolled.connect("size-allocate", self._align_current_row)
         self.index_list = scrolled
+        # Column minimums are wider than a narrow main pane. The pinned row
+        # scrolls with the list so those columns do not push the controls off.
+        now_scroll = gtk.ScrolledWindow()
+        now_scroll.set_policy(gtk.PolicyType.EXTERNAL, gtk.PolicyType.NEVER)
+        now_scroll.set_shadow_type(gtk.ShadowType.NONE)
+        now_scroll.set_min_content_width(1)
+        now_scroll.set_propagate_natural_width(False)
+        now_scroll.set_propagate_natural_height(True)
+        now_scroll.set_hexpand(True)
+        now_scroll.add(self.now_tree)
+        self.now_scroll = now_scroll
         # Shared rows keep this cluster short. The list above it gets the spare height.
         lower = gtk.Box(orientation=gtk.Orientation.VERTICAL, spacing=4)
 
-        self.current_label = gtk.Label(label="No file is indexing.")
-        self.current_label.set_xalign(0)
-        self.current_label.set_hexpand(True)
-        self.current_label.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
-        self.current_label.set_tooltip_text(TIPS["file_now"])
-        self.current_label.set_valign(gtk.Align.CENTER)
-        self.current_bar = gtk.ProgressBar()
-        self.current_bar.set_show_text(True)
-        self.current_bar.set_text("Idle")
-        self.current_bar.set_hexpand(True)
-        self.current_bar.set_valign(gtk.Align.CENTER)
-        self.current_bar.set_tooltip_text(TIPS["file_bar"])
         self.overall = gtk.ProgressBar()
         self.overall.set_show_text(True)
         self.overall.set_text("Scanning…")
         self.overall.set_hexpand(True)
         self.overall.set_valign(gtk.Align.CENTER)
         self.overall.set_tooltip_text(TIPS["library_bar"])
+        lower.pack_start(self.overall, False, False, 0)
         batch_label = gtk.Label(label="Embed batch")
         batch_label.set_tooltip_text(TIPS["slider"])
         batch_label.set_valign(gtk.Align.CENTER)
@@ -620,26 +693,10 @@ class _Window:
         self.recommend_button.set_valign(gtk.Align.CENTER)
         self.recommend_button.set_tooltip_text(TIPS["recommend"])
         self.recommend_button.connect("clicked", self.on_recommend)
-        bars = gtk.Box(orientation=gtk.Orientation.HORIZONTAL, spacing=8)
-        bars.pack_start(self.current_label, True, True, 0)
-        bars.pack_start(self.current_bar, True, True, 0)
-        bars.pack_start(self.overall, True, True, 0)
-        lower.pack_start(bars, False, False, 0)
-
-        self.usage = gtk.Label(label="")
-        self.usage.set_xalign(0)
-        self.usage.set_hexpand(True)
-        self.usage.set_ellipsize(Pango.EllipsizeMode.END)
-        self.usage.set_tooltip_text(TIPS["usage"])
-        self.card = gtk.Label(label="")
-        self.card.set_xalign(0)
-        self.card.set_hexpand(True)
-        self.card.set_ellipsize(Pango.EllipsizeMode.END)
-        self.card.set_tooltip_text(TIPS["card"])
-        meters = gtk.Box(orientation=gtk.Orientation.HORIZONTAL, spacing=12)
-        meters.pack_start(self.usage, True, True, 0)
-        meters.pack_start(self.card, True, True, 0)
-        lower.pack_start(meters, False, False, 0)
+        self.server_label = gtk.Label(label=embed_server_text(0))
+        self.server_label.set_valign(gtk.Align.CENTER)
+        self.server_label.set_halign(gtk.Align.START)
+        self.server_label.set_tooltip_text(TIPS["usage"])
 
         self.stats = gtk.Label(label="")
         self.stats.set_xalign(0)
@@ -658,20 +715,27 @@ class _Window:
         self.tune_label.set_tooltip_text(TIPS["tune"])
         lower.pack_start(self.tune_label, False, False, 0)
 
-        self.keep_check = gtk.CheckButton(
-            label="Stay on after the last file, and index new files as they arrive"
-        )
+        self.keep_check = gtk.ToggleButton(label="Stay on")
         self.keep_check.set_active(bool(getattr(install, "keep_control", False)))
         self.keep_check.set_halign(gtk.Align.START)
-        self.keep_check.set_tooltip_text(TIPS["keep"])
+        self.keep_check.set_tooltip_text(
+            "Stay on after the last file, and index new files as they arrive. " + TIPS["keep"]
+        )
         self.keep_check.connect("toggled", self.on_keep)
 
-        buttons = gtk.Box(orientation=gtk.Orientation.HORIZONTAL, spacing=8)
         self.start_button = gtk.Button(label="Start indexing")
         self.delete_button = gtk.Button(label="Delete index")
         self.rescan_button = gtk.Button(label="Rescan")
         self.stop_button = gtk.Button(label="Stop")
         self.export_button = gtk.Button(label="Export log")
+        self.measure_button = gtk.Button(label="Measure")
+        self.measure_button.set_tooltip_text(TIPS["measure"])
+        self.measure_button.set_valign(gtk.Align.CENTER)
+        self.measure_button.connect("clicked", lambda *_args: self.on_measure())
+        self.then_index_button = gtk.ToggleButton(label="Then index")
+        self.then_index_button.set_tooltip_text(TIPS["then_index"])
+        self.then_index_button.set_valign(gtk.Align.CENTER)
+        self.then_index_button.connect("toggled", self.on_then_index)
         self.start_button.connect("clicked", lambda *_: self.on_start(False))
         self.delete_button.connect("clicked", self.on_delete_index)
         self.rescan_button.connect("clicked", lambda *_: self.begin_scan())
@@ -682,65 +746,50 @@ class _Window:
         self.stop_button.set_tooltip_text(TIPS["stop"])
         self.rescan_button.set_tooltip_text(TIPS["rescan"])
         self.export_button.set_tooltip_text(TIPS["export"])
+        self.export_button.set_valign(gtk.Align.CENTER)
         self.delete_tip = TIPS["delete"]
         self.delete_button.set_tooltip_text(TIPS["delete"])
         self.delete_button.get_style_context().add_class("destructive-action")
-        order_label = gtk.Label(label="Order")
-        order_label.set_tooltip_text(TIPS["order"])
-        order_label.set_valign(gtk.Align.CENTER)
-        self.order_combo = gtk.ComboBoxText()
-        self.order_combo.set_tooltip_text(TIPS["order"])
-        self.order_combo.set_valign(gtk.Align.CENTER)
-        for choice, label in ORDER_CHOICES:
-            self.order_combo.append(choice, label)
-        self.order_combo.set_active_id(self.session.get_order())
-        self.order_combo.connect("changed", self.on_order)
-        self.measure_button = gtk.Button(label="Measure")
-        self.measure_button.set_tooltip_text(TIPS["measure"])
-        self.measure_button.set_valign(gtk.Align.CENTER)
-        self.measure_button.connect("clicked", self.on_measure)
-        self.hide_finished = gtk.CheckButton(label="Hide finished")
-        self.hide_finished.set_active(bool(getattr(install, "hide_finished", False)))
-        self.hide_finished.set_halign(gtk.Align.START)
-        self.hide_finished.set_valign(gtk.Align.CENTER)
-        self.hide_finished.set_tooltip_text(TIPS["hide_finished"])
-        self.hide_finished.connect("toggled", self.on_hide_finished)
-        # Own row, so the long order names do not widen the button row past the window floor.
-        order_row = gtk.Box(orientation=gtk.Orientation.HORIZONTAL, spacing=8)
-        order_row.pack_start(order_label, False, False, 0)
-        order_row.pack_start(self.order_combo, False, False, 0)
-        order_row.pack_start(self.measure_button, False, False, 0)
-        order_row.pack_start(self.hide_finished, False, False, 0)
-        lower.pack_start(order_row, False, False, 0)
-        buttons.pack_start(self.keep_check, False, False, 0)
-        for button in (self.start_button, self.stop_button, self.rescan_button, self.export_button):
-            buttons.pack_start(button, False, False, 0)
-        # Between Export log and Delete index, so the file and library bars keep the row above.
-        self.tune_auto = gtk.CheckButton(label="Auto")
+        # Run actions, then the measure halves, then the embed batch. Delete stays apart.
+        self.run_group = self._linked(
+            self.start_button,
+            self.stop_button,
+            self.rescan_button,
+            self.keep_check,
+        )
+        self.measure_group = self._linked(self.measure_button, self.then_index_button)
+        self.tune_auto = gtk.ToggleButton(label="Auto")
         self.tune_auto.set_tooltip_text(TIPS["tune_auto"])
         self.tune_auto.set_active(bool(getattr(install, "tune_auto", False)))
         self.session.set_tune_auto(bool(getattr(install, "tune_auto", False)))
         self.tune_auto.connect("toggled", self.on_tune_auto)
         self.chunk_entry.set_sensitive(not self.tune_auto.get_active())
-        buttons.pack_start(self.tune_auto, False, False, 0)
-        buttons.pack_start(batch_label, False, False, 0)
-        buttons.pack_start(self.chunk_entry, False, False, 0)
-        buttons.pack_start(self.recommend_button, False, False, 0)
-        buttons.pack_end(self.delete_button, False, False, 0)
+        self.embed_group = self._flow(
+            self.tune_auto,
+            batch_label,
+            self.chunk_entry,
+            self.recommend_button,
+            self.server_label,
+        )
+        delete_pad = gtk.Box(orientation=gtk.Orientation.HORIZONTAL, spacing=0)
+        delete_pad.set_margin_start(16)
+        delete_pad.pack_start(self.delete_button, False, False, 0)
+        self.delete_pad = delete_pad
+        buttons = self._flow(self.run_group, self.measure_group, self.embed_group, delete_pad)
         lower.pack_start(buttons, False, False, 0)
         self.index_buttons = buttons
         self.index_controls = lower
         # The list takes extra height. The controls stay at the bottom of the
         # page, against the bar above the log.
+        index.pack_start(self.now_scroll, False, False, 0)
         index.pack_start(self.index_list, True, True, 0)
         index.pack_start(self.index_controls, False, False, 0)
         self._build_repair_page(headed)
         self._build_about_page()
 
-        log_head = gtk.Box(orientation=gtk.Orientation.HORIZONTAL, spacing=8)
-        self.error_check = gtk.CheckButton(label="Errors")
-        self.info_check = gtk.CheckButton(label="Info")
-        self.debug_check = gtk.CheckButton(label="Debug")
+        self.error_check = gtk.ToggleButton(label="Errors")
+        self.info_check = gtk.ToggleButton(label="Info")
+        self.debug_check = gtk.ToggleButton(label="Debug")
         self.error_check.set_active(True)
         self.info_check.set_active(True)
         self.debug_check.set_active(False)
@@ -750,15 +799,16 @@ class _Window:
         self.info_check.connect("toggled", self.on_filter)
         self.debug_check.connect("toggled", self.on_filter)
         self.error_check.connect("toggled", self.on_filter)
-        self.follow_check = gtk.CheckButton(label="Follow")
+        self.follow_check = gtk.ToggleButton(label="Follow")
         self.follow_check.set_active(bool(getattr(install, "log_follow", True)))
         self.follow_check.set_tooltip_text(TIPS["follow"])
         self.follow_check.connect("toggled", self.on_follow)
-        log_head.pack_start(self.error_check, False, False, 0)
-        log_head.pack_start(self.info_check, False, False, 0)
-        log_head.pack_start(self.debug_check, False, False, 0)
-        log_head.pack_start(self.follow_check, False, False, 0)
-        self.log_filters = log_head
+        self.log_filters = self._linked(
+            self.error_check,
+            self.info_check,
+            self.debug_check,
+            self.follow_check,
+        )
         # The log row is the first thing under the bar, so it stays against it.
         # The log text fills the rest. Neither side sets a tall size request,
         # so the window edges stay free.
@@ -779,10 +829,18 @@ class _Window:
         log_title_box = gtk.EventBox()
         log_title_box.add(log_title)
         log_title_box.connect("button-press-event", self._on_log_title)
-        log_header = gtk.Box(orientation=gtk.Orientation.HORIZONTAL, spacing=8)
-        log_header.pack_start(self.log_open_button, False, False, 0)
-        log_header.pack_start(log_title_box, False, False, 0)
-        log_header.pack_start(log_head, False, False, 0)
+        self.log_help_button = gtk.Button(label="Log help")
+        self.log_help_button.set_tooltip_text(TIPS["log_help"])
+        self.log_help_button.set_valign(gtk.Align.CENTER)
+        self.log_help_button.connect("clicked", self.on_log_help)
+        log_title_group = gtk.Box(orientation=gtk.Orientation.HORIZONTAL, spacing=4)
+        log_title_group.pack_start(self.log_open_button, False, False, 0)
+        log_title_group.pack_start(log_title_box, False, False, 0)
+        # Log help stays to the right of Export log.
+        self.log_export_group = gtk.Box(orientation=gtk.Orientation.HORIZONTAL, spacing=8)
+        self.log_export_group.pack_start(self.export_button, False, False, 0)
+        self.log_export_group.pack_start(self.log_help_button, False, False, 0)
+        log_header = self._flow(log_title_group, self.log_filters, self.log_export_group)
         self.log_header = log_header
         self.log_view = gtk.TextView()
         self.log_view.set_editable(False)
@@ -795,6 +853,7 @@ class _Window:
         log_scroll.set_vexpand(True)
         log_scroll.add(self.log_view)
         self.log_scroll = log_scroll
+        self._watch_log_scroll()
         self.log_filters.set_no_show_all(not log_open)
         self.log_filters.set_visible(log_open)
         log_scroll.set_no_show_all(not log_open)
@@ -1045,18 +1104,18 @@ class _Window:
             pane.remove(widget)
 
     def _place_host_split(self) -> None:
-        """Keep the saved host width. The pages keep the rest."""
+        """Keep the saved host width. The pages keep the rest, down to the squeeze limit."""
         pane = getattr(self, "host_pane", None)
         if pane is None or not self.host_button.get_active():
             return
         width = int(pane.get_allocated_width() or 0)
-        if width < 480:
+        if width < 80:
             return
         saved = int(getattr(self.install, "host_width", 0) or 0)
         panel = saved if saved >= 180 else 320
-        panel = min(panel, width - 300)
-        panel = max(180, panel)
-        position = width - panel
+        requested = width - panel
+        position = host_bar_position(width, requested, main_min=self._main_squeeze())
+        self._yield_host(width, self._main_squeeze())
         if abs(int(pane.get_position()) - position) <= 1:
             return
         self._pane_lock = True
@@ -1079,13 +1138,16 @@ class _Window:
         def on_size(_widget, allocation) -> None:
             if not self.host_button.get_active():
                 return
+            width = int(allocation.width or 0)
+            if width < 80:
+                return
+            # A drag can leave the main side under the squeeze limit. Put it back.
             if getattr(pane, "_button_down", False) or getattr(pane, "_user_drag", False):
                 self._host_split_ready = True
+                self._clamp_host_bar(pane)
                 return
             if self._host_split_ready:
-                return
-            width = int(allocation.width or 0)
-            if width < 480:
+                self._clamp_host_bar(pane)
                 return
             self._place_host_split()
             if self._host_settle:
@@ -1102,14 +1164,16 @@ class _Window:
             return False
 
         def on_position(widget, _pspec) -> None:
-            if self._pane_lock or not getattr(widget, "_user_drag", False):
-                return
-            if not self.host_button.get_active():
+            if self._pane_lock or not self.host_button.get_active():
                 return
             width = int(widget.get_allocated_width() or 0)
-            position = int(widget.get_position())
+            if width < 80:
+                return
+            position = self._clamp_host_bar(widget)
+            if not getattr(widget, "_user_drag", False):
+                return
             panel = width - position
-            if panel < 180 or position < 300:
+            if panel < 1:
                 return
             self.install.host_width = int(panel)
             self._save_layout_soon()
@@ -1255,18 +1319,32 @@ class _Window:
         if panel is not None:
             panel.stop()
 
-    def _flush_stats(self) -> None:
+    def _flush_stats(self, *, wait: bool = False) -> None:
         stats = getattr(self, "file_stats", None)
         if stats is None:
             return
-        try:
-            stats.save()
-        except Exception:
-            log.exception("could not save file stats")
+        if wait:
+            try:
+                stats.save()
+            except Exception:
+                log.exception("could not save file stats")
+            return
+        worker = getattr(self, "_stats_thread", None)
+        if worker is not None and worker.is_alive():
+            return
+
+        def run() -> None:
+            try:
+                stats.save()
+            except Exception:
+                log.exception("could not save file stats")
+
+        self._stats_thread = threading.Thread(target=run, name="nomad-turbo-stats", daemon=True)
+        self._stats_thread.start()
 
     def on_delete(self, *_args) -> bool:
         indexing = self._work_alive()
-        self._flush_stats()
+        self._flush_stats(wait=True)
         self._flush_frame()
         if window_close_action(indexing) == "hide" and self.indicator is not None:
             self.hidden = True
@@ -1376,6 +1454,165 @@ class _Window:
         self.refresh_rows()
         return False
 
+    def _make_index_tree(self, headed, model, *, headers: bool, fit: bool):
+        """File columns shared by the pinned row and the folder tree."""
+        gtk = self.gtk
+        from gi.repository import Pango
+
+        tree = gtk.TreeView(model=model)
+        tree.set_headers_visible(headers)
+        tree.set_tooltip_column(0)
+        name_cell = gtk.CellRendererText()
+        name_cell.set_property("ellipsize", Pango.EllipsizeMode.MIDDLE)
+        file_column = gtk.TreeViewColumn()
+        file_column.set_title(INDEX_HEADERS[0])
+        file_label = gtk.Label(label=INDEX_HEADERS[0])
+        file_label.set_tooltip_text(TIPS["col_file"])
+        file_label.show()
+        file_column.set_widget(file_label)
+        # The asterisk is its own cell, so ellipsizing the name cannot hide it.
+        mark_cell = gtk.CellRendererText()
+        mark_cell.set_property("foreground", PRIORITY_COLOR)
+        file_column.pack_start(mark_cell, False)
+        file_column.pack_start(name_cell, True)
+        file_column.add_attribute(mark_cell, "text", COL_MARK)
+        file_column.add_attribute(name_cell, "text", COL_NAME)
+        file_column.add_attribute(name_cell, "foreground", COL_COLOR)
+        if not headers:
+            # The folder tree reads the indexing glyph from the row. The pinned row does not.
+            file_column.set_cell_data_func(mark_cell, self._paint_tree_mark)
+            file_column.set_cell_data_func(name_cell, self._paint_tree_name)
+        self._add_column(
+            tree,
+            "index:File",
+            file_column,
+            text_index=COL_NAME,
+            minimum=180,
+            maximum=460,
+            fit=fit,
+        )
+        self._add_column(
+            tree,
+            "index:File type",
+            headed(INDEX_HEADERS[1], TIPS["col_type"], gtk.CellRendererText(), text=COL_TYPE),
+            text_index=COL_TYPE,
+            minimum=64,
+            maximum=140,
+            fit=fit,
+        )
+        self._add_column(
+            tree,
+            "index:Size",
+            headed(INDEX_HEADERS[2], TIPS["col_size"], gtk.CellRendererText(), text=COL_SIZE),
+            text_index=COL_SIZE,
+            minimum=70,
+            maximum=140,
+            fit=fit,
+        )
+        self._add_column(
+            tree,
+            "index:Status",
+            headed(INDEX_HEADERS[3], TIPS["col_status"], gtk.CellRendererText(), text=COL_STATUS),
+            text_index=COL_STATUS,
+            minimum=80,
+            maximum=160,
+            fit=fit,
+        )
+        progress_cell = gtk.CellRendererProgress()
+        progress_column = headed(
+            INDEX_HEADERS[4],
+            TIPS["col_progress"],
+            progress_cell,
+            value=COL_PROGRESS,
+        )
+        if not headers:
+            progress_column.set_cell_data_func(progress_cell, self._hide_folder_progress)
+        self._add_column(
+            tree,
+            "index:Progress",
+            progress_column,
+            text_index=None,
+            minimum=160,
+            maximum=280,
+            fit=fit,
+        )
+        self._add_column(
+            tree,
+            "index:Articles",
+            headed(INDEX_HEADERS[5], TIPS["col_articles"], gtk.CellRendererText(), text=COL_ARTICLES),
+            text_index=COL_ARTICLES,
+            minimum=90,
+            maximum=240,
+            fit=fit,
+        )
+        self._add_column(
+            tree,
+            "index:art/min",
+            headed(INDEX_HEADERS[6], TIPS["col_art_min"], gtk.CellRendererText(), text=COL_ART_MIN),
+            text_index=COL_ART_MIN,
+            minimum=70,
+            maximum=140,
+            fit=fit,
+        )
+        self._add_column(
+            tree,
+            "index:Chunks",
+            headed(INDEX_HEADERS[7], TIPS["col_chunks"], gtk.CellRendererText(), text=COL_CHUNKS),
+            text_index=COL_CHUNKS,
+            minimum=80,
+            maximum=160,
+            fit=fit,
+        )
+        self._add_column(
+            tree,
+            "index:chk/s",
+            headed(INDEX_HEADERS[8], TIPS["col_chk_s"], gtk.CellRendererText(), text=COL_CHK_S),
+            text_index=COL_CHK_S,
+            minimum=70,
+            maximum=120,
+            fit=fit,
+        )
+        # Spare width stays on the last column. Growing File moved every later
+        # edge, and the folder tree did not grow that column by the same amount.
+        self._add_column(
+            tree,
+            "index:ETA",
+            headed(INDEX_HEADERS[9], TIPS["col_eta"], gtk.CellRendererText(), text=COL_ETA),
+            text_index=COL_ETA,
+            minimum=70,
+            maximum=140,
+            expand=True,
+            fit=fit,
+        )
+        # A click is not a choice. The file menu is the right-click.
+        tree.get_selection().set_mode(gtk.SelectionMode.NONE)
+        tree.connect("button-press-event", self.on_file_press)
+        return tree
+
+    def _hide_folder_progress(self, _column, cell, model, iterator, _data) -> None:
+        cell.set_property("visible", model.get_value(iterator, COL_TYPE) != FOLDER)
+
+    def _paint_tree_mark(self, _column, cell, model, iterator, _data) -> None:
+        """The indexing glyph and the priority asterisk. Status text is not either."""
+        mark = str(model.get_value(iterator, COL_MARK) or "")
+        cell.set_property("text", mark)
+        cell.set_property("weight", self._pango_weight(INDEXING_MARK in mark))
+        if PRIORITY_MARK in mark:
+            cell.set_property("foreground", PRIORITY_COLOR)
+        elif INDEXING_MARK in mark:
+            cell.set_property("foreground", INDEXING_COLOR)
+        else:
+            cell.set_property("foreground", "#000000")
+
+    def _paint_tree_name(self, _column, cell, model, iterator, _data) -> None:
+        mark = str(model.get_value(iterator, COL_MARK) or "")
+        cell.set_property("weight", self._pango_weight(INDEXING_MARK in mark))
+
+    def _pango_weight(self, bold: bool):
+        from gi.repository import Pango
+
+        return Pango.Weight.BOLD if bold else Pango.Weight.NORMAL
+
     def _saved_width(self, key: str) -> int | None:
         raw = getattr(self.install, "column_widths", None) or {}
         if not isinstance(raw, dict):
@@ -1398,6 +1635,7 @@ class _Window:
         maximum: int,
         expand: bool = False,
         sort_index: int | None = None,
+        fit: bool = True,
     ) -> None:
         """A resizable column. A saved width is kept. Otherwise the first rows size it."""
         column.set_resizable(True)
@@ -1407,6 +1645,7 @@ class _Window:
             column.set_expand(True)
         if sort_index is not None:
             column.set_sort_column_id(sort_index)
+        self._columns_by_key.setdefault(key, []).append(column)
         widget = column.get_widget()
         if widget is not None:
             tip = widget.get_tooltip_text() or ""
@@ -1426,7 +1665,7 @@ class _Window:
         self._column_manual[key] = saved is not None
         column.connect("notify::width", self._on_column_width, key)
         column.connect("clicked", self._on_column_clicked, tree)
-        if text_index is not None:
+        if text_index is not None and fit:
             self._fit_meta.append((key, column, text_index, minimum, maximum))
         tree.append_column(column)
 
@@ -1435,13 +1674,19 @@ class _Window:
         self._followed.pop(id(tree), None)
 
     def _on_column_width(self, column, _pspec, key: str) -> None:
-        if self._sizing:
+        if self._sizing or column.get_expand():
             return
-        width = int(column.get_fixed_width() or column.get_width() or 0)
+        # Allocated width includes leftover space. Only a real drag changes fixed width.
+        width = int(column.get_fixed_width() or 0)
         if width < 40 or width == self._column_width.get(key):
             return
         self._column_manual[key] = True
         self._column_width[key] = width
+        self._sizing = True
+        try:
+            self._mirror_fixed_width(column, key, width)
+        finally:
+            self._sizing = False
         raw = getattr(self.install, "column_widths", None) or {}
         widths = dict(raw) if isinstance(raw, dict) else {}
         widths[key] = width
@@ -1454,14 +1699,14 @@ class _Window:
         if model is None or not self._fit_meta:
             return
         samples: dict[int, list[str]] = {}
-        limit = min(80, len(model))
         interesting = [
-            item for item in self._fit_meta if item[1].get_tree_view() == tree and not self._column_manual.get(item[0])
+            item
+            for item in self._fit_meta
+            if item[1].get_tree_view() == tree and not self._column_manual.get(item[0]) and not item[1].get_expand()
         ]
         if not interesting:
             return
-        for index in range(limit):
-            row = model[index]
+        for row in self._model_sample(model, 80):
             for _key, _column, text_index, _minimum, _maximum in interesting:
                 samples.setdefault(text_index, []).append(str(row[text_index] or ""))
         self._sizing = True
@@ -1478,8 +1723,112 @@ class _Window:
                     continue
                 column.set_fixed_width(width)
                 self._column_width[key] = width
+                self._mirror_fixed_width(column, key, width)
         finally:
             self._sizing = False
+
+    def _mirror_fixed_width(self, source, key: str, width: int) -> None:
+        """Keep the pinned row and the folder tree on the same column edges."""
+        for other in self._columns_by_key.get(key, ()):
+            if other is source:
+                continue
+            if int(other.get_fixed_width() or 0) == int(width):
+                continue
+            other.set_fixed_width(int(width))
+
+    def _model_sample(self, model, limit: int) -> list:
+        """Breadth-first rows, so both library roots contribute to column width."""
+        rows = []
+        level = []
+        iterator = model.iter_children(None)
+        while iterator is not None:
+            level.append(iterator)
+            iterator = model.iter_next(iterator)
+        while level and len(rows) < limit:
+            nxt = []
+            for iterator in level:
+                if len(rows) >= limit:
+                    break
+                rows.append(model[iterator])
+                child = model.iter_children(iterator)
+                while child is not None:
+                    nxt.append(child)
+                    child = model.iter_next(child)
+            level = nxt
+        return rows
+
+    def _apply_shared_widths(self) -> None:
+        """Put the saved fixed width on both trees. The last column keeps the leftover."""
+        if self._sizing:
+            return
+        self._sizing = True
+        try:
+            for key, width in self._column_width.items():
+                for column in self._columns_by_key.get(key, ()):
+                    if column.get_expand():
+                        continue
+                    if int(column.get_fixed_width() or 0) != int(width):
+                        column.set_fixed_width(int(width))
+        finally:
+            self._sizing = False
+
+    def _align_current_row(self, *_args) -> None:
+        """Line the pinned row up with the tree when a scrollbar takes width."""
+        self._apply_shared_widths()
+        bar = self.index_list.get_vscrollbar()
+        width = 0
+        if bar is not None and bar.get_visible() and not self.index_list.get_overlay_scrolling():
+            width = max(0, int(bar.get_allocated_width()))
+        if self.now_tree.get_margin_end() != width:
+            self.now_tree.set_margin_end(width)
+        self._follow_list_scroll()
+
+    def _follow_list_scroll(self, *_args) -> None:
+        """The pinned headings scroll with the folder tree. They do not widen the page."""
+        now_scroll = getattr(self, "now_scroll", None)
+        listing = getattr(self, "index_list", None)
+        if now_scroll is None or listing is None:
+            return
+        src = listing.get_hadjustment()
+        dst = now_scroll.get_hadjustment()
+        if src is None or dst is None:
+            return
+        if getattr(self, "_now_hscroll_adj", None) is not src:
+            self._now_hscroll_adj = src
+            src.connect("value-changed", self._follow_list_scroll)
+        value = float(src.get_value())
+        if abs(float(dst.get_value()) - value) > 0.5:
+            dst.set_value(value)
+
+    def _on_test_expand(self, _tree, iterator, _path) -> bool:
+        """Load this folder's rows before the arrow opens it."""
+        key = str(self.store.get_value(iterator, COL_SOURCE))
+        if key == FOLDER_HOLD:
+            return True
+        book = self.session.get_book() if hasattr(self.session, "get_book") else None
+        if book is None:
+            return True
+        if self._ensure_library(book, self._hide_finished(), getattr(book, "structure_epoch", None)):
+            self._tree_dirty = True
+        folder = self._folder_by_key.get(key)
+        if folder is None:
+            return True
+        self._sync_visible(iterator, self._child_entries(folder), self._priorities(), self._activity())
+        return False
+
+    def _on_folder_expanded(self, _tree, iterator, _path) -> None:
+        key = str(self.store.get_value(iterator, COL_SOURCE))
+        if key == FOLDER_HOLD:
+            return
+        self._open_folders.add(key)
+        self._restore_open_folders()
+        self._refit_columns(self.file_tree)
+
+    def _on_folder_collapsed(self, _tree, iterator, _path) -> None:
+        key = str(self.store.get_value(iterator, COL_SOURCE))
+        self._open_folders.discard(key)
+        self._drop_children(iterator)
+        self._hold(iterator)
 
     def _save_layout_soon(self) -> None:
         if self.layout_timer:
@@ -1517,6 +1866,28 @@ class _Window:
             paned separator.wide:active {
                 background-color: alpha(@theme_fg_color, 0.85);
             }
+            .nomad-segment {
+                border: 1px solid alpha(@theme_fg_color, 0.55);
+                border-radius: 4px;
+                padding: 0;
+            }
+            .nomad-segment button {
+                border: none;
+                border-radius: 0;
+                box-shadow: none;
+                margin: 0;
+            }
+            .nomad-segment button:first-child {
+                border-right: 1px solid alpha(@theme_fg_color, 0.35);
+            }
+            progressbar,
+            progressbar trough {
+                min-width: 48px;
+            }
+            .nomad-segment button:checked {
+                background-image: none;
+                background-color: alpha(@theme_selected_bg_color, 0.45);
+            }
             """
         )
         from gi.repository import Gdk
@@ -1529,6 +1900,105 @@ class _Window:
             provider,
             self.gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
         )
+
+    def _linked(self, *children):
+        """One segmented control. The children sit flush inside a shared outline."""
+        box = self.gtk.Box(orientation=self.gtk.Orientation.HORIZONTAL, spacing=0)
+        box.get_style_context().add_class("linked")
+        box.get_style_context().add_class("nomad-segment")
+        box.set_halign(self.gtk.Align.START)
+        box.set_valign(self.gtk.Align.CENTER)
+        for child in children:
+            child.set_valign(self.gtk.Align.CENTER)
+            child.set_margin_start(0)
+            child.set_margin_end(0)
+            box.pack_start(child, False, False, 0)
+        return box
+
+    def _flow(self, *children, spacing: int = 8):
+        """A row that wraps whole children when the main area gets narrow.
+
+        The minimum height stays one row, so a short window is not forced open
+        by the wrapped height. The wrapped height is what a narrow width asks
+        for, and the list above gives up that space.
+        """
+        flow = _wrap_box(spacing=spacing, row_spacing=4)
+        for child in children:
+            flow.add(child)
+        return flow
+
+    def _bind_choice(self, chosen, other) -> None:
+        """Two buttons, exactly one selected. Choosing one releases the other."""
+
+        def on_toggle(button, mate) -> None:
+            if self._choice_guard:
+                return
+            self._choice_guard = True
+            try:
+                if button.get_active():
+                    mate.set_active(False)
+                elif not mate.get_active():
+                    button.set_active(True)
+            finally:
+                self._choice_guard = False
+
+        chosen.connect("toggled", on_toggle, other)
+        other.connect("toggled", on_toggle, chosen)
+
+    def _preferred_min_width(self, widget) -> int:
+        if widget is None:
+            return 0
+        try:
+            minimum, _natural = widget.get_preferred_width()
+        except Exception:
+            return 0
+        return max(0, int(minimum or 0))
+
+    def _main_squeeze(self) -> int:
+        """Narrowest main-pane width that still fits every control, wrapped."""
+        widths = [
+            self._preferred_min_width(widget)
+            for widget in (
+                getattr(self, "run_group", None),
+                getattr(self, "measure_group", None),
+                getattr(self, "embed_group", None),
+                getattr(self, "delete_pad", None),
+                getattr(self, "repair_choice", None),
+                getattr(self, "repair_actions", None),
+                getattr(self, "optimize_segments", None),
+                getattr(self, "log_filters", None),
+                getattr(self, "log_export_group", None),
+            )
+        ]
+        return max(widths or [0]) + 4
+
+    def _yield_host(self, pane_width: int, main_min: int) -> None:
+        """Let the host side shrink when the window is already at its floor."""
+        panel = getattr(self, "host_panel", None)
+        widget = None if panel is None else getattr(panel, "widget", None)
+        if widget is None:
+            return
+        room = int(pane_width) - int(main_min)
+        request = 220 if room >= 220 else max(1, room)
+        current = widget.get_size_request()
+        if int(current.width) != int(request):
+            widget.set_size_request(int(request), -1)
+
+    def _clamp_host_bar(self, pane) -> int:
+        """Stop the vertical bar at the squeeze limit. Returns the main width."""
+        width = int(pane.get_allocated_width() or 0)
+        if width < 1:
+            return 0
+        main_min = self._main_squeeze()
+        self._yield_host(width, main_min)
+        position = host_bar_position(width, int(pane.get_position()), main_min=main_min)
+        if abs(int(pane.get_position()) - position) > 1:
+            self._pane_lock = True
+            try:
+                pane.set_position(int(position))
+            finally:
+                self._pane_lock = False
+        return position
 
     def _make_pane(self, orientation=None):
         """A visible split. The log bar is vertical. The host bar runs the other way."""
@@ -1650,6 +2120,7 @@ class _Window:
         except Exception:
             log.exception("could not save the log follow setting")
         if following:
+            self._log_away = False
             end = self.log_buffer.get_end_iter()
             self.log_buffer.place_cursor(end)
             self._settle_log(bottom=True)
@@ -1689,8 +2160,13 @@ class _Window:
 
     def on_order(self, combo) -> None:
         """Choose which unfinished file comes next. The one already running stays."""
-        choice = combo.get_active_id() or "library"
+        choice = normalize_order(combo.get_active_id())
         self.session.set_order(choice)
+        self.install.index_order = choice
+        try:
+            save_install(self.install)
+        except Exception:
+            log.exception("could not save the index order")
         self.refresh_rows()
 
     def on_hide_finished(self, button) -> None:
@@ -1702,8 +2178,13 @@ class _Window:
             log.exception("could not save the hide-finished setting")
         self.refresh_rows()
 
-    def on_measure(self, *_args) -> None:
-        """Sample each unfinished file, then resume or stop the way Stop does."""
+    def on_measure(self, *_args, then_index: bool = False) -> None:
+        """Sample each unfinished file. Started idle, the pass stops the way Stop does.
+
+        A pass started during a run keeps indexing. Then index is a separate
+        half: it does not start this pass.
+        """
+        del then_index
         if hasattr(self.session, "measuring") and self.session.measuring():
             return
         running = (
@@ -1712,14 +2193,39 @@ class _Window:
             and self.thread.is_alive()
         )
         if running:
-            self.session.start_measure(from_idle=False)
+            self.session.start_measure(from_idle=False, then_index=False)
             self.session.set_note("Measuring each unfinished file for about five minutes.")
             return
         if not self.rows_ready or not self.qdrant_ready or self._work_alive():
             return
-        self.session.start_measure(from_idle=True)
+        self._measure_pending = True
+        self.session.start_measure(from_idle=True, then_index=False)
         if not self.on_start(False):
+            self._measure_pending = False
             self.session.set_measuring(False)
+
+    def on_then_index(self, button) -> None:
+        """Arm the measurement already running. Idle does not start a worker."""
+        if self._then_guard:
+            return
+        measuring = bool(self.session.measuring()) if hasattr(self.session, "measuring") else False
+        if then_index_action(measuring=measuring) != "arm":
+            self._set_then_index_shown(False)
+            return
+        armed = bool(self.session.arm_then_index()) if hasattr(self.session, "arm_then_index") else False
+        self._set_then_index_shown(armed)
+
+    def _set_then_index_shown(self, armed: bool) -> None:
+        button = getattr(self, "then_index_button", None)
+        if button is None or not hasattr(button, "set_active"):
+            return
+        if bool(button.get_active()) == bool(armed):
+            return
+        self._then_guard = True
+        try:
+            button.set_active(bool(armed))
+        finally:
+            self._then_guard = False
 
     def on_file_press(self, tree, event):
         if getattr(event, "button", 1) != 3:
@@ -1728,8 +2234,10 @@ class _Window:
         if not info:
             return False
         path = info[0]
-        tree.set_cursor(path, None, False)
-        source = tree.get_model()[path][0]
+        row = tree.get_model()[path]
+        if row[COL_TYPE] == FOLDER:
+            return False
+        source = row[0]
         menu = self._file_menu(str(source))
         # GTK drops the menu if nothing in Python still holds it.
         self._row_menu = menu
@@ -1765,7 +2273,12 @@ class _Window:
         """The facts the details window shows for one file."""
         live = None
         book = self.session.get_book() if hasattr(self.session, "get_book") else None
-        if book is not None and hasattr(book, "snapshot"):
+        if book is not None and hasattr(book, "file_snap"):
+            try:
+                live = book.file_snap(source)
+            except Exception:
+                live = None
+        elif book is not None and hasattr(book, "snapshot"):
             try:
                 snap = book.snapshot()
             except Exception:
@@ -1931,6 +2444,11 @@ class _Window:
     def on_start(self, wipe: bool) -> bool:
         if not self.rows_ready or self._work_alive() or not self.qdrant_ready:
             return False
+        # Start indexing is a full run. Measure sets the flag, then calls this.
+        # A sample stopped earlier must not stay on and turn this run into samples.
+        if not getattr(self, "_measure_pending", False) and hasattr(self.session, "set_measuring"):
+            self.session.set_measuring(False)
+        self._measure_pending = False
         self.session.stop.clear()
         self.session.wipe_confirmed = bool(wipe)
         self.session.set_phase("waiting")
@@ -2013,21 +2531,23 @@ class _Window:
         box.set_spacing(8)
         note = gtk.Label(
             label=(
-                "The log file keeps every line. The checkboxes only hide lines in the window. "
+                "The log file keeps every line. The log buttons only hide lines in the window. "
                 "Older sessions are not kept."
             )
         )
         note.set_xalign(0)
         note.set_line_wrap(True)
         note.set_max_width_chars(48)
-        current = gtk.RadioButton.new_with_label(None, "Current session")
-        last = gtk.RadioButton.new_with_label_from_widget(current, "Last session")
+        current = gtk.ToggleButton(label="Current session")
+        last = gtk.ToggleButton(label="Last session")
+        current.set_active(True)
         last.set_sensitive(has_previous)
         if not has_previous:
             last.set_tooltip_text("No earlier session is saved yet.")
+        self._bind_choice(current, last)
+        choice = self._linked(current, last)
         box.pack_start(note, False, False, 0)
-        box.pack_start(current, False, False, 0)
-        box.pack_start(last, False, False, 0)
+        box.pack_start(choice, False, False, 0)
         dialog.show_all()
         response = dialog.run()
         chosen = previous if last.get_active() and has_previous else self.log_path
@@ -2157,6 +2677,7 @@ class _Window:
         finally:
             write_shortcut(False)
             self.session.wipe_confirmed = False
+            schedule.release_measure(self.session)
 
     def on_tick(self) -> bool:
         self.tick += 1
@@ -2216,9 +2737,14 @@ class _Window:
         self.delete_button.set_sensitive(library_idle and changes)
         self.rescan_button.set_sensitive(library_idle)
         measuring = bool(self.session.measuring()) if hasattr(self.session, "measuring") else False
-        self.measure_button.set_sensitive(
+        measure_ready = (
             self.rows_ready and changes and not measuring and not repairing and not deleting and (library_idle or running)
         )
+        self.measure_button.set_sensitive(measure_ready)
+        # Then index only takes effect during a measurement. It stays off until then.
+        self.then_index_button.set_sensitive(measuring and not repairing and not deleting)
+        armed = bool(measuring and hasattr(self.session, "measure_then_index") and self.session.measure_then_index())
+        self._set_then_index_shown(armed)
         self._gate_tip(self.start_button, self.start_tip)
         self._gate_tip(self.delete_button, self.delete_tip)
         self.stop_button.set_sensitive(running or deleting)
@@ -2238,68 +2764,243 @@ class _Window:
     def refresh_rows(self):
         book = self.session.get_book()
         if book is None:
+            self._running_source = ""
             return None
-        snap = book.snapshot()
-        priorities = self.session.priorities() if hasattr(self.session, "priorities") else set()
-        dates = self.session.zim_dates() if hasattr(self.session, "zim_dates") else {}
-        source = next((item.source for item in snap.files if item.state == "running"), "")
-        hide = bool(self.hide_finished.get_active()) if hasattr(self, "hide_finished") else False
-        visible = list_display_order(
-            files_for_list_order(snap.files, priorities=priorities, dates=dates),
-            self.session.get_order() if hasattr(self.session, "get_order") else "library",
-            current=source or None,
-            hide_finished=hide,
-        )
-        activity = ""
-        if hasattr(self.session, "view"):
-            activity = self.session.view().get("note") or ""
-        seen = set(visible)
-        for index in range(len(self.store) - 1, -1, -1):
-            if self.store[index][0] not in seen:
-                del self.store[index]
-        existing = self._iters_by_source(self.store)
-        by_source = {item.source: item for item in snap.files}
-        for item_source in visible:
-            item = by_source.get(item_source)
-            if item is None:
-                continue
-            values = index_store_row(item, priority=item.source in priorities)
-            if item.state == "running":
-                cells = ocr_list_cells(activity)
-                if cells is not None:
-                    status, percent = cells
-                    values = (*values[:COL_STATUS], status, percent, *values[COL_PROGRESS + 1 :])
-            if item.source in existing:
-                self._set_row(self.store, existing[item.source], values)
-            else:
-                self.store.append(values)
-        self._reorder_store(self.store, visible)
-        self._refit_columns(self.file_tree)
-        self._follow_files(self.file_tree, source)
-        title, fraction, text = format_current_file(snap, activity)
-        self._show(self.current_label, title)
-        self.current_label.set_tooltip_text(title if source else TIPS["file_now"])
-        self.current_bar.set_fraction(min(1.0, max(0.0, fraction)))
-        self._show(self.current_bar, text)
+        # pulse reads the running file and the bar totals. Those totals stay on
+        # the book, so this tick does not walk the library. A closed folder is one row.
+        if hasattr(book, "pulse"):
+            snap = book.pulse()
+        else:
+            snap = book.snapshot()
+        priorities = self._priorities()
+        activity = self._activity()
+        hide = self._hide_finished()
+        rebuilt = self._ensure_library(book, hide, getattr(snap, "structure_epoch", None))
+        if rebuilt or self._tree_dirty:
+            self._sync_visible(None, self._root_entries(), priorities, activity)
+            self._open_folders.intersection_update(self._folder_by_key)
+            self._restore_open_folders()
+            self._refit_columns(self.file_tree)
+            self._tree_dirty = False
+        elif frozenset(priorities) != self._shown_priority:
+            self._paint_marks(priorities)
+        self._shown_priority = frozenset(priorities)
+        running = next((item for item in snap.files if item.state == "running"), None)
+        self._running_source = running.source if running is not None else ""
+        self._paint_running(running, priorities, activity)
         self.overall.set_fraction(min(1.0, max(0.0, snap.overall_fraction)))
         self._show(self.overall, snap.overall_text)
         return snap
 
-    def _reorder_store(self, store, sources: list[str]) -> None:
-        """Put store rows into sources order. Gtk maps each new slot to the old one."""
-        positions = {}
-        iterator = store.get_iter_first()
-        index = 0
+    def _hide_finished(self) -> bool:
+        if not hasattr(self, "hide_finished"):
+            return False
+        return bool(self.hide_finished.get_active())
+
+    def _priorities(self) -> set:
+        if hasattr(self.session, "priorities"):
+            return self.session.priorities()
+        return set()
+
+    def _activity(self) -> str:
+        if hasattr(self.session, "view"):
+            return self.session.view().get("note") or ""
+        return ""
+
+    def _ensure_library(self, book, hide: bool, seen_epoch) -> bool:
+        """Rebuild the folder cache when the library membership changes."""
+        if self._shown_book is book and self._shown_hide == hide and self._shown_epoch == seen_epoch:
+            return False
+        if hasattr(book, "library_items"):
+            epoch, items = book.library_items()
+        else:
+            snap = book.snapshot()
+            epoch = getattr(snap, "structure_epoch", 0)
+            items = snap.files
+        folders = library_tree(items, hide_finished=hide)
+        self._root_folders = folders
+        self._folder_by_key = {}
+        self._index_folders(folders)
+        self._shown_book = book
+        self._shown_epoch = epoch
+        self._shown_hide = hide
+        return True
+
+    def _index_folders(self, folders) -> None:
+        for folder in folders:
+            self._folder_by_key[folder.key] = folder
+            self._index_folders(folder.folders)
+
+    def _root_entries(self) -> list:
+        return [("folder", folder.key, folder) for folder in self._root_folders]
+
+    def _child_entries(self, folder) -> list:
+        entries = [("folder", child.key, child) for child in folder.folders]
+        entries.extend(("file", source, source) for source in folder.files)
+        return entries
+
+    def _file_values(self, item, priorities, activity: str, *, tree: bool = False) -> tuple:
+        values = index_store_row(item, priority=item.source in priorities)
+        if tree:
+            mark = row_mark(priority=item.source in priorities, indexing=item.state == "running")
+            values = (*values[:COL_MARK], mark, *values[COL_MARK + 1 :])
+        if item.state == "running":
+            cells = ocr_list_cells(activity)
+            if cells is not None:
+                status, percent = cells
+                values = (*values[:COL_STATUS], status, percent, *values[COL_PROGRESS + 1 :])
+        return values
+
+    def _sync_now_row(self, item, priorities, activity: str) -> None:
+        """The file being indexed stays above the folder tree, outside the scroll."""
+        if item is None or item.state != "running":
+            if len(self.now_store):
+                self.now_store.clear()
+            return
+        values = self._file_values(item, priorities, activity)
+        if len(self.now_store) == 0:
+            self.now_store.append(values)
+            return
+        self._set_row(self.now_store, self.now_store.get_iter_first(), values)
+
+    def _paint_running(self, item, priorities, activity: str) -> None:
+        self._sync_now_row(item, priorities, activity)
+        current = item.source if item is not None and getattr(item, "state", "") == "running" else ""
+        previous = getattr(self, "_tree_indexing", "") or ""
+        if previous and previous != current:
+            self._rewrite_tree_file(previous, priorities, activity)
+        self._tree_indexing = current
+        if item is None:
+            return
+        iterator = self._file_iters.get(item.source)
+        if iterator is None:
+            return
+        self._set_row(self.store, iterator, self._file_values(item, priorities, activity, tree=True))
+
+    def _rewrite_tree_file(self, source: str, priorities, activity: str) -> None:
+        """Drop the indexing mark once that file is no longer the one indexing."""
+        iterator = self._file_iters.get(source)
+        if iterator is None:
+            return
+        book = self.session.get_book() if hasattr(self.session, "get_book") else None
+        item = None
+        if book is not None and hasattr(book, "files_for"):
+            item = book.files_for([source]).get(source)
+        if item is None:
+            mark = row_mark(priority=source in priorities, indexing=False)
+            if self.store.get_value(iterator, COL_MARK) != mark:
+                self.store.set_value(iterator, COL_MARK, mark)
+            return
+        self._set_row(self.store, iterator, self._file_values(item, priorities, activity, tree=True))
+
+    def _paint_marks(self, priorities) -> None:
+        running = getattr(self, "_tree_indexing", "") or ""
+        for source, iterator in self._file_iters.items():
+            mark = row_mark(priority=source in priorities, indexing=source == running)
+            if self.store.get_value(iterator, COL_MARK) != mark:
+                self.store.set_value(iterator, COL_MARK, mark)
+
+    def _sync_visible(self, parent, entries, priorities, activity: str) -> None:
+        """Keep one open level in place. A closed folder keeps a single hidden child."""
+        wanted = {key for _kind, key, _payload in entries}
+        found = self._child_map(parent)
+        for key, iterator in list(found.items()):
+            if key not in wanted:
+                self._forget_subtree(iterator)
+                self.store.remove(iterator)
+        found = self._child_map(parent)
+        book = self.session.get_book() if hasattr(self.session, "get_book") else None
+        file_sources = [key for kind, key, _payload in entries if kind == "file"]
+        snaps = {}
+        if file_sources and book is not None and hasattr(book, "files_for"):
+            snaps = book.files_for(file_sources)
+        for kind, key, payload in entries:
+            if kind == "file":
+                item = snaps.get(key)
+                if item is None:
+                    continue
+                values = self._file_values(item, priorities, activity, tree=True)
+            else:
+                values = folder_store_row(payload)
+            iterator = found.get(key)
+            if iterator is None:
+                iterator = self.store.append(parent, values)
+                found[key] = iterator
+            else:
+                self._set_row(self.store, iterator, values)
+            if kind == "folder":
+                self._folder_iters[key] = iterator
+                path = self.store.get_path(iterator)
+                if path is not None and self.file_tree.row_expanded(path):
+                    self._sync_visible(iterator, self._child_entries(payload), priorities, activity)
+                else:
+                    self._hold(iterator)
+            else:
+                self._file_iters[key] = iterator
+        order = []
+        iterator = self.store.iter_children(parent)
         while iterator is not None:
-            positions[store.get_value(iterator, 0)] = index
-            iterator = store.iter_next(iterator)
-            index += 1
-        if len(positions) != len(sources) or any(source not in positions for source in sources):
+            order.append(self.store.get_value(iterator, COL_SOURCE))
+            iterator = self.store.iter_next(iterator)
+        wanted_order = [key for _kind, key, _payload in entries]
+        if order != wanted_order and len(order) == len(wanted_order) and set(order) == set(wanted_order):
+            positions = {key: index for index, key in enumerate(order)}
+            self.store.reorder(parent, [positions[key] for key in wanted_order])
+
+    def _hold(self, parent) -> None:
+        """One hidden child, so a closed folder still has an arrow."""
+        child = self.store.iter_children(parent)
+        if child is None:
+            self.store.append(parent, hold_store_row())
             return
-        new_order = [positions[source] for source in sources]
-        if new_order == list(range(len(new_order))):
+        key = self.store.get_value(child, COL_SOURCE)
+        if key == FOLDER_HOLD and self.store.iter_next(child) is None:
             return
-        store.reorder(new_order)
+        self._drop_children(parent)
+        self.store.append(parent, hold_store_row())
+
+    def _drop_children(self, parent) -> None:
+        child = self.store.iter_children(parent)
+        while child is not None:
+            self._forget_subtree(child)
+            if not self.store.remove(child):
+                break
+
+    def _forget_subtree(self, iterator) -> None:
+        child = self.store.iter_children(iterator)
+        while child is not None:
+            self._forget_subtree(child)
+            child = self.store.iter_next(child)
+        key = self.store.get_value(iterator, COL_SOURCE)
+        self._file_iters.pop(key, None)
+        self._folder_iters.pop(key, None)
+
+    def _child_map(self, parent) -> dict:
+        found = {}
+        iterator = self.store.iter_children(parent)
+        while iterator is not None:
+            found[self.store.get_value(iterator, COL_SOURCE)] = iterator
+            iterator = self.store.iter_next(iterator)
+        return found
+
+    def _restore_open_folders(self) -> None:
+        """Re-open folders the user left open. A closed parent stays closed."""
+        pending = True
+        while pending:
+            pending = False
+            for key in list(self._open_folders):
+                iterator = self._folder_iters.get(key)
+                if iterator is None:
+                    continue
+                path = self.store.get_path(iterator)
+                if path is None or self.file_tree.row_expanded(path):
+                    continue
+                if path.get_depth() > 1:
+                    parent_path = path.copy()
+                    if not parent_path.up() or not self.file_tree.row_expanded(parent_path):
+                        continue
+                self.file_tree.expand_row(path, False)
+                pending = True
 
     def _iters_by_source(self, store):
         """Row iterators stay valid when a sort column moves the row."""
@@ -2404,24 +3105,10 @@ class _Window:
 
     def refresh_usage(self) -> None:
         view = self.session.view()
-        chunks = int(view.get("chunks", view["percent"]))
-        text = usage_text(
-            chunks=chunks,
-            server_up=view["active_slots"] > 0 and view["phase"] in ("waiting", "running"),
-            slots_ignored=bool(self.install.slots),
-        )
-        self._show(self.usage, text)
-        self.usage.set_tooltip_text(f"{TIPS['usage']} {text}".strip())
-        gpu = self.live_gpu
-        if gpu:
-            _index, total, used = gpu
-            card = f"Card memory in use: {used:,} / {total:,} MiB"
-        elif view["total_mib"]:
-            card = "Card memory in use: waiting for a reading."
-        else:
-            card = "No GPU detected. The embed server will use the CPU."
-        self._show(self.card, card)
-        self.card.set_tooltip_text(f"{TIPS['card']} {card}".strip())
+        running = view["active_slots"] if view["phase"] in ("waiting", "running") else 0
+        text = embed_server_text(running)
+        self._show(self.server_label, text)
+        self.server_label.set_tooltip_text(f"{TIPS['usage']} {text}".strip())
         self._apply_tune()
 
     def _apply_tune(self) -> None:
@@ -2443,12 +3130,9 @@ class _Window:
             article_size = item[5] if len(item) > 5 else 0
             samples.append(EmbedSample(int(size), int(chunks), float(seconds), bool(ok), str(kind), int(article_size)))
         live_kind = ""
-        book = self.session.get_book()
-        if book is not None:
-            snap = book.snapshot()
-            current = next((row for row in snap.files if row.state == "running"), None)
-            if current is not None:
-                live_kind = content_kind(current.source or current.name)
+        source = getattr(self, "_running_source", "") or ""
+        if source:
+            live_kind = content_kind(source)
         count = int(view.get("chunks", view["percent"]))
         advice = tune_advice(
             samples,
@@ -2492,38 +3176,44 @@ class _Window:
             adjustment.get_value(),
             adjustment.get_page_size(),
             adjustment.get_upper(),
+            away=bool(getattr(self, "_log_away", False)),
         )
-        if self.filter_dirty:
-            self.log_buffer.set_text("")
-            self.last_seq = 0
-            self.filter_dirty = False
-            stick = follow
-        # Inserting at the end moves the cursor, and the text view scrolls to
-        # that cursor on its own. Hold a mark when Follow is off, then put the
-        # cursor back on it so the new lines do not pull the page down.
-        anchor = None
-        if not stick:
-            anchor = self.log_buffer.create_mark(None, self._log_anchor_iter(), True)
-        added = False
-        for seq, level, msg in lines:
-            if seq <= self.last_seq:
-                continue
-            self.last_seq = seq
-            if not log_line_visible(level, show_info, show_debug, show_errors):
-                continue
-            self.log_buffer.insert(self.log_buffer.get_end_iter(), msg + "\n")
-            added = True
-        self._trim_log_pane()
-        if not added:
-            if anchor is not None:
-                self.log_buffer.delete_mark(anchor)
-            return
-        if stick or anchor is None or anchor.get_deleted():
-            self.log_buffer.place_cursor(self.log_buffer.get_end_iter())
-            self._settle_log(bottom=True)
-        else:
-            self.log_buffer.place_cursor(self.log_buffer.get_iter_at_mark(anchor))
-            self._settle_log(bottom=False, mark=anchor)
+        # New lines move the adjustment. That is not the user leaving the end.
+        self._log_pinning += 1
+        try:
+            if self.filter_dirty:
+                self.log_buffer.set_text("")
+                self.last_seq = 0
+                self.filter_dirty = False
+                stick = follow
+            # Inserting at the end moves the cursor, and the text view scrolls to
+            # that cursor on its own. Hold a mark when Follow is off, then put the
+            # cursor back on it so the new lines do not pull the page down.
+            anchor = None
+            if not stick:
+                anchor = self.log_buffer.create_mark(None, self._log_anchor_iter(), True)
+            added = False
+            for seq, level, msg in lines:
+                if seq <= self.last_seq:
+                    continue
+                self.last_seq = seq
+                if not log_line_visible(level, show_info, show_debug, show_errors):
+                    continue
+                self.log_buffer.insert(self.log_buffer.get_end_iter(), msg + "\n")
+                added = True
+            self._trim_log_pane()
+            if not added:
+                if anchor is not None:
+                    self.log_buffer.delete_mark(anchor)
+                return
+            if stick or anchor is None or anchor.get_deleted():
+                self.log_buffer.place_cursor(self.log_buffer.get_end_iter())
+                self._settle_log(bottom=True)
+            else:
+                self.log_buffer.place_cursor(self.log_buffer.get_iter_at_mark(anchor))
+                self._settle_log(bottom=False, mark=anchor)
+        finally:
+            self._log_pinning -= 1
 
     def _trim_log_pane(self) -> None:
         drop = log_lines_to_drop(self.log_buffer.get_line_count())
@@ -2555,15 +3245,69 @@ class _Window:
 
     def _settle_log(self, *, bottom: bool, mark=None) -> None:
         def apply_pin() -> bool:
-            adjustment = self.log_scroll.get_vadjustment()
-            if bottom:
-                adjustment.set_value(max(0.0, adjustment.get_upper() - adjustment.get_page_size()))
-            elif mark is not None and not mark.get_deleted():
-                self.log_view.scroll_to_mark(mark, 0.0, True, 0.0, 0.0)
-                self.log_buffer.delete_mark(mark)
+            self._log_pinning += 1
+            try:
+                adjustment = self.log_scroll.get_vadjustment()
+                if bottom and self.follow_check.get_active() and not self._log_away:
+                    adjustment.set_value(max(0.0, adjustment.get_upper() - adjustment.get_page_size()))
+                elif mark is not None and not mark.get_deleted():
+                    self.log_view.scroll_to_mark(mark, 0.0, True, 0.0, 0.0)
+                    self.log_buffer.delete_mark(mark)
+            finally:
+                self._log_pinning -= 1
             return False
 
         self.glib.idle_add(apply_pin, priority=self.glib.PRIORITY_LOW)
+
+    def _log_near_end(self) -> bool:
+        adjustment = self.log_scroll.get_vadjustment()
+        value = float(adjustment.get_value())
+        page = float(adjustment.get_page_size())
+        upper = float(adjustment.get_upper())
+        if page <= 0 or upper <= page + 1:
+            return True
+        return value + page >= upper - 24
+
+    def _finish_log_user(self) -> bool:
+        if not self._log_pinning and self.follow_check.get_active():
+            self._log_away = not self._log_near_end()
+        self._log_user = False
+        return False
+
+    def _arm_log_user(self, *_args) -> bool:
+        self._log_user = True
+        return False
+
+    def _on_log_user_scroll(self, *_args) -> bool:
+        self._log_user = True
+        self.glib.idle_add(self._finish_log_user)
+        return False
+
+    def _on_log_key(self, _widget, event) -> bool:
+        key = int(getattr(event, "keyval", 0) or 0)
+        # Up, Down, Page Up, Page Down, Home, End, space. Other keys are not a scroll.
+        if key in (32, 65360, 65361, 65362, 65363, 65364, 65365, 65366, 65367):
+            return self._on_log_user_scroll()
+        return False
+
+    def _watch_log_scroll(self) -> None:
+        """A scroll the user made holds the place. Lines that arrive do not."""
+
+        def on_value(_adjustment) -> None:
+            if self._log_pinning or not self._log_user:
+                return
+            if not self.follow_check.get_active():
+                return
+            self._log_away = not self._log_near_end()
+
+        self.log_scroll.get_vadjustment().connect("value-changed", on_value)
+        self.log_view.connect("scroll-event", self._on_log_user_scroll)
+        self.log_scroll.connect("scroll-event", self._on_log_user_scroll)
+        self.log_view.connect("key-press-event", self._on_log_key)
+        bar = self.log_scroll.get_vscrollbar()
+        if bar is not None:
+            bar.connect("button-press-event", self._arm_log_user)
+            bar.connect("button-release-event", self._on_log_user_scroll)
 
     def _build_repair_page(self, headed) -> None:
         gtk = self.gtk
@@ -2670,6 +3414,8 @@ class _Window:
         scrolled.set_policy(gtk.PolicyType.AUTOMATIC, gtk.PolicyType.AUTOMATIC)
         scrolled.add(tree)
         scrolled.set_min_content_height(1)
+        scrolled.set_min_content_width(1)
+        scrolled.set_propagate_natural_width(False)
         scrolled.set_vexpand(True)
         self.repair_tree = tree
         self.repair_list = scrolled
@@ -2679,6 +3425,7 @@ class _Window:
         self.repair_current_label.set_xalign(0)
         self.repair_current_label.set_hexpand(True)
         self.repair_current_label.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
+        self.repair_current_label.set_width_chars(10)
         self.repair_current_label.set_valign(gtk.Align.CENTER)
         self.repair_current_label.set_tooltip_text(TIPS["repair_file_now"])
         self.repair_current_bar = gtk.ProgressBar()
@@ -2693,6 +3440,8 @@ class _Window:
         self.repair_overall.set_hexpand(True)
         self.repair_overall.set_valign(gtk.Align.CENTER)
         self.repair_overall.set_tooltip_text(TIPS["repair_overall_bar"])
+        self.repair_current_bar.set_size_request(48, -1)
+        self.repair_overall.set_size_request(48, -1)
         repair_bars = gtk.Box(orientation=gtk.Orientation.HORIZONTAL, spacing=8)
         repair_bars.pack_start(self.repair_current_label, True, True, 0)
         repair_bars.pack_start(self.repair_current_bar, True, True, 0)
@@ -2720,11 +3469,13 @@ class _Window:
         self.repair_specs.set_tooltip_text(self.repair_specs.get_text())
         lower.pack_start(self.repair_specs, False, False, 0)
 
-        self.repair_quick = gtk.RadioButton.new_with_label_from_widget(None, "Quick repair")
-        self.repair_complete = gtk.RadioButton.new_with_label_from_widget(self.repair_quick, "Complete repair")
+        self.repair_quick = gtk.ToggleButton(label="Quick repair")
+        self.repair_complete = gtk.ToggleButton(label="Complete repair")
+        self.repair_quick.set_active(True)
         self.repair_quick.set_tooltip_text(TIPS["repair_quick"])
         self.repair_complete.set_tooltip_text(TIPS["repair_complete"])
-        buttons = gtk.Box(orientation=gtk.Orientation.HORIZONTAL, spacing=8)
+        self._bind_choice(self.repair_quick, self.repair_complete)
+        self.repair_choice = self._linked(self.repair_quick, self.repair_complete)
         self.repair_scan = gtk.Button(label="Scan")
         self.repair_start = gtk.Button(label="Start repair")
         self.repair_stop_button = gtk.Button(label="Stop")
@@ -2741,11 +3492,8 @@ class _Window:
         self.optimize_segments_tip = TIPS["repair_optimize"]
         self.optimize_segments.set_tooltip_text(TIPS["repair_optimize"])
         self.optimize_segments.connect("clicked", lambda *_args: self.on_optimize_segments())
-        buttons.pack_start(self.repair_quick, False, False, 0)
-        buttons.pack_start(self.repair_complete, False, False, 0)
-        buttons.pack_start(self.repair_scan, False, False, 0)
-        buttons.pack_start(self.repair_start, False, False, 0)
-        buttons.pack_start(self.repair_stop_button, False, False, 0)
+        self.repair_actions = self._linked(self.repair_scan, self.repair_start, self.repair_stop_button)
+        buttons = self._flow(self.repair_choice, self.repair_actions)
         buttons.set_tooltip_text(TIPS["repair_page"])
         lower.pack_start(buttons, False, False, 0)
         # Own row so the file-repair buttons keep their width on a short window.

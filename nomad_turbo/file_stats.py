@@ -6,6 +6,7 @@ closed. A file that is no longer in the library is removed.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
 import time
@@ -198,6 +199,10 @@ def _apply_rate(row: FileStat, kind: str, rate: float | None, measured: bool) ->
     return changed
 
 
+def _partial_name(source: str) -> str:
+    return hashlib.sha256(source.encode()).hexdigest() + ".json"
+
+
 def _dump(row: FileStat) -> dict:
     data = asdict(row)
     data.pop("source", None)
@@ -221,46 +226,118 @@ class FileStats:
     def __init__(self, path: Path | None):
         self.path = path
         self._lock = threading.Lock()
+        self._io = threading.Lock()
         self._rows: dict[str, FileStat] = {}
-        self._dirty = False
+        self._touched: set[str] = set()
+        self._removed = False
 
     def load(self) -> None:
         path = self.path
-        if path is None or not path.exists():
-            return
-        try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return
-        files = raw.get("files") if isinstance(raw, dict) else None
-        if not isinstance(files, dict):
+        if path is None:
             return
         rows: dict[str, FileStat] = {}
-        for source, item in files.items():
-            if not isinstance(source, str) or not isinstance(item, dict):
-                continue
-            rows[source] = _row_from(source, item)
+        if path.exists():
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                return
+            files = raw.get("files") if isinstance(raw, dict) else None
+            if isinstance(files, dict):
+                for source, item in files.items():
+                    if not isinstance(source, str) or not isinstance(item, dict):
+                        continue
+                    rows[source] = _row_from(source, item)
+        self._overlay_partial(rows)
         with self._lock:
             self._rows = rows
-            self._dirty = False
+            self._touched.clear()
+            self._removed = False
 
     def save(self) -> None:
-        with self._lock:
-            if not self._dirty or self.path is None:
-                return
-            payload = {"files": {source: _dump(row) for source, row in sorted(self._rows.items())}}
-            text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
-            path = self.path
-            self._dirty = False
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = path.with_name(path.name + ".tmp")
-            temporary.write_text(text, encoding="utf-8")
-            temporary.replace(path)
-        except OSError:
+        """Write the facts. One changed file does not rewrite the whole set."""
+        with self._io:
             with self._lock:
-                self._dirty = True
-            raise
+                if self.path is None or (not self._touched and not self._removed):
+                    return
+                path = self.path
+                one = None
+                if not self._removed and len(self._touched) == 1:
+                    source = next(iter(self._touched))
+                    row = self._rows.get(source)
+                    if row is not None:
+                        one = (source, asdict(row))
+                if one is None:
+                    copied = [(source, asdict(row)) for source, row in self._rows.items()]
+                else:
+                    copied = None
+                self._touched.clear()
+                self._removed = False
+            try:
+                if one is None:
+                    self._write_full(path, copied)
+                else:
+                    self._write_one(path, one[0], one[1])
+            except OSError:
+                with self._lock:
+                    if one is None:
+                        self._removed = True
+                    else:
+                        self._touched.add(one[0])
+                raise
+
+    def _partial_dir(self, path: Path) -> Path:
+        return path.with_name(path.name + ".d")
+
+    def _overlay_partial(self, rows: dict[str, FileStat]) -> None:
+        """Facts saved for one file since the last full write."""
+        path = self.path
+        if path is None:
+            return
+        folder = self._partial_dir(path)
+        if not folder.is_dir():
+            return
+        for child in sorted(folder.glob("*.json")):
+            try:
+                item = json.loads(child.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(item, dict):
+                continue
+            source = item.get("source")
+            fields = item.get("fields")
+            if not isinstance(source, str) or not isinstance(fields, dict):
+                continue
+            rows[source] = _row_from(source, fields)
+
+    def _write_full(self, path: Path, copied: list[tuple[str, dict]]) -> None:
+        rows = {}
+        for source, data in copied:
+            data.pop("source", None)
+            rows[source] = data
+        text = json.dumps({"files": rows}, indent=2, sort_keys=True) + "\n"
+        self._atomic_write(path, text)
+        self._clear_partial(path)
+
+    def _write_one(self, path: Path, source: str, data: dict) -> None:
+        data.pop("source", None)
+        folder = self._partial_dir(path)
+        folder.mkdir(parents=True, exist_ok=True)
+        text = json.dumps({"source": source, "fields": data}, indent=2, sort_keys=True) + "\n"
+        self._atomic_write(folder / _partial_name(source), text)
+
+    def _atomic_write(self, path: Path, text: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(path.name + ".tmp")
+        temporary.write_text(text, encoding="utf-8")
+        temporary.replace(path)
+
+    def _clear_partial(self, path: Path) -> None:
+        folder = self._partial_dir(path)
+        if not folder.is_dir():
+            return
+        for child in folder.glob("*"):
+            if child.is_file():
+                child.unlink()
 
     def get(self, source: str) -> FileStat | None:
         with self._lock:
@@ -274,7 +351,8 @@ class FileStats:
             if source not in self._rows:
                 return False
             del self._rows[source]
-            self._dirty = True
+            self._touched.discard(source)
+            self._removed = True
             return True
 
     def prune(self, present: set[str]) -> list[str]:
@@ -284,7 +362,9 @@ class FileStats:
             for source in removed:
                 del self._rows[source]
             if removed:
-                self._dirty = True
+                for source in removed:
+                    self._touched.discard(source)
+                self._removed = True
             return removed
 
     def priorities(self) -> set[str]:
@@ -374,7 +454,7 @@ class FileStats:
                 row.measured_eta_seconds = int(eta_seconds)
                 changed = True
             if changed:
-                self._dirty = True
+                self._touch(source)
 
     def note_measurement(
         self,
@@ -412,7 +492,7 @@ class FileStats:
                 return False
             row.zim_date = value
             row.zim_known = True
-            self._dirty = True
+            self._touch(source)
             return True
 
     def set_priority(self, source: str, on: bool) -> None:
@@ -422,17 +502,21 @@ class FileStats:
             if row.priority == on:
                 return
             row.priority = on
-            self._dirty = True
+            self._touch(source)
+
+    def _touch(self, source: str) -> None:
+        """The caller holds the library lock."""
+        self._touched.add(source)
 
     def _ensure(self, source: str) -> FileStat:
         row = self._rows.get(source)
         if row is None:
             row = FileStat(source=source)
             self._rows[source] = row
-            self._dirty = True
+            self._touch(source)
         return row
 
     def _assign(self, row: FileStat, key: str, value) -> None:
         if getattr(row, key) != value:
             setattr(row, key, value)
-            self._dirty = True
+            self._touch(row.source)

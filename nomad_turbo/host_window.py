@@ -1,6 +1,6 @@
 """Host meters for the side pane.
 
-The header checkbox shows and hides this pane. Sampling runs only while it
+The header button shows and hides this pane. Sampling runs only while it
 is shown. The main window remembers the pane's width.
 """
 
@@ -10,10 +10,12 @@ from nomad_turbo.host import (
     HostPoint,
     HostSampler,
     cpu_caption,
-    disk_caption,
+    disk_line,
+    disk_series,
     gpu_caption,
     plot_segments,
     ram_caption,
+    rate_ceiling,
     vram_caption,
 )
 from nomad_turbo.tips import TIPS
@@ -22,6 +24,8 @@ _CPU = (0.35, 0.68, 0.95)
 _RAM = (0.35, 0.80, 0.72)
 _GPU = (0.92, 0.62, 0.28)
 _VRAM = (0.86, 0.75, 0.32)
+_READ = (0.35, 0.62, 0.95)
+_WRITE = (0.90, 0.42, 0.38)
 
 
 def _stroke(cr, segments, rgb, bottom: int, fill: bool) -> None:
@@ -79,13 +83,6 @@ class HostPanel:
         self.ram_label = self._caption(gtk, "RAM")
         self.gpu_label = self._caption(gtk, "GPU")
         self.vram_label = self._caption(gtk, "vRAM —")
-        self.disk_label = gtk.Label(label="Disk")
-        self.disk_label.set_xalign(0)
-        self.disk_label.set_yalign(0)
-        self.disk_label.set_line_wrap(True)
-        self.disk_label.set_width_chars(28)
-        self.disk_label.set_max_width_chars(32)
-        self.disk_label.set_tooltip_text(TIPS["host_disk"])
         self.cpu_area = self._graph(gtk)
         self.ram_area = self._graph(gtk)
         self.gpu_area = self._graph(gtk)
@@ -98,7 +95,11 @@ class HostPanel:
         ):
             root.pack_start(label, False, False, 0)
             root.pack_start(area, True, True, 0)
-        root.pack_start(self.disk_label, False, False, 0)
+        self._disk_widgets: list = []
+        self._disk_rows: dict = {}
+        self._disk_labels: tuple[str, ...] = ()
+        self._disk_series: dict = {}
+        self._rebuild_disks(())
         self.cpu_area.connect("draw", self._draw_cpu)
         self.ram_area.connect("draw", self._draw_ram)
         self.gpu_area.connect("draw", self._draw_gpu)
@@ -160,6 +161,44 @@ class HostPanel:
         _paint_series(cr, width, height, self._values("vram_percent"), 0, 100, _VRAM, True)
         return False
 
+    def _draw_disk(self, widget, cr, label: str) -> bool:
+        width, height = self._size(widget)
+        reads, writes = self._disk_series.get(label, ([], []))
+        cr.set_source_rgba(1, 1, 1, 0.05)
+        cr.rectangle(0, 0, width, height)
+        cr.fill()
+        high = rate_ceiling(list(reads) + list(writes))
+        _stroke(cr, plot_segments(reads, width, height, 0, high), _READ, height, True)
+        _stroke(cr, plot_segments(writes, width, height, 0, high), _WRITE, height, False)
+        return False
+
+    def _rebuild_disks(self, labels: tuple[str, ...]) -> None:
+        """One caption and one graph per disk. An empty reading stays one line."""
+        for widget in self._disk_widgets:
+            self.widget.remove(widget)
+            widget.destroy()
+        self._disk_widgets = []
+        self._disk_rows = {}
+        self._disk_labels = labels
+        if not labels:
+            caption = self._caption(self.gtk, "Disk")
+            caption.set_tooltip_text(TIPS["host_disk"])
+            self.widget.pack_start(caption, False, False, 0)
+            caption.show()
+            self._disk_widgets.append(caption)
+            return
+        for name in labels:
+            caption = self._caption(self.gtk, name)
+            caption.set_tooltip_text(TIPS["host_disk"])
+            area = self._graph(self.gtk)
+            area.connect("draw", self._draw_disk, name)
+            self.widget.pack_start(caption, False, False, 0)
+            self.widget.pack_start(area, True, True, 0)
+            caption.show()
+            area.show()
+            self._disk_widgets.extend((caption, area))
+            self._disk_rows[name] = (caption, area)
+
     def _size(self, widget) -> tuple[int, int]:
         return int(widget.get_allocated_width() or 0), int(widget.get_allocated_height() or 0)
 
@@ -172,7 +211,18 @@ class HostPanel:
         self.ram_label.set_text(ram_caption(latest))
         self.gpu_label.set_text(gpu_caption(latest))
         self.vram_label.set_text(vram_caption(latest))
-        self.disk_label.set_text(disk_caption(latest))
+        labels = tuple(disk.label for disk in latest.disks) if latest and latest.disks else ()
+        if labels != self._disk_labels:
+            self._rebuild_disks(labels)
+        by_label = {disk.label: disk for disk in (latest.disks if latest else ())}
+        self._disk_series = {
+            name: (reads, writes) for name, reads, writes in disk_series(self._points)
+        }
+        for name, (caption, area) in self._disk_rows.items():
+            disk = by_label.get(name)
+            if disk is not None:
+                caption.set_text(disk_line(disk))
+            area.queue_draw()
         for area in (self.cpu_area, self.ram_area, self.gpu_area, self.vram_area):
             area.queue_draw()
         return True

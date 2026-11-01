@@ -107,6 +107,185 @@ def priority_mark(priority: bool) -> str:
     return PRIORITY_MARK if priority else ""
 
 
+# Drawn in the folder-tree mark cell. Status text is not this mark.
+INDEXING_MARK = "▶"
+INDEXING_COLOR = "#0e6b3c"
+
+
+def row_mark(*, priority: bool, indexing: bool) -> str:
+    """Glyphs for one folder-tree file row.
+
+    The indexing glyph is only for the file that is indexing. The pinned row
+    above the tree does not use it. A priority asterisk can sit beside it.
+    """
+    text = INDEXING_MARK if indexing else ""
+    if priority:
+        text += PRIORITY_MARK
+    return text
+
+
+def then_index_action(*, measuring: bool) -> str:
+    """What the Then index half does.
+
+    ``arm`` marks the measurement already in progress so it keeps indexing.
+    ``ignore`` does nothing: it does not start a measurement or a worker.
+    """
+    if measuring:
+        return "arm"
+    return "ignore"
+
+
+FOLDER = "folder"
+# One hidden child so a closed folder still shows an arrow. It is not a file.
+# GTK stores this column as a C string, so the marker cannot contain a null.
+FOLDER_HOLD = "nomad-turbo:folder-hold"
+KB_ROOT = "kb_uploads"
+ZIM_ROOT = "zim"
+
+
+@dataclass(frozen=True)
+class TreeFolder:
+    """One directory in the library list. files are source paths, in name order."""
+
+    key: str
+    name: str
+    root: str
+    file_count: int
+    size_bytes: int
+    folders: tuple["TreeFolder", ...]
+    files: tuple[str, ...]
+
+
+def library_place(source: str, name: str, origin: str = "") -> tuple[str, tuple[str, ...]]:
+    """Which library root holds this file, and the directories above it.
+
+    A container path under kb_uploads or zim keeps those directories.
+    Anything else uses the file name at the root for its origin.
+    """
+    text = (source or "").replace("\\", "/")
+    file_name = name or text.rsplit("/", 1)[-1] or source
+    for root, marker in ((KB_ROOT, f"/{KB_ROOT}/"), (ZIM_ROOT, f"/{ZIM_ROOT}/")):
+        at = text.find(marker)
+        if at < 0:
+            continue
+        parts = [part for part in text[at + len(marker) :].split("/") if part]
+        if len(parts) <= 1:
+            return root, ()
+        return root, tuple(parts[:-1])
+    if (origin or "") == ZIM_ROOT or file_name.lower().endswith(".zim"):
+        return ZIM_ROOT, ()
+    return KB_ROOT, ()
+
+
+def _freeze_folder(key: str, name: str, root: str, node) -> TreeFolder:
+    folders = []
+    for part in sorted(node.dirs, key=str.casefold):
+        child = _freeze_folder(f"{key}/{part}", part, root, node.dirs[part])
+        if child.file_count:
+            folders.append(child)
+    files = tuple(source for _sort, source, _size in sorted(node.files, key=lambda row: (row[0], row[1])))
+    size = sum(item[2] for item in node.files) + sum(folder.size_bytes for folder in folders)
+    count = len(files) + sum(folder.file_count for folder in folders)
+    return TreeFolder(key, name, root, count, size, tuple(folders), files)
+
+
+def library_tree(items, *, hide_finished: bool = False) -> tuple[TreeFolder, ...]:
+    """kb_uploads, then zim. Indexed files stay out when hide_finished is set.
+
+    Folders and files are sorted by name. A folder with nothing left to show
+    is left out. This does not follow the indexing order.
+    """
+
+    class _Dir:
+        def __init__(self) -> None:
+            self.dirs: dict[str, _Dir] = {}
+            self.files: list[tuple[str, str, int]] = []
+
+    roots = {KB_ROOT: _Dir(), ZIM_ROOT: _Dir()}
+    for item in items:
+        if hide_finished and getattr(item, "state", "") == "indexed":
+            continue
+        root, parents = library_place(
+            getattr(item, "source", "") or "",
+            getattr(item, "name", "") or "",
+            getattr(item, "origin", "") or "",
+        )
+        node = roots[root]
+        for part in parents:
+            node = node.dirs.setdefault(part, _Dir())
+        node.files.append(
+            (
+                (getattr(item, "name", "") or "").casefold(),
+                item.source,
+                int(getattr(item, "size_bytes", 0) or 0),
+            )
+        )
+    built = []
+    for root in (KB_ROOT, ZIM_ROOT):
+        folder = _freeze_folder(root, root, root, roots[root])
+        if folder.file_count:
+            built.append(folder)
+    return tuple(built)
+
+
+def folder_store_row(folder: TreeFolder) -> tuple:
+    """One folder row, in the same order as a file row. Progress stays blank."""
+    from nomad_turbo.catalog import UPLOAD_COLOR, ZIM_COLOR
+    from nomad_turbo.progress import UNKNOWN_ETA_SECONDS, format_bytes
+
+    color = ZIM_COLOR if folder.root == ZIM_ROOT else UPLOAD_COLOR
+    count = int(folder.file_count)
+    label = "1 file" if count == 1 else f"{count} files"
+    return (
+        folder.key,
+        "",
+        folder.name,
+        FOLDER,
+        format_bytes(int(folder.size_bytes)),
+        label,
+        0,
+        EM_DASH,
+        EM_DASH,
+        EM_DASH,
+        EM_DASH,
+        "",
+        color,
+        int(folder.size_bytes),
+        0,
+        0,
+        0,
+        0,
+        UNKNOWN_ETA_SECONDS,
+    )
+
+
+def hold_store_row() -> tuple:
+    """The hidden child that gives a closed folder its arrow."""
+    from nomad_turbo.progress import UNKNOWN_ETA_SECONDS
+
+    return (
+        FOLDER_HOLD,
+        "",
+        "",
+        FOLDER,
+        "",
+        "",
+        0,
+        EM_DASH,
+        EM_DASH,
+        EM_DASH,
+        EM_DASH,
+        "",
+        "",
+        0,
+        0,
+        0,
+        0,
+        0,
+        UNKNOWN_ETA_SECONDS,
+    )
+
+
 def index_store_row(item, *, priority: bool) -> tuple:
     """One file-list row, in the same order as the list store."""
     art = getattr(item, "articles_per_minute", None)
@@ -449,8 +628,22 @@ def open_index_now(session, files: list[OrderFile] | None = None) -> str | None:
             if hit.state in ("indexed", "deferred"):
                 return None
             return target
-    listed = None
     book = session.get_book() if hasattr(session, "get_book") else None
+    # One file's state. Walking every row here ran between articles.
+    state_of = getattr(book, "state_of", None) if book is not None else None
+    if callable(state_of):
+        state = state_of(target)
+        if state is not None:
+            if state in ("indexed", "deferred"):
+                return None
+            return target
+        if files is not None:
+            return None
+        listed = book.listed() if hasattr(book, "listed") else None
+        if listed:
+            return None
+        return target
+    listed = None
     if book is not None and hasattr(book, "listed"):
         listed = book.listed()
     if listed:
@@ -534,15 +727,28 @@ def apply_sample_batch(session, *, auto: bool, recommended: int) -> int:
     return session.get_chunks()
 
 
-def measure_ending(*, from_idle: bool, pass_complete: bool) -> str:
+def measure_ending(*, from_idle: bool, pass_complete: bool, then_index: bool = False) -> str:
     """What to do when Measure has visited every unfinished file.
 
     `stop` ends the run the way Stop does. `resume` keeps indexing.
     Empty means the pass is not finished.
+    Then index keeps indexing even when the pass started while idle.
     """
     if not pass_complete:
         return ""
-    return "stop" if from_idle else "resume"
+    if not from_idle or then_index:
+        return "resume"
+    return "stop"
+
+
+def release_measure(session) -> None:
+    """The worker has left the run. Measure can be clicked again.
+
+    Stop during a sample used to leave the flag set, so the button stayed
+    off until the program was opened again.
+    """
+    if session is not None and hasattr(session, "set_measuring"):
+        session.set_measuring(False)
 
 
 def file_eta_view(

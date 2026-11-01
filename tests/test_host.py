@@ -16,6 +16,7 @@ from nomad_turbo.host import (
     cpu_times,
     device_for_mount,
     disk_caption,
+    disk_series,
     disk_sectors,
     gpu_caption,
     io_megabytes,
@@ -24,6 +25,7 @@ from nomad_turbo.host import (
     parse_gpu_csv,
     pick_cpu_temp,
     plot_segments,
+    rate_ceiling,
     storage_disks,
     vram_caption,
 )
@@ -170,6 +172,33 @@ class HostReadingTest(unittest.TestCase):
         self.assertIn("qdrant  —   Read — · Write —", text.splitlines()[1])
         self.assertEqual(disk_caption(None), "Disk")
         self.assertEqual(disk_caption(HostPoint()), "Disk")
+        self.assertEqual(rate_ceiling([None, 0.0]), 1.0)
+        self.assertAlmostEqual(rate_ceiling([10.0, None, 20.0]), 23.0)
+        series = disk_series(
+            [
+                HostPoint(disks=(DiskMeter("Library", read_mbs=None, write_mbs=None),)),
+                HostPoint(
+                    disks=(
+                        DiskMeter("Library", read_mbs=1.0, write_mbs=2.0),
+                        DiskMeter("qdrant", read_mbs=3.0, write_mbs=4.0),
+                    )
+                ),
+            ]
+        )
+        self.assertEqual([row[0] for row in series], ["Library", "qdrant"])
+        self.assertEqual(series[0][1], [None, 1.0])
+        self.assertEqual(series[0][2], [None, 2.0])
+        self.assertEqual(series[1][1], [None, 3.0])
+        self.assertEqual(series[1][2], [None, 4.0])
+        self.assertEqual(disk_series([]), [])
+        self.assertEqual(disk_series([HostPoint()]), [])
+        from nomad_turbo.host_window import HostPanel
+
+        panel = inspect.getsource(HostPanel)
+        self.assertIn("_draw_disk", panel)
+        self.assertIn("_READ", panel)
+        self.assertIn("_WRITE", panel)
+        self.assertNotIn("self.disk_label", panel)
 
     def test_the_host_window_place_round_trips_and_is_not_a_gpu_name(self):
         install = _install()
@@ -190,7 +219,7 @@ class HostReadingTest(unittest.TestCase):
         self.assertEqual(restored.host_width, 0)
         self.assertIsNone(restored.host_x)
         source = inspect.getsource(load_install)
-        for key in ("host_open", "host_x", "host_y", "host_width", "host_height"):
+        for key in ("host_open", "host_x", "host_y", "host_width", "host_height", "index_order"):
             self.assertIn(f'"{key}"', source)
         for key in ("window_x", "window_y", "window_width", "window_height", "window_max"):
             self.assertIn(f'"{key}"', source)

@@ -247,6 +247,26 @@ The Qdrant line under the page switch has not said the collection answered. Thos
 
 **Scan** changes nothing. It does not pause embedding. **Start repair** pauses file embedding, then deletes points only for ZIM and upload files that are already gone. It also removes that file's ingest row, checkpoint, and leftover embed jobs. Points for a file that is still on disk stay. A count that does not match is reported and left in place. Repair does not embed files again, and it does not wipe the whole index. The Repair section describes the page.
 
+### What does Then index do?
+
+Then index does nothing until a measurement is already going. **Then index** does not start indexing and it does not start a measurement. During a measurement it arms that same pass to keep indexing after the samples. It does not restart the pass or clear the samples already taken. The half shows that it took effect. **Measure** by itself still stops when it started from idle.
+
+### Why are some controls buttons?
+
+**Host system graphs**, **Hide finished**, **Stay on**, **Auto**, **Errors**, **Info**, **Debug**, **Follow**, the export session choice, and **Quick repair** / **Complete repair** are buttons rather than checkboxes. **Stay on** is the label. Its tip keeps the sentence "Stay on after the last file, and index new files as they arrive."
+
+### Does the vertical bar cut the buttons off?
+
+No. Dragging the vertical bar left wraps the Index controls, the Repair controls, and the log row so each control stays visible. The bar stops at that squeeze limit. The window still asks for at most 480 by 280. If the window is already that small, the host side shrinks.
+
+### Does Follow fall behind?
+
+With **Follow** on, new lines leave the newest line in view after the scroll settles, including when several updates arrive together. Scrolling away holds your place until you return to the end or turn **Follow** on again. **Follow** off does not jump.
+
+### How can I see which file is indexing?
+
+The row above the folder tree names it. That file's row in the folder tree also carries a tree mark the other file rows do not. The tree mark goes away when that file is no longer indexing.
+
 ### Is there a license?
 
 Yes. This project is under the MIT License. The terms are in the `LICENSE` file. Copyright 2026 Vibe-Dragon.
@@ -271,9 +291,9 @@ Click the icon. The window scans the library. Opening it does not start or stop 
 
 **Start indexing** pauses NOMAD's file embedding and continues from the saved article. The reader opens the ZIM once, walks to that article, and keeps going from there. **Rescan** reads the library again. It does not pause NOMAD or start indexing. **Stop** finishes the embed call already running. It does not delete the index. When the run started on Manual, unfinished files are not handed back to stock NOMAD. **Delete index** sits at the right end of the button row. You must type DELETE. Indexing does not start. ZIM files and uploads stay.
 
-The header shows the package version beside **Index**, **Repair**, and **About**. **Host** is a checkbox. It shows CPU, memory, GPU, and video memory, plus the used space, size, read speed, and write speed of each disk the library uses, in a pane beside the pages. A folder on its own disk is its own line. A vertical bar sets that pane's width. Whether it is open, and that width, are remembered. The header link opens the [Nomad TURBO Index repository](https://github.com/Vibe-Dragon/Nomad-TURBO-Index). **About** is its own page. It shows this Turbo version, states that this version was tested with Project NOMAD 1.35.1, and links to that repository and the [Project NOMAD repository](https://github.com/Crosstalk-Solutions/project-nomad). It names the author Vibe-Dragon, the MIT license, Copyright 2026, that these notes are updated when I get to it, and that I am not responsible if Turbo messes up an index.
+The header shows the package version beside **Index**, **Repair**, and **About**. **Host system graphs** is a button. It shows CPU, memory, GPU, and video memory, plus a read graph and a write graph for each disk indexing uses and for the disk that holds the knowledge base. A folder on its own disk is its own graph. The blue line is read and the red line is write. A vertical bar sets that pane's width. Dragging it left wraps the Index controls, the Repair controls, and the log row so they stay visible, and the bar stops at the narrowest width those controls still fit. The window still asks for at most 480 by 280. If the window is already that small, the host side shrinks. Whether the pane is open, and that width, are remembered. **Order** and **Hide finished** sit on that header. The order is remembered. The header link opens the [Nomad TURBO Index repository](https://github.com/Vibe-Dragon/Nomad-TURBO-Index). **About** is its own page. It shows this Turbo version, states that this version was tested with Project NOMAD 1.35.1, and links to that repository and the [Project NOMAD repository](https://github.com/Crosstalk-Solutions/project-nomad). It names the author Vibe-Dragon, the MIT license, Copyright 2026, that these notes are updated when I get to it, and that I am not responsible if Turbo messes up an index.
 
-The file list is the part that grows. On Index, the current-file bar and the library bar share one row under the list. The optimization bar sits above the list and appears when indexing is waiting on a segment rewrite. The usage line and the card line share the next row. The usage line reads `<chunks> chunks per call. Embed server: idle.` Once a run has started the server, that line says `One embed server is running.` The card line on that same row reads `Card memory in use: <used> / <total> MiB`, or `No GPU detected. The embed server will use the CPU.` The stats line is under those. **Stay on after the last file** shares the button row with **Start indexing**, **Stop**, **Rescan**, and **Export log**. **Embed batch**, the chunk field, **Recommended**, and **Auto** are on that same row, between **Export log** and **Delete index**. At the default window size, with the log open, each file list is at least half its page. Extra height goes to the list. Hover any button, checkbox, column heading, progress bar, or those lines for what they do.
+The file list is the part that grows. On Index, the library bar under the list is the full width of the list. The optimization bar sits above the list and appears when indexing is waiting on a segment rewrite. The stats line is under the library bar. **Start indexing**, **Stop**, **Rescan**, and **Stay on** are one group of buttons. **Measure** and **Then index** are the two halves of one button. **Auto**, the chunk field, **Recommended**, and the embed-server count are the embed-batch group. **Delete index** stays apart at the end. When the page is narrow those groups wrap, and the list gives up that height. The chunk count is the number in the field. The count beside **Recommended** is how many embed servers are running. Card memory is on the host graphs. At the default window size, with the log open, each file list is at least half its page. Extra height goes to the list. Hover any button, column heading, progress bar, or those lines for what they do.
 
 The Qdrant line sits under the Index / Repair / About switch. **Start indexing**, **Delete index**, **Scan**, and **Start repair** stay off until that line says `Qdrant is ready for changes.` **Rescan** does not wait.
 
@@ -281,7 +301,7 @@ The window edges resize the whole window. The smallest size it asks for is 480 b
 
 If Turbo dies while the embed queue is paused, the next time the window opens it puts the ingest policy back and resumes NOMAD embedding. If a repair delete may still be running, embedding stays paused. `nomad-turbo recover` does the same thing.
 
-**Stay on after the last file** keeps Turbo in control when the queue is empty, so files that arrive later are indexed by Turbo. Off, which is the default, Turbo stops and the ingest policy returns to the value found at Start. When the run started on Manual, stock NOMAD does not start embedding.
+**Stay on** keeps Turbo in control when the queue is empty, so files that arrive later are indexed by Turbo. The button's tip is the sentence "Stay on after the last file, and index new files as they arrive." Off, which is the default, Turbo stops and the ingest policy returns to the value found at Start. When the run started on Manual, stock NOMAD does not start embedding.
 
 Closing the window while a run is going hides it to the tray. The tray menu can show the window or stop the run. The tray icon is the plain logo when idle, the logo on fire while indexing, and blue while a repair is running. Clicking the desktop icon brings the window back. It does not start or stop the run.
 
@@ -289,8 +309,8 @@ Closing the window while a run is going hides it to the tray. The tray menu can 
 
 The Index page is the library list.
 
-- **File.** Blue names are ZIM files. Amber names are uploads. Hover a row for the full path. A red asterisk to the left of the name means that file is prioritized.
-- **File type.** zim, pdf, docx, epub, txt, md, rtf, or an image extension such as jpg or png.
+- **File.** Blue names are ZIM files. Amber names are uploads. `kb_uploads` and `zim` are folders. Click the arrow to open or close one. They start closed. A closed folder does not keep its files in the list. Hover a row for the full path. A red asterisk to the left of the name means that file is prioritized. The folder-tree row of the file that is indexing carries a tree mark the other file rows do not. The pinned row above the tree still names that file. The tree mark goes away when that file is no longer indexing.
+- **File type.** zim, pdf, docx, epub, txt, md, rtf, an image extension such as jpg or png, or folder.
 - **Size.** The file on disk.
 - **Status.** Waiting, indexing, indexed, partial, failed, or needs NOMAD.
 - **Progress.** How far this file is through its articles.
@@ -300,13 +320,13 @@ The Index page is the library list.
 - **chk/s.** Chunks per second for the file being indexed.
 - **ETA.** Time left for this file. After Measure, a sampled file keeps that ETA.
 
-**Order** chooses which unfinished file comes next, and the file list follows that same order. The file already in progress stays at the top and keeps going. Prioritized files come next, in that order, and finished files stay at the bottom. **Hide finished** takes the indexed files out of the list. Right-click a row for **Index now**, to set or clear priority, or for **Details**. Details shows the file's size, location on disk, download date, ZIM date, article and chunk counts, slowest and fastest speeds, the last measured ETA, and whether it is prioritized. Those facts are saved and come back the next time Turbo opens. A file that leaves the library is forgotten. Priority comes back with them. **Measure** indexes each unfinished file for about five minutes, then resumes a run that was already going, or stops the way **Stop** does when Measure started from idle.
+**Order** chooses which unfinished file comes next. The file already in progress keeps going. Prioritized files come next, in that order. The list itself is the `kb_uploads` and `zim` folder tree, with folders before files and both in name order. The file being indexed is also pinned above that tree and stays there while the tree scrolls. **Hide finished** takes indexed files out of the tree, and hides a folder that only held those files. Right-click a file for **Index now**, to set or clear priority, or for **Details**. Details shows the file's size, location on disk, download date, ZIM date, article and chunk counts, slowest and fastest speeds, the last measured ETA, and whether it is prioritized. Those facts are saved and come back the next time Turbo opens. A file that leaves the library is forgotten. Priority comes back with them. **Measure** indexes each unfinished file for about five minutes, then resumes a run that was already going, or stops the way **Stop** does when Measure started from idle. **Then index** does nothing until a measurement is already going. It does not start indexing and it does not start a measurement. During a measurement it arms that same pass to keep indexing after the samples, including a pass that started while idle, without restarting the pass or clearing the samples already taken. The half shows that it took effect. **Measure** stays clickable again once the run is idle.
 
-The file being indexed has its own bar. The library bar on the same row is the whole library, weighed by file size, and the time left for what remains. **Embed batch** is the chunk field on the button row, between **Export log** and **Delete index**. Typing a count during a run changes the next embed call.
+The library bar under the list is the whole library, weighed by file size, and the time left for what remains. The file being indexed is the row above the tree, so that bar does not repeat its name. **Embed batch** is the chunk field in the embed-batch group, with **Auto**, **Recommended**, and the server count. **Delete index** stays apart at the end. Typing a count during a run changes the next embed call. The label beside **Recommended** says how many embed servers are running.
 
 An optimization bar appears above the file list while indexing is paused so a segment can be rewritten. Each new pause starts that bar's clock over. Qdrant does not report how far the in-memory build is, so the bar moves without a percent. The stats line counts articles per minute, chunks per minute, skipped pages, and bad pages. Skipped pages had no text. Bad pages could not be read or parsed. A long page is indexed in full.
 
-The list keeps the file being indexed at the top. Drag a column edge to resize it. That width is remembered.
+The file being indexed stays in its own row above the folder tree. Column headings sit on that row. Drag a column edge to resize it. That width is remembered, and the tree below uses the same edges. Extra space stays on the last column.
 
 ## Resource spikes while indexing
 
@@ -340,7 +360,7 @@ Reading a ZIM and writing the index share the disk. When the disk is saturated, 
 
 ### Start spends a short while loading the model
 
-The embed server loads the model once when a run starts. The log says `embedder not ready yet` until that load finishes. Card memory steps up by the model and stays there. The usage line then says `One embed server is running.`
+The embed server loads the model once when a run starts. The log says `embedder not ready yet` until that load finishes. Card memory steps up by the model and stays there. The count beside **Recommended** then says `1 embed server`.
 
 ### One page holds the article count
 
@@ -348,11 +368,11 @@ A very long page is read and split before its chunks are stored. The article cou
 
 ## Log
 
-The Log row shows and hides the log. **Errors**, **Info**, and **Debug** only change which lines the pane draws. The log file still records every line. **Follow** jumps to the newest line and stays there. Scroll up to hold your place. Turn Follow off and the page stays where it is while new lines arrive.
+The Log row shows and hides the log. **Errors**, **Info**, and **Debug** only change which lines the pane draws. The log file still records every line. **Follow** jumps to the newest line and stays there, including when several lines arrive before the page has scrolled. Scroll away to hold your place. That place stays until you return to the end or turn **Follow** on again. **Follow** off does not jump.
 
-Opening the window starts a new session log. The log that was already there is kept as the last session. Older session logs are deleted. **Export log** asks whether to save the current session or that last one, including lines the checkboxes are hiding. The suggested name is `nomad-turbo-log.txt`, or `nomad-turbo-previous-log.txt` for the last session. If the window crashed, open it again and export the last session.
+Opening the window starts a new session log. The log that was already there is kept as the last session. Older session logs are deleted. **Export log** is on the log row, at the right of **Errors**, **Info**, **Debug**, and **Follow**. **Log help** is to the right of **Export log**. **Export log** asks whether to save the current session or that last one, including lines the log buttons are hiding. **Current session** and **Last session** are buttons, and one of them is selected. The suggested name is `nomad-turbo-log.txt`, or `nomad-turbo-previous-log.txt` for the last session. If the window crashed, open it again and export the last session.
 
-**Log help**, beside About, opens a window that explains the lines Turbo writes on purpose. A warning or traceback that window does not name is the program reporting what it hit.
+**Log help** opens a window that explains the lines Turbo writes on purpose. A warning or traceback that window does not name is the program reporting what it hit.
 
 On a long run the pane drops lines it has already shown, so the window still answers the close button. The session file keeps the lines.
 
@@ -360,7 +380,7 @@ On a long run the pane drops lines it has already shown, so the window still ans
 
 Repair is the second page. It does not embed files, and it does not wipe the collection. It finds index entries whose library file is gone, and **Start repair** can delete those entries. **Delete index** is the other button, on the Index page, and it asks you to type DELETE.
 
-**Quick repair** and **Complete repair** are the two modes. Both **Scan** and **Start repair** use the mode that is selected. Those two modes share the row under the file list with **Scan**, **Start repair**, and **Stop**. The file list takes the spare height on this page, the same way the Index list does. The longer repair instructions are on the status line's tip.
+**Quick repair** and **Complete repair** are buttons, and exactly one is selected. Quick is the default. Both **Scan** and **Start repair** use the mode that is selected. **Scan**, **Start repair**, and **Stop** are grouped beside that choice. **Optimize stuck segments** stays on its own row. The file list takes the spare height on this page, the same way the Index list does. The controls wrap when the page is narrow, the same way the Index buttons do. The longer repair instructions are on the status line's tip.
 
 **Scan** only reads. It does not pause NOMAD, does not change the ingest policy, and does not delete points. Quick compares the files on disk with ingest rows and checkpoints. Complete also asks Qdrant to list every `source` in the collection, when the collection is answering. If it is not answering, the scan still compares files, rows, and checkpoints, and it says the source list did not return. Stop is checked between those steps. The source list itself runs until Qdrant answers.
 
@@ -434,7 +454,7 @@ Pressing the button writes `Optimize stuck segments: checking.` Then one of `ref
 
 ### The embed server is not ready
 
-Before Start, the usage line says `Embed server: idle.` After Start, Turbo waits while `llama-server` loads the model. New waits are logged as `embedder not ready yet: ...`. That wait is about three minutes. The usage line then says `One embed server is running.`
+Before Start, the count beside **Recommended** says `0 embed servers`. After Start, Turbo waits while `llama-server` loads the model. New waits are logged as `embedder not ready yet: ...`. That wait is about three minutes. The count then says `1 embed server`.
 
 `<n> chunks per call` is the size of the next embed call. `embed batch:` is Auto, or the recommendation, saying why the count moved. `embed sequences <n>, <tokens> tokens each` means that one server added or dropped a second sequence. Each sequence keeps 2048 tokens. `long calls were slower with 2 sequences, staying at 1` means it went back to one sequence.
 

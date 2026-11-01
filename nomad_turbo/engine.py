@@ -62,6 +62,7 @@ from nomad_turbo.schedule import (
     interrupt_outcome,
     measure_ending,
     open_index_now,
+    release_measure,
     pick_next,
 )
 from nomad_turbo.session import Session
@@ -86,6 +87,11 @@ from nomad_turbo.store import (
 )
 
 log = logging.getLogger("nomad_turbo")
+
+# A small file can spare a path list, used to skip articles already stored.
+# A larger file resumes from its checkpoint. Listing every path would walk
+# the index, and an empty skip set is not the same as an empty file.
+_PATH_LIST_LIMIT = 2000
 
 # How often the library is compared with the queue while a run is going.
 SCAN_SECONDS = 5
@@ -525,8 +531,26 @@ class _LiveFile:
             return self.source
 
 
+# Set while a run is inside a file. A write hold then reuses the last
+# download check instead of walking zim/ and kb_uploads again.
+_library_live: _LiveFile | None = None
+_downloads_seen = False
+
+
 def _sync_library(install: Install, session: Session | None, live: _LiveFile) -> None:
-    """Show files that just arrived, and clear entries for files NOMAD removed."""
+    """Show files that just arrived, and clear entries for files NOMAD removed.
+
+    The folders are walked when nothing is indexing. During a file, only
+    that file's own path is checked, which is not a folder walk.
+    """
+    current = live.current()
+    if current:
+        host = _library_host(install, current)
+        if host is not None and not host.exists():
+            if not live.retire.is_set():
+                log.info("%s disappeared while it was indexing. Its entries will be cleared.", current)
+                live.retire.set()
+        return
     book = session.get_book() if session else None
     present = getattr(book, "ensure_present", None)
     for host, kind, source in _sources(install, include_fresh=True):
@@ -755,15 +779,29 @@ def _library_host(install: Install, source: str) -> Path | None:
 
 
 def _downloads_pending(install: Install) -> bool:
+    """True when a download is still being written into the library.
+
+    While a file is indexing this returns the last answer and does not walk
+    the folders. The next gap between files looks again.
+    """
+    global _downloads_seen
+    live = _library_live
+    if live is not None and live.current():
+        return _downloads_seen
     root = Path(install.storage_host)
+    found = False
     for folder in ("zim", "kb_uploads"):
         base = root / folder
         if not base.is_dir():
             continue
         for path in base.rglob("*"):
             if path.name.endswith(".tmp") or path.name.endswith(".part"):
-                return True
-    return False
+                found = True
+                break
+        if found:
+            break
+    _downloads_seen = found
+    return found
 
 
 def _work_list(install: Install, jobs: list[dict], finished: set[str]) -> list[FileWork]:
@@ -1022,6 +1060,22 @@ def _after_batch(pool: EmbedPool, session: Session | None, install: Install) -> 
     pool.publish(session)
 
 
+def resume_log(source: str, articles: int, points: int | None, paths: set[str] | None) -> str:
+    """One line when a file starts or continues.
+
+    `paths` is the article-path skip set when it was loaded. None means that
+    set was not loaded. A large file still continues at `articles` from its
+    checkpoint. The point count is what is already stored.
+    """
+    if points is None:
+        detail = "point count unavailable"
+    elif paths is None:
+        detail = f"{points} points already stored, article paths not re-listed"
+    else:
+        detail = f"{len(paths)} paths already stored"
+    return f"indexing {source} from article {articles} ({detail})"
+
+
 def _index_zim(
     install: Install,
     pool: EmbedPool,
@@ -1033,8 +1087,11 @@ def _index_zim(
 ) -> None:
     _load_point_active(install, work)
     already = count_source(install, work.source)
-    stored = existing_paths(install, work.source) or set() if already is not None and already <= 2000 else set()
-    log.info("indexing %s from article %s (%s paths already stored)", work.source, work.articles, len(stored))
+    paths: set[str] | None = None
+    if already is not None and already <= _PATH_LIST_LIMIT:
+        paths = existing_paths(install, work.source)
+    stored = paths or set()
+    log.info("%s", resume_log(work.source, work.articles, already, paths))
     _report(session, work, "running")
     proc = start_extract(
         install,
@@ -1432,8 +1489,13 @@ def settle_file_stop(install: Install, session: Session | None, work: FileWork, 
 
 
 def finish_measure_pass(session, stop: threading.Event) -> str:
-    """End Measure. Idle starts stop the run. A run already going keeps indexing."""
-    action = measure_ending(from_idle=bool(session.measure_from_idle()), pass_complete=True)
+    """End Measure. Idle starts stop the run. Then index, or a run already going, keeps indexing."""
+    then_index = bool(session.measure_then_index()) if hasattr(session, "measure_then_index") else False
+    action = measure_ending(
+        from_idle=bool(session.measure_from_idle()),
+        pass_complete=True,
+        then_index=then_index,
+    )
     session.set_measuring(False)
     if action == "stop":
         session.set_note("Measure finished.")
@@ -1564,6 +1626,15 @@ def _queue_batch(install: Install, session, jobs: list[dict], finished: set[str]
     return [item for item in _work_list(install, jobs, finished) if item.source not in failed]
 
 
+def article_stay_reason(session, source: str, sample_started, now: float, armed_epoch: int = 0):
+    """Whether to leave the file in progress after the embed call already running.
+
+    Index now, a priority mark, and Measure come from the session. An ordinary
+    order change stays. This does not snapshot the library.
+    """
+    return engine_switch_reason(session, source, sample_started, now, armed_epoch)
+
+
 def _next_work(install: Install, pool, session, batch: list[FileWork], stop: threading.Event):
     """The one file this pass should index, plus the measure clock and priority epoch.
 
@@ -1688,10 +1759,19 @@ def execute(
             name="nomad-turbo-library",
             daemon=True,
         )
+        global _library_live
+        _library_live = live
         watch_thread.start()
         idle_note = ""
         try:
             while not stop.is_set():
+                # The watch waits out its timer. Apply adds and removals
+                # before the next file is chosen, not during the current one.
+                if live.current() is None:
+                    try:
+                        _sync_library(install, session, live)
+                    except Exception:
+                        log.exception("library scan failed")
                 pending = _queue_has_work(session, finished, failed)
                 if pending is False:
                     batch = []
@@ -1754,8 +1834,7 @@ def execute(
                             live = clock()
                             if live is not None:
                                 moment = live
-                    rows = _order_rows(batch, session) if session is not None else None
-                    return engine_switch_reason(session, source, moment, time.monotonic(), epoch, rows)
+                    return article_stay_reason(session, source, moment, time.monotonic(), epoch)
 
                 live.begin(work.source)
                 try:
@@ -1821,6 +1900,7 @@ def execute(
                 finally:
                     live.end()
         finally:
+            _library_live = None
             watch_stop.set()
             watch_thread.join(timeout=30)
             if watch_thread.is_alive():
@@ -1858,6 +1938,9 @@ def execute(
         _status(**status_fields)
         if manage_icon:
             write_shortcut(False)
+        # After the thread's work is done, including a sample Stop cut short.
+        # Clearing earlier would make Measure look idle while handoff is still running.
+        release_measure(session)
 
 
 def os_cpu() -> int:

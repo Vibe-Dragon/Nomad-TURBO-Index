@@ -42,6 +42,7 @@ class Session:
         self._index_now: str | None = None
         self._measuring = False
         self._measure_from_idle = False
+        self._measure_then_index = False
         self._measure_clock: float | None = None
         self._sampled: set[str] = set()
         self._zim_dates: dict[str, str] = {}
@@ -229,11 +230,16 @@ class Session:
             if source is None or self._index_now == source:
                 self._index_now = None
 
-    def start_measure(self, *, from_idle: bool) -> None:
-        """Begin a measure pass and start the 300s clock for the file already running."""
+    def start_measure(self, *, from_idle: bool, then_index: bool = False) -> None:
+        """Begin a measure pass and start the 300s clock for the file already running.
+
+        `then_index` keeps indexing after the samples when this pass started idle.
+        A pass started during a run already keeps indexing.
+        """
         with self._lock:
             self._measuring = True
             self._measure_from_idle = bool(from_idle)
+            self._measure_then_index = bool(then_index)
             self._sampled = set()
             self._measure_clock = time.monotonic()
 
@@ -256,6 +262,7 @@ class Session:
             if not on:
                 self._sampled = set()
                 self._measure_clock = None
+                self._measure_then_index = False
 
     def measuring(self) -> bool:
         with self._lock:
@@ -264,6 +271,23 @@ class Session:
     def measure_from_idle(self) -> bool:
         with self._lock:
             return self._measure_from_idle
+
+    def measure_then_index(self) -> bool:
+        with self._lock:
+            # A session built before this field existed still answers after its class is rebound.
+            return bool(getattr(self, "_measure_then_index", False))
+
+    def arm_then_index(self) -> bool:
+        """Keep indexing after the measurement that is already running.
+
+        Returns False when nothing is being measured. Does not restart the
+        pass, reset the sample clock, or clear files already sampled.
+        """
+        with self._lock:
+            if not self._measuring:
+                return False
+            self._measure_then_index = True
+            return True
 
     def note_sampled(self, source: str) -> None:
         with self._lock:

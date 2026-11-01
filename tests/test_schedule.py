@@ -27,28 +27,38 @@ from nomad_turbo.schedule import (
     COL_MARK,
     COL_NAME,
     COL_SIZE,
+    COL_STATUS,
     COL_TYPE,
     EM_DASH,
+    FOLDER,
+    FOLDER_HOLD,
     INDEX_HEADERS,
     MEASURE_SECONDS,
     PRIORITY_COLOR,
     PRIORITY_MARK,
     OrderFile,
+    INDEXING_MARK,
     apply_sample_batch,
     engine_switch_reason,
     file_eta_view,
     file_type_label,
     files_for_list_order,
+    folder_store_row,
+    hold_store_row,
     index_store_row,
+    library_place,
+    library_tree,
     list_display_order,
     measure_ending,
     measure_start_chunks,
+    release_measure,
     ordered_sources,
     order_choice_labels,
     pick_next,
     row_menu_labels,
     sample_expired,
     sum_known_etas,
+    then_index_action,
 )
 from nomad_turbo.session import Session
 from nomad_turbo.slots import safe_call_chunks
@@ -1099,6 +1109,41 @@ class MeasureTest(unittest.TestCase):
         self.assertEqual(measure_ending(from_idle=True, pass_complete=False), "")
         self.assertEqual(measure_ending(from_idle=True, pass_complete=True), "stop")
         self.assertEqual(measure_ending(from_idle=False, pass_complete=True), "resume")
+        self.assertEqual(measure_ending(from_idle=True, pass_complete=True, then_index=True), "resume")
+        self.assertEqual(measure_ending(from_idle=True, pass_complete=False, then_index=True), "")
+        self.assertEqual(then_index_action(measuring=False), "ignore")
+        idle = Session(8)
+        self.assertFalse(idle.arm_then_index())
+        self.assertFalse(idle.measuring())
+        self.assertFalse(idle.measure_then_index())
+        idle.start_measure(from_idle=True)
+        clock = idle.measure_clock()
+        idle.note_sampled("kept.pdf")
+        sampled = idle.sampled()
+        self.assertEqual(then_index_action(measuring=idle.measuring()), "arm")
+        self.assertTrue(idle.arm_then_index())
+        self.assertEqual(idle.measure_clock(), clock)
+        self.assertEqual(idle.sampled(), sampled)
+        self.assertTrue(idle.measure_from_idle())
+        self.assertEqual(
+            measure_ending(
+                from_idle=idle.measure_from_idle(),
+                pass_complete=True,
+                then_index=idle.measure_then_index(),
+            ),
+            "resume",
+        )
+        plain = Session(8)
+        plain.start_measure(from_idle=True)
+        self.assertFalse(plain.measure_then_index())
+        self.assertEqual(
+            measure_ending(
+                from_idle=plain.measure_from_idle(),
+                pass_complete=True,
+                then_index=plain.measure_then_index(),
+            ),
+            "stop",
+        )
         stop = threading.Event()
         with mock.patch.object(engine, "set_policy", side_effect=AssertionError("policy")):
             resumed = engine.finish_measure_pass(session, stop)
@@ -1113,6 +1158,25 @@ class MeasureTest(unittest.TestCase):
         self.assertEqual(ended, "stop")
         self.assertTrue(idle_stop.is_set())
         self.assertFalse(session.measuring())
+        session.start_measure(from_idle=True, then_index=True)
+        self.assertTrue(session.measure_then_index())
+        kept = threading.Event()
+        with mock.patch.object(engine, "set_policy", side_effect=AssertionError("policy")):
+            continued = engine.finish_measure_pass(session, kept)
+        self.assertEqual(continued, "resume")
+        self.assertFalse(kept.is_set())
+        self.assertFalse(session.measuring())
+        self.assertFalse(session.measure_then_index())
+        self.assertEqual(session.view()["note"], "Indexing.")
+        session.start_measure(from_idle=True)
+        self.assertTrue(session.measuring())
+        release_measure(session)
+        self.assertFalse(session.measuring())
+        release_measure(None)
+        engine_source = Path("nomad_turbo/engine.py").read_text(encoding="utf-8")
+        window_source = Path("nomad_turbo/window.py").read_text(encoding="utf-8")
+        self.assertIn("release_measure(session)", engine_source)
+        self.assertIn("schedule.release_measure(self.session)", window_source)
 
     def test_measure_times_the_file_already_indexing(self):
         source = "/app/storage/kb_uploads/current.pdf"
@@ -1324,6 +1388,85 @@ class MeasureTest(unittest.TestCase):
         self.assertEqual(sum_known_etas([("pending", 150), ("indexed", 0)]), 150)
 
 
+def _tree_keys(store, parent=None):
+    rows = []
+    iterator = store.iter_children(parent)
+    while iterator is not None:
+        rows.append((store.get_value(iterator, 0), _tree_keys(store, iterator)))
+        iterator = store.iter_next(iterator)
+    return rows
+
+
+class LibraryTreeTest(unittest.TestCase):
+    def test_uploads_and_zims_keep_their_directories(self):
+        items = [
+            SimpleNamespace(
+                source="/app/storage/kb_uploads/textbooks/biology/Biology-2e_-_WEB.pdf",
+                name="Biology-2e_-_WEB.pdf",
+                origin="upload",
+                state="indexed",
+                size_bytes=400,
+            ),
+            SimpleNamespace(
+                source="/app/storage/kb_uploads/ca-federal-law/acts/C-46.md",
+                name="C-46.md",
+                origin="upload",
+                state="pending",
+                size_bytes=20,
+            ),
+            SimpleNamespace(
+                source="/app/storage/kb_uploads/loose.pdf",
+                name="loose.pdf",
+                origin="upload",
+                state="pending",
+                size_bytes=5,
+            ),
+            SimpleNamespace(
+                source="/app/storage/zim/wikipedia_en.zim",
+                name="wikipedia_en.zim",
+                origin="zim",
+                state="running",
+                size_bytes=800,
+            ),
+            SimpleNamespace(
+                source="notes.zim",
+                name="notes.zim",
+                origin="zim",
+                state="pending",
+                size_bytes=3,
+            ),
+        ]
+        self.assertEqual(
+            library_place(items[0].source, items[0].name, "upload"),
+            ("kb_uploads", ("textbooks", "biology")),
+        )
+        roots = library_tree(items)
+        self.assertEqual([folder.name for folder in roots], ["kb_uploads", "zim"])
+        uploads, zims = roots
+        self.assertEqual(uploads.file_count, 3)
+        self.assertEqual(uploads.size_bytes, 425)
+        self.assertEqual([folder.name for folder in uploads.folders], ["ca-federal-law", "textbooks"])
+        self.assertEqual(uploads.files, ("/app/storage/kb_uploads/loose.pdf",))
+        biology = uploads.folders[1].folders[0]
+        self.assertEqual(biology.key, "kb_uploads/textbooks/biology")
+        self.assertEqual(biology.files, (items[0].source,))
+        self.assertEqual(zims.files, ("notes.zim", "/app/storage/zim/wikipedia_en.zim"))
+        row = folder_store_row(uploads)
+        self.assertEqual(len(row), 19)
+        self.assertEqual(row[COL_TYPE], FOLDER)
+        self.assertEqual(row[COL_NAME], "kb_uploads")
+        self.assertEqual(row[COL_STATUS], "3 files")
+        self.assertEqual(row[COL_ARTICLES], EM_DASH)
+        hidden = library_tree(items, hide_finished=True)
+        self.assertEqual(hidden[0].file_count, 2)
+        self.assertEqual([folder.name for folder in hidden[0].folders], ["ca-federal-law"])
+        self.assertNotIn("textbooks", [folder.name for folder in hidden[0].folders])
+        held = hold_store_row()
+        self.assertEqual(len(held), 19)
+        self.assertEqual(held[0], FOLDER_HOLD)
+        self.assertEqual(held[COL_TYPE], FOLDER)
+
+
 class IndexPageControlsTest(unittest.TestCase):
     def test_the_window_uses_the_shipped_labels(self):
         text = (ROOT / "nomad_turbo" / "window.py").read_text(encoding="utf-8")
@@ -1369,15 +1512,102 @@ class IndexPageControlsTest(unittest.TestCase):
             self.assertIn("\n".join(["headers:", *INDEX_HEADERS]), dump)
             self.assertIn("\n".join(["order:", *order_choice_labels()]), dump)
             self.assertIn("measure:\nMeasure\n", dump)
+            self.assertIn("then-index:\nThen index\n", dump)
             self.assertIn("hide:\nHide finished\n", dump)
             self.assertFalse(app.hide_finished.get_active())
             self.assertIn("menu:\nIndex now\nSet priority\nDetails\n", dump)
             self.assertIn("menu-priority:\nIndex now\nClear priority\nDetails\n", dump)
             self.assertEqual(app.measure_button.get_label(), "Measure")
+            self.assertEqual(app.then_index_button.get_label(), "Then index")
+            app.rows_ready = True
+            app.qdrant_ready = True
+            app._buttons("stopped")
+            self.assertTrue(app.measure_button.get_sensitive())
+            self.assertFalse(app.then_index_button.get_sensitive())
+            self.assertIs(app.measure_button.get_parent(), app.then_index_button.get_parent())
+            segment = app.measure_button.get_parent()
+            self.assertTrue(segment.get_style_context().has_class("linked"))
+            self.assertEqual(segment.get_spacing(), 0)
+            self.assertEqual(segment.get_children(), [app.measure_button, app.then_index_button])
+            self.assertEqual(
+                [child.get_label() for child in app.run_group.get_children()],
+                ["Start indexing", "Stop", "Rescan", "Stay on"],
+            )
+            self.assertEqual(app.keep_check.get_label(), "Stay on")
+            self.assertIn(
+                "Stay on after the last file, and index new files as they arrive",
+                app.keep_check.get_tooltip_text(),
+            )
+            for widget in (
+                app.host_button,
+                app.hide_finished,
+                app.keep_check,
+                app.tune_auto,
+                app.error_check,
+                app.info_check,
+                app.debug_check,
+                app.follow_check,
+                app.repair_quick,
+                app.repair_complete,
+            ):
+                self.assertEqual(type(widget).__name__, "ToggleButton", type(widget).__name__)
+            self.assertTrue(app.repair_quick.get_active())
+            self.assertFalse(app.repair_complete.get_active())
+            self.assertIs(app.repair_quick.get_parent(), app.repair_complete.get_parent())
+            self.assertEqual(
+                [child.get_label() for child in app.repair_actions.get_children()],
+                ["Scan", "Start repair", "Stop"],
+            )
+            threads = threading.active_count()
+            app.on_then_index(app.then_index_button)
+            self.assertFalse(app.session.measuring())
+            self.assertFalse(app.then_index_button.get_active())
+            self.assertIsNone(app.thread)
+            self.assertEqual(threading.active_count(), threads)
+            app.session.start_measure(from_idle=True)
+            clock = app.session.measure_clock()
+            app.session.note_sampled("kept.pdf")
+            sampled = set(app.session.sampled())
+            app._buttons("running")
+            self.assertFalse(app.measure_button.get_sensitive())
+            self.assertTrue(app.then_index_button.get_sensitive())
+            app.on_then_index(app.then_index_button)
+            self.assertTrue(app.session.measure_then_index())
+            self.assertEqual(app.session.measure_clock(), clock)
+            self.assertEqual(app.session.sampled(), sampled)
+            self.assertTrue(app.then_index_button.get_active())
+            self.assertIsNone(app.thread)
+            self.assertEqual(threading.active_count(), threads)
+            self.assertEqual(
+                measure_ending(
+                    from_idle=app.session.measure_from_idle(),
+                    pass_complete=True,
+                    then_index=app.session.measure_then_index(),
+                ),
+                "resume",
+            )
+            release_measure(app.session)
+            app._buttons("stopped")
+            self.assertTrue(app.measure_button.get_sensitive())
+            self.assertFalse(app.then_index_button.get_sensitive())
+            self.assertFalse(app.then_index_button.get_active())
+            self.assertIn("keep indexing", app.then_index_button.get_tooltip_text().lower())
             self.assertEqual(app.order_combo.get_active_id(), "library")
             app.session.set_order("name_asc")
             app.order_combo.set_active_id("size_desc")
             self.assertEqual(app.session.get_order(), "size_desc")
+            self.assertEqual(app.install.index_order, "size_desc")
+            from nomad_turbo.schedule import normalize_order
+
+            self.assertEqual(normalize_order("not-an-order"), "library")
+            saved = Install.from_json(Path(os.environ["NOMAD_TURBO_CONFIG"]).read_text())
+            self.assertEqual(saved.index_order, "size_desc")
+            restored = _Window(saved, Session(55), _MemoryLog(), Path(state.name) / "order.log", Gtk, GLib)
+            try:
+                self.assertEqual(restored.order_combo.get_active_id(), "size_desc")
+                self.assertEqual(restored.session.get_order(), "size_desc")
+            finally:
+                restored.window.destroy()
             self.assertIsNone(engine_switch_reason(app.session, "example.zim", None, 0, app.session.arm_priority()))
             app.file_tree.get_columns()[2].clicked()
             self.assertEqual(app.session.get_order(), "size_desc")
@@ -1389,6 +1619,16 @@ class IndexPageControlsTest(unittest.TestCase):
 
             self.assertIn('mark_cell.set_property("foreground", PRIORITY_COLOR)', text)
             self.assertIn("file_column.pack_start(mark_cell, False)", text)
+            self.assertEqual(
+                app.file_tree.get_selection().get_mode(),
+                Gtk.SelectionMode.NONE,
+            )
+            self.assertEqual(
+                app.now_tree.get_selection().get_mode(),
+                Gtk.SelectionMode.NONE,
+            )
+            self.assertNotIn("tree.set_cursor(path, None, False)", text)
+            self.assertIn('connect("test-expand-row"', text)
             self.assertEqual(cells[0].get_property("ellipsize"), Pango.EllipsizeMode.NONE)
             self.assertEqual(cells[1].get_property("ellipsize"), Pango.EllipsizeMode.MIDDLE)
             self.assertEqual(PRIORITY_COLOR, "#c0392b")
@@ -1396,7 +1636,7 @@ class IndexPageControlsTest(unittest.TestCase):
                 [CatalogRow("example.zim", "example.zim", "zim", "zim", 10, "pending")]
             )
             app.store.clear()
-            app.store.append(index_store_row(book.snapshot(now=0).files[0], priority=True))
+            app.store.append(None, index_store_row(book.snapshot(now=0).files[0], priority=True))
             self.assertEqual(app.store[0][COL_MARK], "*")
             self.assertEqual(app.store[0][COL_NAME], "example.zim")
             app.session.set_order("size_desc")
@@ -1415,15 +1655,86 @@ class IndexPageControlsTest(unittest.TestCase):
             app.session.set_priority("small.zim", True)
             app.session.set_priority("done.zim", True)
             app.refresh_rows()
-            self.assertEqual(
-                [app.store[i][0] for i in range(len(app.store))],
-                ["now.pdf", "big.zim", "small.zim", "mid.pdf", "done.zim"],
-            )
+            self.assertEqual([app.now_store[i][0] for i in range(len(app.now_store))], ["now.pdf"])
+            self.assertEqual(_tree_keys(app.store), [
+                ("kb_uploads", [(FOLDER_HOLD, [])]),
+                ("zim", [(FOLDER_HOLD, [])]),
+            ])
+            self.assertEqual(app.store[0][COL_TYPE], FOLDER)
+            self.assertEqual(app.store[0][COL_STATUS], "2 files")
+            app.file_tree.expand_row(Gtk.TreePath.new_from_indices([0]), False)
+            self.assertIn("kb_uploads", app._open_folders)
+            self.assertEqual(_tree_keys(app.store), [
+                ("kb_uploads", [("mid.pdf", []), ("now.pdf", [])]),
+                ("zim", [(FOLDER_HOLD, [])]),
+            ])
+            app.refresh_rows()
+            self.assertTrue(app.file_tree.row_expanded(Gtk.TreePath.new_from_indices([0])))
+            self.assertEqual(_tree_keys(app.store), [
+                ("kb_uploads", [("mid.pdf", []), ("now.pdf", [])]),
+                ("zim", [(FOLDER_HOLD, [])]),
+            ])
+            book = app.session.get_book()
+            epoch = book.structure_epoch
+            book.update("now.pdf", articles=4, total=10, chunks=2, state="running", now=8)
+            self.assertEqual(book.structure_epoch, epoch)
+            app.refresh_rows()
+            self.assertEqual(_tree_keys(app.store), [
+                ("kb_uploads", [("mid.pdf", []), ("now.pdf", [])]),
+                ("zim", [(FOLDER_HOLD, [])]),
+            ])
+            now_row = app.store.iter_children(app.store.get_iter_first())
+            now_row = app.store.iter_next(now_row)
+            self.assertEqual(app.store.get_value(now_row, 0), "now.pdf")
+            self.assertEqual(app.store.get_value(now_row, COL_ARTICLES), "4 / 10")
+            self.assertEqual(app.now_store[0][COL_ARTICLES], "4 / 10")
+            self.assertIn(INDEXING_MARK, app.store.get_value(now_row, COL_MARK))
+            self.assertNotIn(INDEXING_MARK, str(app.now_store[0][COL_MARK] or ""))
+            pending = app.store.iter_children(app.store.get_iter_first())
+            self.assertEqual(app.store.get_value(pending, 0), "mid.pdf")
+            self.assertNotIn(INDEXING_MARK, app.store.get_value(pending, COL_MARK) or "")
+            mark_cell = app.file_tree.get_columns()[0].get_cells()[0]
+            app._paint_tree_mark(None, mark_cell, app.store, now_row, None)
+            self.assertIn(INDEXING_MARK, mark_cell.get_property("text"))
+            app._paint_tree_mark(None, mark_cell, app.store, pending, None)
+            self.assertNotIn(INDEXING_MARK, mark_cell.get_property("text") or "")
+            book.update("now.pdf", articles=4, total=10, chunks=2, state="pending", now=9)
+            app.refresh_rows()
+            cleared = None
+            walker = app.store.iter_children(app.store.get_iter_first())
+            while walker is not None:
+                if app.store.get_value(walker, 0) == "now.pdf":
+                    cleared = walker
+                    break
+                walker = app.store.iter_next(walker)
+            self.assertIsNotNone(cleared)
+            self.assertNotIn(INDEXING_MARK, app.store.get_value(cleared, COL_MARK) or "")
+            # The rest of this window still expects the file that is indexing.
+            book.update("now.pdf", articles=4, total=10, chunks=2, state="running", now=9)
+            app.refresh_rows()
+            app.file_tree.expand_row(Gtk.TreePath.new_from_indices([1]), False)
+            self.assertEqual(_tree_keys(app.store), [
+                ("kb_uploads", [("mid.pdf", []), ("now.pdf", [])]),
+                ("zim", [("big.zim", []), ("done.zim", []), ("small.zim", [])]),
+            ])
+            zim = app.store.iter_next(app.store.get_iter_first())
+            big = app.store.iter_children(zim)
+            self.assertEqual(app.store.get_value(big, COL_MARK), PRIORITY_MARK)
             app.hide_finished.set_active(True)
-            self.assertEqual(
-                [app.store[i][0] for i in range(len(app.store))],
-                ["now.pdf", "big.zim", "small.zim", "mid.pdf"],
-            )
+            self.assertEqual([app.now_store[i][0] for i in range(len(app.now_store))], ["now.pdf"])
+            self.assertEqual(_tree_keys(app.store), [
+                ("kb_uploads", [("mid.pdf", []), ("now.pdf", [])]),
+                ("zim", [("big.zim", []), ("small.zim", [])]),
+            ])
+            self.assertEqual(app.store[1][COL_STATUS], "2 files")
+            self.assertTrue(app.file_tree.row_expanded(Gtk.TreePath.new_from_indices([0])))
+            app.file_tree.collapse_row(Gtk.TreePath.new_from_indices([0]))
+            self.assertNotIn("kb_uploads", app._open_folders)
+            self.assertEqual(_tree_keys(app.store), [
+                ("kb_uploads", [(FOLDER_HOLD, [])]),
+                ("zim", [("big.zim", []), ("small.zim", [])]),
+            ])
+            self.assertEqual([app.now_store[i][0] for i in range(len(app.now_store))], ["now.pdf"])
             app.file_stats.note_measurement(
                 "big.zim",
                 article_rate=0.5,
@@ -1447,6 +1758,34 @@ class IndexPageControlsTest(unittest.TestCase):
             )
             self.assertIsNone(app.file_stats.get("gone.zim"))
             self.assertIsNotNone(app.file_stats.get("big.zim"))
+            self.assertFalse(app.now_tree.get_columns()[0].get_expand())
+            self.assertFalse(app.file_tree.get_columns()[0].get_expand())
+            self.assertTrue(app.now_tree.get_columns()[-1].get_expand())
+            self.assertTrue(app.file_tree.get_columns()[-1].get_expand())
+            app.window.resize(1280, 640)
+            app.window.show_all()
+            for _ in range(40):
+                while Gtk.events_pending():
+                    Gtk.main_iteration_do(False)
+
+            def starts(tree):
+                x = 0
+                found = []
+                for column in tree.get_columns():
+                    found.append(x)
+                    x += column.get_width()
+                return found
+
+            self.assertGreater(app.now_tree.get_allocated_width(), 400)
+            self.assertEqual(starts(app.now_tree), starts(app.file_tree))
+            size = app.now_tree.get_columns()[2]
+            size.set_fixed_width(130)
+            app._on_column_width(size, None, "index:Size")
+            for _ in range(10):
+                while Gtk.events_pending():
+                    Gtk.main_iteration_do(False)
+            self.assertEqual(app.file_tree.get_columns()[2].get_fixed_width(), 130)
+            self.assertEqual(starts(app.now_tree), starts(app.file_tree))
         finally:
             if app is not None:
                 app.window.destroy()
@@ -1459,6 +1798,137 @@ class IndexPageControlsTest(unittest.TestCase):
             else:
                 os.environ["NOMAD_TURBO_CONFIG"] = previous_config
             state.cleanup()
+
+
+class LibraryWatchTest(unittest.TestCase):
+    def test_a_running_file_is_not_a_reason_to_walk_the_library(self):
+        directory = tempfile.TemporaryDirectory(prefix="nomad-turbo-watch-")
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        (root / "zim").mkdir()
+        (root / "kb_uploads").mkdir()
+        current_host = root / "zim" / "current.zim"
+        old_host = root / "zim" / "old.zim"
+        current_host.write_bytes(b"zim")
+        old_host.write_bytes(b"zim")
+        current = "/app/storage/zim/current.zim"
+        old = "/app/storage/zim/old.zim"
+        new = "/app/storage/kb_uploads/new.md"
+        book = ProgressBook(
+            [
+                CatalogRow(current, "current.zim", "zim", "zim", 10, "running"),
+                CatalogRow(old, "old.zim", "zim", "zim", 10, "pending"),
+            ]
+        )
+        session = Session(8)
+        session.bind_book(book)
+        install = _install(str(root))
+        live = engine._LiveFile()
+        state = root / "state"
+        state.mkdir()
+        previous_live = engine._library_live
+        previous_seen = engine._downloads_seen
+        walks = {"n": 0}
+        real_rglob = Path.rglob
+
+        def counting(self, pattern):
+            walks["n"] += 1
+            return real_rglob(self, pattern)
+
+        try:
+            with mock.patch.dict(os.environ, {"NOMAD_TURBO_STATE": str(state)}):
+                live.begin(current)
+                engine._library_live = live
+                (root / "kb_uploads" / "new.md").write_text("new", encoding="utf-8")
+                old_host.unlink()
+                with mock.patch.object(Path, "rglob", counting):
+                    with mock.patch.object(engine, "_drop_source", return_value=True):
+                        engine._sync_library(install, session, live)
+                        self.assertFalse(engine._downloads_pending(install))
+                self.assertEqual(walks["n"], 0)
+                listed = dict(book.listed())
+                self.assertIn(old, listed)
+                self.assertNotIn(new, listed)
+                self.assertFalse(live.retire.is_set())
+                current_host.unlink()
+                walks["n"] = 0
+                with mock.patch.object(Path, "rglob", counting):
+                    engine._sync_library(install, session, live)
+                self.assertEqual(walks["n"], 0)
+                self.assertTrue(live.retire.is_set())
+
+                live.end()
+                engine._library_live = None
+                with mock.patch.object(engine, "_drop_source", return_value=True):
+                    engine._sync_library(install, session, live)
+                listed = dict(book.listed())
+                self.assertNotIn(old, listed)
+                self.assertIn(new, listed)
+                self.assertEqual(listed[new], "pending")
+        finally:
+            engine._library_live = previous_live
+            engine._downloads_seen = previous_seen
+
+
+class StayDecisionTest(unittest.TestCase):
+    def test_between_articles_does_not_snapshot_the_library(self):
+        count = 3000
+        rows = [
+            CatalogRow(
+                f"/app/storage/kb_uploads/f{i}.md",
+                f"f{i}.md",
+                "upload",
+                "text",
+                1000 + i,
+                "pending",
+            )
+            for i in range(count)
+        ]
+        current = "/app/storage/zim/current.zim"
+        other = "/app/storage/kb_uploads/f7.md"
+        rows.append(
+            CatalogRow(current, "current.zim", "zim", "zim", 5000, "running", articles=10, total_articles=100, chunks=20)
+        )
+        book = ProgressBook(rows)
+        session = Session(8)
+        session.bind_book(book)
+        book.update(current, articles=12, total=100, chunks=24, state="running", now=5)
+        snaps = {"n": 0}
+        real_snapshot = book.snapshot
+
+        def counting(now=None):
+            snaps["n"] += 1
+            return real_snapshot(now)
+
+        book.snapshot = counting
+        session.request_index_now(other)
+        armed = session.arm_priority()
+        now_reason = engine.article_stay_reason(session, current, None, 0, armed)
+        self.assertEqual(now_reason, "now")
+        self.assertEqual(now_reason, engine_switch_reason(session, current, None, 0, armed))
+
+        session.clear_index_now()
+        armed = session.arm_priority()
+        session.set_order("size_desc")
+        order_reason = engine.article_stay_reason(session, current, None, 0, armed)
+        self.assertIsNone(order_reason)
+        self.assertEqual(order_reason, engine_switch_reason(session, current, None, 0, armed))
+
+        session.set_priority(other, True)
+        priority_reason = engine.article_stay_reason(session, current, None, 0, armed)
+        self.assertEqual(priority_reason, "priority")
+        self.assertEqual(priority_reason, engine_switch_reason(session, current, None, 0, armed))
+        self.assertEqual(snaps["n"], 0)
+
+        pulse = book.pulse(now=5)
+        full = book.snapshot(now=5)
+        self.assertEqual(pulse.overall_text, full.overall_text)
+        self.assertEqual(pulse.done_files, full.done_files)
+        self.assertEqual(pulse.chunks_stored, full.chunks_stored)
+        self.assertEqual(pulse.overall_fraction, full.overall_fraction)
+        self.assertEqual(len(full.files), count + 1)
+        self.assertEqual(len(pulse.files), 1)
+        self.assertEqual(pulse.files[0].source, current)
 
 
 class FileStatsTest(unittest.TestCase):
@@ -1576,6 +2046,126 @@ class FileStatsTest(unittest.TestCase):
         reloaded = FileStats(path)
         reloaded.load()
         self.assertIsNone(reloaded.get("a.pdf"))
+
+    def test_progress_rewrites_one_file_and_an_old_document_still_loads(self):
+        directory = tempfile.TemporaryDirectory(prefix="nomad-turbo-one-file-")
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        path = root / "file-stats.json"
+        stats = FileStats(path)
+        count = 3000
+        sources = [f"/app/storage/kb_uploads/law/f{i}.md" for i in range(count)]
+        for index, source in enumerate(sources):
+            stats.note_library(
+                source,
+                name=f"f{index}.md",
+                file_type="text",
+                size_bytes=2000 + index,
+                mtime=1_700_000_000.0,
+                articles=1,
+                chunks=2,
+                state="pending",
+            )
+            stats.set_priority(source, index % 2 == 0)
+            if index % 5 == 0:
+                stats.note_zim_date(source, "2024-06")
+            stats.note_rates(source, 0.5, 3.0, measured=True, eta_seconds=12)
+        stats.save()
+
+        def facts(row):
+            return (
+                row.priority,
+                row.zim_date,
+                row.zim_known,
+                row.articles,
+                row.total_articles,
+                row.chunks,
+                row.state,
+                row.measured_article_rate,
+                row.measured_chunk_rate,
+                row.last_article_rate,
+                row.last_chunk_rate,
+                row.measured_eta_seconds,
+                row.mtime,
+                row.size_bytes,
+                row.name,
+            )
+
+        first = FileStats(path)
+        first.load()
+        remembered = {source: facts(first.get(source)) for source in sources}
+        target = sources[10]
+        before = {}
+        for item in root.rglob("*"):
+            if item.is_file():
+                before[str(item.relative_to(root))] = item.read_bytes()
+        self.assertIn("file-stats.json", before)
+        self.assertGreater(len(before["file-stats.json"]), 100_000)
+
+        stats.note_progress(target, articles=40, total_articles=90, chunks=15, state="running")
+        stats.save()
+        after = {}
+        for item in root.rglob("*"):
+            if item.is_file():
+                after[str(item.relative_to(root))] = item.read_bytes()
+        self.assertEqual(before["file-stats.json"], after["file-stats.json"])
+        written = 0
+        for name, data in after.items():
+            if before.get(name) != data:
+                written += len(data)
+        self.assertLess(written, 16_384)
+        self.assertGreater(written, 0)
+
+        again = FileStats(path)
+        again.load()
+        for source, previous in remembered.items():
+            row = again.get(source)
+            self.assertIsNotNone(row)
+            if source == target:
+                self.assertEqual(row.articles, 40)
+                self.assertEqual(row.total_articles, 90)
+                self.assertEqual(row.chunks, 15)
+                self.assertEqual(row.state, "running")
+                self.assertEqual(row.priority, previous[0])
+                self.assertEqual(row.zim_date, previous[1])
+                self.assertEqual(row.measured_article_rate, previous[7])
+                self.assertEqual(row.measured_chunk_rate, previous[8])
+                self.assertEqual(row.measured_eta_seconds, previous[11])
+                continue
+            self.assertEqual(facts(row), previous)
+
+        legacy_path = root / "legacy.json"
+        legacy_path.write_text(
+            json.dumps(
+                {
+                    "files": {
+                        "/app/storage/zim/legacy.zim": {
+                            "name": "legacy.zim",
+                            "priority": True,
+                            "zim_date": "2020-01",
+                            "articles": 3,
+                            "chunks": 9,
+                            "state": "partial",
+                            "measured_article_rate": 1.5,
+                        }
+                    }
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        legacy = FileStats(legacy_path)
+        legacy.load()
+        kept = legacy.get("/app/storage/zim/legacy.zim")
+        self.assertIsNotNone(kept)
+        self.assertTrue(kept.priority)
+        self.assertEqual(kept.zim_date, "2020-01")
+        self.assertEqual(kept.articles, 3)
+        self.assertEqual(kept.chunks, 9)
+        self.assertEqual(kept.state, "partial")
+        self.assertAlmostEqual(kept.measured_article_rate, 1.5)
 
     def test_a_broken_stats_file_does_not_raise(self):
         directory = tempfile.TemporaryDirectory(prefix="nomad-turbo-bad-stats-")

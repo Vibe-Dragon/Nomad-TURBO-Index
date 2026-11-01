@@ -57,7 +57,7 @@ class HostPoint:
 
 @dataclass(frozen=True)
 class DiskMeter:
-    """One filesystem the library uses. Numbers, not a graph."""
+    """One filesystem. The pane graphs its read and its write."""
 
     label: str
     used: int | None = None
@@ -351,22 +351,56 @@ def vram_caption(point: HostPoint | None) -> str:
     return f"vRAM {point.vram_used:,} / {point.vram_total:,} MiB"
 
 
+def disk_line(disk: DiskMeter) -> str:
+    """Name, used / size, and the latest read and write for one filesystem."""
+    if disk.used is None or disk.total is None:
+        capacity = "—"
+    else:
+        capacity = f"{format_bytes(disk.used)} / {format_bytes(disk.total)}"
+    if disk.read_mbs is None or disk.write_mbs is None:
+        speed = "Read — · Write —"
+    else:
+        speed = f"Read {_rate(disk.read_mbs)} · Write {_rate(disk.write_mbs)}"
+    return f"{disk.label}  {capacity}   {speed}"
+
+
 def disk_caption(point: HostPoint | None) -> str:
     """One line per filesystem: name, used / size, read, and write."""
     if point is None or not point.disks:
         return "Disk"
-    lines = []
-    for disk in point.disks:
-        if disk.used is None or disk.total is None:
-            capacity = "—"
-        else:
-            capacity = f"{format_bytes(disk.used)} / {format_bytes(disk.total)}"
-        if disk.read_mbs is None or disk.write_mbs is None:
-            speed = "Read — · Write —"
-        else:
-            speed = f"Read {_rate(disk.read_mbs)} · Write {_rate(disk.write_mbs)}"
-        lines.append(f"{disk.label}  {capacity}   {speed}")
-    return "\n".join(lines)
+    return "\n".join(disk_line(disk) for disk in point.disks)
+
+
+def rate_ceiling(values: list[float | None]) -> float:
+    """Top of a MB/s graph. The bottom stays zero. A quiet disk still has room."""
+    peak = 0.0
+    for value in values:
+        if value is not None and value > peak:
+            peak = float(value)
+    if peak <= 0:
+        return 1.0
+    return peak * 1.15
+
+
+def disk_series(
+    points: list[HostPoint],
+) -> list[tuple[str, list[float | None], list[float | None]]]:
+    """Read and write MB/s for each disk on the newest sample, oldest first.
+
+    A disk that was missing from an older sample is a gap in that series.
+    """
+    if not points or not points[-1].disks:
+        return []
+    rows = []
+    for disk in points[-1].disks:
+        reads: list[float | None] = []
+        writes: list[float | None] = []
+        for point in points:
+            match = next((item for item in point.disks if item.label == disk.label), None)
+            reads.append(None if match is None else match.read_mbs)
+            writes.append(None if match is None else match.write_mbs)
+        rows.append((disk.label, reads, writes))
+    return rows
 
 
 def measure_disks(
