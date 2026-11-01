@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.1.6
+
+### Moderate
+
+- Delete index still removes the collection. An upload is skipped only when that file itself has stored points. The count is exact. The keyword indexes on source, content type, and collection are created with PUT, including when the collection is already there. Without those indexes an approximate count was about half the points in the collection for every file, so uploads were marked done with no points stored.
+- Hide finished and the file-list refresh keep painting. GTK 3's tree has no reorder call, and that missing call had stopped the list, the totals, and the buttons. The rows are ordered with move_before.
+
 ## 1.1.5
 
 ### Moderate

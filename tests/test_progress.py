@@ -1169,15 +1169,20 @@ class AboutAndLayoutTest(unittest.TestCase):
         self.assertIn("Project NOMAD 1.35.1", changelog)
         self.assertIn("shared rows", changelog)
         notes = changelog.split(f"## {__version__}", 1)[1].split("\n## ", 1)[0]
-        self.assertIn("Then index", notes)
-        self.assertIn("Follow", notes)
-        self.assertIn("vertical bar", notes)
-        self.assertIn("tree mark", notes)
-        self.assertIn("buttons rather than checkboxes", notes)
-        self.assertIn("Repair", notes)
+        self.assertIn("exact", notes)
+        self.assertIn("PUT", notes)
+        self.assertIn("move_before", notes)
+        released_115 = changelog.split("## 1.1.5", 1)[1].split("\n## ", 1)[0]
+        self.assertIn("Then index", released_115)
+        self.assertIn("Follow", released_115)
+        self.assertIn("vertical bar", released_115)
+        self.assertIn("tree mark", released_115)
+        self.assertIn("buttons rather than checkboxes", released_115)
+        self.assertIn("Repair", released_115)
         previous_notes = changelog.split("## 1.1.4", 1)[1].split("\n## ", 1)[0]
         self.assertIn("Auto", previous_notes)
         self.assertIn("finished embed calls", previous_notes)
+        self.assertLess(changelog.index("## 1.1.6"), changelog.index("## 1.1.5"))
         self.assertLess(changelog.index("## 1.1.5"), changelog.index("## 1.1.4"))
         released = changelog.split("## 1.1.0", 1)[1].split("\n## ", 1)[0]
         self.assertIn("150%", released)
