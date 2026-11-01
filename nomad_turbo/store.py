@@ -313,7 +313,8 @@ def collection_ready(install: Install) -> None:
     install.dimension (768), and cosine distance. Keyword indexes on source,
     content_type, and collection match what NOMAD search expects. Turbo does
     not switch the distance or the dimension. A collection that is already
-    there is not recreated.
+    there is not recreated. Missing keyword indexes are created anyway,
+    because a filtered point count is wrong without them.
     """
     base = install.qdrant_url.rstrip("/")
     name = install.collection
@@ -323,6 +324,7 @@ def collection_ready(install: Install) -> None:
     except StoreError as exc:
         info_error = str(exc)
     if info_error is None:
+        _ensure_keyword_indexes(install)
         apply_segment_cap(install)
         return
     names = _collection_names(base)
@@ -330,6 +332,7 @@ def collection_ready(install: Install) -> None:
     health_ok = _health_ok(base) if names is None else False
     action = collection_action(info_error, names, name, health_ok)
     if action == "ready":
+        _ensure_keyword_indexes(install)
         apply_segment_cap(install)
         return
     if action == "raise":
@@ -340,17 +343,36 @@ def collection_ready(install: Install) -> None:
         timeout=60,
         method="PUT",
     )
+    _ensure_keyword_indexes(install)
+    apply_segment_cap(install)
+
+
+def _ensure_keyword_indexes(install: Install) -> None:
+    """Keyword indexes Qdrant needs for an exact filtered count.
+
+    Qdrant creates a payload index with PUT. POST returns 404, and an
+    approximate count with no index is about half the points in the collection
+    for every file.
+    """
+    base = install.qdrant_url.rstrip("/")
+    name = install.collection
     for field in ("source", "content_type", "collection"):
         try:
             _request(
                 f"{base}/collections/{name}/index",
                 {"field_name": field, "field_schema": "keyword"},
-                timeout=60,
+                timeout=120,
+                method="PUT",
             )
-        except StoreError:
-            # The index already exists. Leave it.
-            pass
-    apply_segment_cap(install)
+        except StoreError as exc:
+            if index_already_exists(str(exc)):
+                continue
+            log.warning("could not index payload field %s: %s", field, exc)
+
+
+def index_already_exists(detail: str) -> bool:
+    text = detail.lower()
+    return "already" in text and "index" in text
 
 
 def apply_segment_cap(install: Install) -> None:
@@ -397,11 +419,17 @@ def upsert(install: Install, points: list[dict]) -> None:
 
 
 def count_source(install: Install, source: str) -> int | None:
+    """Exact point count for one file. None when Qdrant does not answer.
+
+    An approximate count is wrong when the source index is missing: Qdrant
+    then reports about half of the whole collection for every filter. A skip
+    decision cannot use that number.
+    """
     try:
         body = _request(
             f"{install.qdrant_url.rstrip('/')}/collections/{install.collection}/points/count",
-            {"filter": {"must": [{"key": "source", "match": {"value": source}}]}, "exact": False},
-            timeout=20,
+            {"filter": {"must": [{"key": "source", "match": {"value": source}}]}, "exact": True},
+            timeout=60,
         )
     except StoreError as exc:
         log.warning("Qdrant problem while indexing: could not count points for %s: %s", source, exc)

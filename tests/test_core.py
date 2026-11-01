@@ -1,5 +1,6 @@
 import io
 import json
+import logging
 import os
 import struct
 import tempfile
@@ -778,6 +779,118 @@ class SpeedTest(unittest.TestCase):
         self.assertIn("could not count points", "\n".join(caught.output))
         self.assertIn("timed out", "\n".join(caught.output))
 
+    def test_a_point_count_is_exact(self):
+        install = Install(
+            admin_container="admin",
+            admin_image="admin",
+            network="net",
+            redis_host="redis",
+            redis_port=6379,
+            redis_container="redis",
+            mysql_container="mysql",
+            qdrant_url="http://127.0.0.1:6333",
+            ollama_image="ollama",
+            ollama_container="ollama",
+            models_dir="/models",
+            storage_host="/storage",
+            collection="nomad_knowledge_base",
+        )
+        seen = {}
+
+        def fake_request(url, payload=None, timeout=60, method=None):
+            seen["url"] = url
+            seen["payload"] = payload
+            seen["timeout"] = timeout
+            return {"result": {"count": 0}}
+
+        original = store._request
+        store._request = fake_request
+        try:
+            self.assertEqual(store.count_source(install, "/app/storage/kb_uploads/a.md"), 0)
+        finally:
+            store._request = original
+        self.assertIn("/points/count", seen["url"])
+        self.assertTrue(seen["payload"]["exact"])
+        self.assertEqual(seen["payload"]["filter"]["must"][0]["match"]["value"], "/app/storage/kb_uploads/a.md")
+
+    def test_an_existing_collection_still_gets_keyword_indexes(self):
+        install = Install(
+            admin_container="admin",
+            admin_image="admin",
+            network="net",
+            redis_host="redis",
+            redis_port=6379,
+            redis_container="redis",
+            mysql_container="mysql",
+            qdrant_url="http://127.0.0.1:6333",
+            ollama_image="ollama",
+            ollama_container="ollama",
+            models_dir="/models",
+            storage_host="/storage",
+            collection="nomad_knowledge_base",
+        )
+        calls = []
+
+        def fake_request(url, payload=None, timeout=60, method=None):
+            calls.append((method, url, payload))
+            if url.endswith("/index"):
+                if payload["field_name"] == "source":
+                    raise store.StoreError("qdrant 400: Field source already has an index")
+                return {"result": True}
+            return {"result": {"config": {"optimizer_config": {"max_segment_size": 4 * 1024 * 1024}}}}
+
+        original = store._request
+        store._request = fake_request
+        try:
+            with self.assertLogs("nomad_turbo", level="WARNING") as caught:
+                store.collection_ready(install)
+                logging.getLogger("nomad_turbo").warning("sentinel so assertLogs has a line")
+        finally:
+            store._request = original
+        index_calls = [item for item in calls if item[1].endswith("/index")]
+        self.assertEqual([item[0] for item in index_calls], ["PUT", "PUT", "PUT"])
+        self.assertEqual(
+            [item[2]["field_name"] for item in index_calls],
+            ["source", "content_type", "collection"],
+        )
+        self.assertNotIn("could not index payload field", "\n".join(caught.output))
+        self.assertFalse(any(item[2] and item[2].get("vectors") for item in calls))
+
+    def test_a_failed_payload_index_is_logged(self):
+        self.assertTrue(store.index_already_exists("qdrant 400: Field source already has an index"))
+        self.assertFalse(store.index_already_exists("qdrant 404: "))
+        install = Install(
+            admin_container="admin",
+            admin_image="admin",
+            network="net",
+            redis_host="redis",
+            redis_port=6379,
+            redis_container="redis",
+            mysql_container="mysql",
+            qdrant_url="http://127.0.0.1:6333",
+            ollama_image="ollama",
+            ollama_container="ollama",
+            models_dir="/models",
+            storage_host="/storage",
+            collection="nomad_knowledge_base",
+        )
+
+        def fake_request(url, payload=None, timeout=60, method=None):
+            if str(url).endswith("/index"):
+                raise store.StoreError("qdrant 404: ")
+            return {"result": {"config": {"optimizer_config": {"max_segment_size": 4 * 1024 * 1024}}}}
+
+        original = store._request
+        store._request = fake_request
+        try:
+            with self.assertLogs("nomad_turbo", level="WARNING") as caught:
+                store.collection_ready(install)
+        finally:
+            store._request = original
+        text = "\n".join(caught.output)
+        self.assertIn("could not index payload field source", text)
+        self.assertIn("404", text)
+
     def test_a_missing_segment_cap_is_four_gigabytes(self):
         cap = 4 * 1024 * 1024
         update = store.segment_cap_update(None)
@@ -833,6 +946,50 @@ class EmbedRetryTest(unittest.TestCase):
 
         self.assertEqual(collect_embeddings(post, ["ok"], pause=lambda _seconds: None), [[0.5]])
         self.assertEqual(len(calls), 2)
+
+
+class _Node:
+    def __init__(self, key: str):
+        self.key = key
+
+
+class _ChildStore:
+    """The TreeStore moves this test needs. Rows stay the same objects."""
+
+    def __init__(self, keys: list[str]):
+        self.rows = [_Node(key) for key in keys]
+
+    def iter_children(self, _parent):
+        return self.rows[0] if self.rows else None
+
+    def iter_next(self, iterator):
+        index = self.rows.index(iterator) + 1
+        if index >= len(self.rows):
+            return None
+        return self.rows[index]
+
+    def get_value(self, iterator, _column):
+        return iterator.key
+
+    def move_before(self, iterator, position):
+        self.rows.remove(iterator)
+        if position is None:
+            self.rows.append(iterator)
+            return
+        self.rows.insert(self.rows.index(position), iterator)
+
+    def keys(self) -> list[str]:
+        return [row.key for row in self.rows]
+
+
+class TreeReorderTest(unittest.TestCase):
+    def test_move_before_matches_the_wanted_order(self):
+        from nomad_turbo.window import reorder_children
+
+        for current in (["c", "a", "b"], ["b", "c", "a"], ["a", "c", "b"], ["a", "b", "c"]):
+            store = _ChildStore(current)
+            reorder_children(store, None, ["a", "b", "c"], 0)
+            self.assertEqual(store.keys(), ["a", "b", "c"], current)
 
 
 if __name__ == "__main__":

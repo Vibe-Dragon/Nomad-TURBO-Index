@@ -184,6 +184,26 @@ def repair_store_types() -> tuple:
     return (str, str, str, str, int, int, str, str, str, str, wide, int)
 
 
+def reorder_children(store, parent, wanted_order, key_column: int) -> None:
+    """Put one level into wanted_order.
+
+    Gtk.ListStore has reorder(). Gtk.TreeStore on GTK 3 does not. move_before
+    does the same job, and a TreeIter stays valid across those moves.
+    """
+    by_key = {}
+    iterator = store.iter_children(parent)
+    while iterator is not None:
+        by_key[store.get_value(iterator, key_column)] = iterator
+        iterator = store.iter_next(iterator)
+    successor = None
+    for key in reversed(wanted_order):
+        iterator = by_key.get(key)
+        if iterator is None:
+            continue
+        store.move_before(iterator, successor)
+        successor = iterator
+
+
 class _MemoryLog(logging.Handler):
     def __init__(self) -> None:
         super().__init__(level=logging.DEBUG)
@@ -2944,8 +2964,7 @@ class _Window:
             iterator = self.store.iter_next(iterator)
         wanted_order = [key for _kind, key, _payload in entries]
         if order != wanted_order and len(order) == len(wanted_order) and set(order) == set(wanted_order):
-            positions = {key: index for index, key in enumerate(order)}
-            self.store.reorder(parent, [positions[key] for key in wanted_order])
+            reorder_children(self.store, parent, wanted_order, COL_SOURCE)
 
     def _hold(self, parent) -> None:
         """One hidden child, so a closed folder still has an arrow."""
