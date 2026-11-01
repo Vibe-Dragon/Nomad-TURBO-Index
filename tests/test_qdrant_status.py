@@ -1,3 +1,4 @@
+import time
 import unittest
 from datetime import datetime, timezone
 
@@ -148,6 +149,16 @@ class QdrantStatusTest(unittest.TestCase):
         cleared, remembered = indexing_problem_line(remembered, True, "")
         self.assertIn("Qdrant problem cleared", cleared)
         self.assertEqual(remembered, "")
+
+    def test_a_hung_command_is_stopped(self):
+        started = time.monotonic()
+        self.assertEqual(qdrant_status._run_captured(["sleep", "30"], 0.4), "")
+        self.assertLess(time.monotonic() - started, 3)
+
+    def test_the_status_check_does_not_read_the_container_log(self):
+        joined = " ".join(item for item in qdrant_status.probe_qdrant.__code__.co_consts if isinstance(item, str))
+        self.assertIn("container log", joined)
+        self.assertNotIn("logs", joined)
 
     def test_changes_wait_until_the_collection_answers(self):
         self.assertFalse(changes_allowed(False))

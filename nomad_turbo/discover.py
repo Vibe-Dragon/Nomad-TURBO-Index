@@ -2,6 +2,8 @@
 
 Turbo reads the containers Docker already started. It does not edit compose
 or patch the admin image. A missing boost_percent stays at or below 100.
+A stored embed_chunks value is the chunk count. A saved percent is converted
+from that percent the first time it is read.
 """
 
 from __future__ import annotations
@@ -39,7 +41,9 @@ class Install:
     dimension: int = 768
     reserve_ratio: float = 0.45
     keep_control: bool = False
-    # Auto moves the embed slider from finished calls. Off until the user turns it on.
+    # Hide indexed rows in the file list. Off shows them at the bottom.
+    hide_finished: bool = False
+    # Auto moves the embed chunk count from finished calls. Off until the user turns it on.
     tune_auto: bool = False
     per_slot_mib: int = 1024
     max_slots: int = 64
@@ -52,17 +56,26 @@ class Install:
     log_pane: int = 0
     # Dragged height of the area above the log bar. 0 keeps the older log_pane height.
     log_split: int = 0
-    # File-list height on each page. 0 leaves the spare space with the list.
+    # Older file-list splits. A saved config still loads. The list has no bar of its own.
     index_pane: int = 0
     repair_pane: int = 0
-    # 10–150 slider. None means "use reserve_ratio", which is at most 100.
-    # 150 is an overclock and is never the default for a new install.
+    # Older percent slider, 10–150. None means "use reserve_ratio", at most 100.
     boost_percent: int | None = None
-    # Separate host-meter window. None leaves the place to the window manager.
+    # Chunks the next embed call sends. None means convert boost_percent once.
+    embed_chunks: int | None = None
+    # Host side pane. host_open shows it. host_width is its width.
+    # host_x, host_y, and host_height remain from the older separate window.
+    host_open: bool = False
     host_x: int | None = None
     host_y: int | None = None
     host_width: int = 0
     host_height: int = 0
+    # Main window. None leaves the place to the window manager. 0 size uses 1180 by 820.
+    window_x: int | None = None
+    window_y: int | None = None
+    window_width: int = 0
+    window_height: int = 0
+    window_max: bool = False
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2)
@@ -234,6 +247,7 @@ def load_install() -> Install:
     for key in (
         "reserve_ratio",
         "keep_control",
+        "hide_finished",
         "tune_auto",
         "log_open",
         "log_follow",
@@ -250,10 +264,17 @@ def load_install() -> Install:
         "collection",
         "dimension",
         "boost_percent",
+        "embed_chunks",
+        "host_open",
         "host_x",
         "host_y",
         "host_width",
         "host_height",
+        "window_x",
+        "window_y",
+        "window_width",
+        "window_height",
+        "window_max",
     ):
         setattr(found, key, getattr(saved, key))
     return found

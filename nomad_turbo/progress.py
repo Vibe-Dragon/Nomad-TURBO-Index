@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass
 
 from nomad_turbo.catalog import CatalogRow, origin_for, row_color, status_word
+from nomad_turbo.schedule import file_eta_view, file_type_label, pace_text, sum_known_etas
 
 
 def format_eta(seconds: float | None) -> str:
@@ -55,6 +57,77 @@ def initial_log_split(saved: int, pane_height: int) -> int:
     else:
         top = height - LOG_HEIGHT_DEFAULT - 16
     return max(80, min(top, height - 80))
+
+
+@dataclass(frozen=True)
+class Frame:
+    """Size and place to open a window with.
+
+    x and y are None when the window manager should center the window.
+    """
+
+    x: int | None
+    y: int | None
+    width: int
+    height: int
+    maximized: bool = False
+
+
+def _title_on_screen(x: int, y: int, width: int, screen_width: int, screen_height: int) -> bool:
+    """True when the title bar still has a grab point on the screen.
+
+    An unknown screen (0) keeps the saved place. A window that is only partly
+    on screen is kept when its top edge can still be dragged.
+    """
+    if screen_width <= 0 or screen_height <= 0:
+        return True
+    if y < -8 or y > screen_height - 24:
+        return False
+    if x > screen_width - 48:
+        return False
+    if x + min(int(width), 80) < 8:
+        return False
+    return True
+
+
+def restored_frame(
+    saved_x: int | None,
+    saved_y: int | None,
+    saved_width: int,
+    saved_height: int,
+    *,
+    default_width: int,
+    default_height: int,
+    floor_width: int,
+    floor_height: int,
+    screen_width: int = 0,
+    screen_height: int = 0,
+    maximized: bool = False,
+) -> Frame:
+    """Frame to open with.
+
+    A saved size below the floor uses the default. A saved size larger than
+    the screen is shrunk to the screen. A place whose title bar is off the
+    screen is centered. Maximized is kept either way, so the unmaximized size
+    is still there when the window is restored.
+    """
+    width = int(saved_width or 0)
+    height = int(saved_height or 0)
+    if width < floor_width or height < floor_height:
+        width = int(default_width)
+        height = int(default_height)
+    if screen_width > 0:
+        width = min(width, max(int(floor_width), int(screen_width)))
+    if screen_height > 0:
+        height = min(height, max(int(floor_height), int(screen_height)))
+    width = max(int(floor_width), width)
+    height = max(int(floor_height), height)
+    x = None if saved_x is None else int(saved_x)
+    y = None if saved_y is None else int(saved_y)
+    if x is None or y is None or not _title_on_screen(x, y, width, int(screen_width or 0), int(screen_height or 0)):
+        x = None
+        y = None
+    return Frame(x, y, width, height, bool(maximized))
 
 
 def restored_log_top(saved_height: int, saved_top: int, pane_height: int) -> int:
@@ -213,12 +286,15 @@ def format_file_rate(articles_per_second: float | None, chunks_per_second: float
     return " · ".join(parts) if parts else "—"
 
 
-def usage_text(*, set_percent: int, chunks: int, server_up: bool, slots_ignored: bool = False) -> str:
-    """Set is the slider. It sizes the next embed call. One server stays up."""
+def usage_text(*, chunks: int, server_up: bool, slots_ignored: bool = False, set_percent: int | None = None) -> str:
+    """The chunk count sizes the next embed call. One server stays up.
+
+    `set_percent` is accepted so older callers still run. It is not shown.
+    A larger count is not a clock change.
+    """
+    del set_percent
     state = "One embed server is running." if server_up else "Embed server: idle."
-    text = f"Set {set_percent}% · {chunks} chunks per call. {state}"
-    if int(set_percent) > 100:
-        text += " Overclock past the detected budget."
+    text = f"{int(chunks)} chunks per call. {state}"
     if slots_ignored:
         text += " The slots setting is ignored."
     return text
@@ -276,6 +352,12 @@ class FileSnap:
     chunks_per_second: float | None = None
     rate_text: str = "—"
     eta_seconds: int | None = None
+    file_type: str = ""
+    art_text: str = "—"
+    chk_text: str = "—"
+    total_articles: int | None = None
+    mtime: float | None = None
+    walk_index: int = 0
 
 
 @dataclass
@@ -303,8 +385,11 @@ class _Row:
         self.articles = int(row.articles or 0)
         self.total = row.total_articles
         self.chunks = int(row.chunks or 0)
+        self.mtime = row.mtime
+        self.walk_index = int(row.walk_index or 0)
         self.rate = RateTracker()
         self.chunk_rate = RateTracker()
+        self.measured_rate: float | None = None
 
 
 class ProgressBook:
@@ -319,6 +404,7 @@ class ProgressBook:
         self._chunk_rate = RateTracker()
         self.skipped = 0
         self.bad = 0
+        self._stats = None
 
     def note_article(self, kind: str) -> None:
         """Count one page that was not stored. A bad page is also skipped."""
@@ -374,6 +460,9 @@ class ProgressBook:
                 row.articles = max(row.articles, row.total or row.articles)
             row.rate.push(moment, row.articles)
             self._bytes.push(moment, self._done_bytes_unlocked())
+            remembered = self._progress_fact(row)
+        if remembered is not None:
+            self._write_progress(remembered)
 
     def ensure_present(
         self,
@@ -405,11 +494,15 @@ class ProgressBook:
             return False
 
     def drop(self, source: str) -> None:
+        stats = None
         with self._lock:
             if source not in self._rows:
                 return
             del self._rows[source]
             self._order = [item for item in self._order if item != source]
+            stats = self._stats
+        if stats is not None and stats.forget(source):
+            stats.save()
 
     def listed(self) -> list[tuple[str, str]]:
         with self._lock:
@@ -424,6 +517,7 @@ class ProgressBook:
                 row.chunks = 0
                 row.rate = RateTracker()
                 row.chunk_rate = RateTracker()
+                row.measured_rate = None
             self._bytes = RateTracker()
             self._advanced = 0.0
             self._article_rate = RateTracker()
@@ -431,6 +525,85 @@ class ProgressBook:
             self._chunk_rate = RateTracker()
             self.skipped = 0
             self.bad = 0
+
+    def attach_stats(self, stats) -> None:
+        with self._lock:
+            self._stats = stats
+
+    def restore_saved(self, stats) -> None:
+        """Put remembered measurement rates back on rows that are still listed."""
+        with self._lock:
+            sources = list(self._rows)
+        saved_rates: dict[str, float] = {}
+        if stats is not None:
+            for source in sources:
+                saved = stats.get(source)
+                if saved is not None and saved.measured_article_rate:
+                    saved_rates[source] = float(saved.measured_article_rate)
+        with self._lock:
+            self._stats = stats
+            for source, rate in saved_rates.items():
+                row = self._rows.get(source)
+                if row is not None:
+                    row.measured_rate = rate
+
+    def keep_measured_rate(self, source: str) -> None:
+        """Remember this file's article pace after Measure leaves it."""
+        with self._lock:
+            row = self._rows.get(source)
+            if row is None:
+                return
+            rate = row.rate.per_second()
+            if rate:
+                row.measured_rate = rate
+            eta_seconds = None
+            if rate:
+                _text, eta_seconds = file_eta_view(
+                    state=row.state,
+                    articles=row.articles,
+                    total=row.total,
+                    live_rate=None,
+                    measured_rate=rate,
+                )
+            remembered = self._progress_fact(row)
+        if remembered is None:
+            return
+        self._write_progress(remembered, measured=True, eta_seconds=eta_seconds)
+        remembered[0].save()
+
+    def _progress_fact(self, row: _Row):
+        """Fields to store. The caller holds the book lock. None when nothing is saved."""
+        if self._stats is None:
+            return None
+        return (
+            self._stats,
+            row.source,
+            row.articles,
+            row.total,
+            row.chunks,
+            row.state,
+            row.name,
+            row.size_bytes,
+            row.mtime,
+            file_type_label(row.name),
+            row.rate.per_second(),
+            row.chunk_rate.per_second(),
+        )
+
+    def _write_progress(self, fact, *, measured: bool = False, eta_seconds: int | None = None) -> None:
+        stats, source, articles, total, chunks, state, name, size_bytes, mtime, file_type, art_rate, chk_rate = fact
+        stats.note_progress(
+            source,
+            articles=articles,
+            total_articles=total,
+            chunks=chunks,
+            state=state,
+            name=name,
+            size_bytes=size_bytes,
+            mtime=mtime,
+            file_type=file_type,
+        )
+        stats.note_rates(source, art_rate, chk_rate, measured=measured, eta_seconds=eta_seconds if measured else None)
 
     def snapshot(self, now: float | None = None) -> BoardSnap:
         moment = time.monotonic() if now is None else now
@@ -451,30 +624,26 @@ class ProgressBook:
                     done_bytes += weight * fraction
                     if row.state != "indexed" and not row.total:
                         unknown += 1
-                eta = ""
-                eta_seconds: int | None = None
                 art_rate = row.rate.per_second()
                 chk_rate = row.chunk_rate.per_second()
+                running = row.state == "running"
                 if row.state == "indexed":
                     count = "indexed"
-                    eta_seconds = 0
                 elif row.total:
                     count = f"{row.articles:,} / {row.total:,}"
-                    remaining = max(0, row.total - row.articles)
-                    if art_rate:
-                        eta_seconds = int(remaining / art_rate)
-                        eta = format_eta(eta_seconds)
-                    elif row.state == "running":
-                        eta = "measuring"
-                    else:
-                        eta = ""
                 elif row.articles:
                     count = f"{row.articles:,}"
-                    eta = "measuring" if row.state == "running" else ""
                 else:
                     count = "—"
-                    eta = "measuring" if row.state == "running" else ""
-                running = row.state == "running"
+                eta, eta_seconds = file_eta_view(
+                    state=row.state,
+                    articles=row.articles,
+                    total=row.total,
+                    live_rate=art_rate if running else None,
+                    measured_rate=row.measured_rate,
+                )
+                art_minute = (art_rate * 60) if running and art_rate else None
+                chk_live = chk_rate if running and chk_rate else None
                 files.append(
                     FileSnap(
                         source=row.source,
@@ -491,18 +660,28 @@ class ProgressBook:
                         size_bytes=row.size_bytes,
                         size_text=format_bytes(row.size_bytes),
                         articles=row.articles,
-                        articles_per_minute=(art_rate * 60) if running and art_rate else None,
-                        chunks_per_second=chk_rate if running and chk_rate else None,
+                        articles_per_minute=art_minute,
+                        chunks_per_second=chk_live,
                         rate_text=format_file_rate(art_rate if running else None, chk_rate if running else None),
                         eta_seconds=eta_seconds,
+                        file_type=file_type_label(row.name),
+                        art_text=pace_text(running, art_minute),
+                        chk_text=pace_text(running, chk_live),
+                        total_articles=row.total,
+                        mtime=row.mtime,
+                        walk_index=row.walk_index,
                     )
                 )
             overall = (done_bytes / included_size) if included_size else 0.0
             rate = self._bytes.per_second()
             remaining_bytes = max(0.0, included_size - done_bytes)
+            summed = sum_known_etas([(item.state, item.eta_seconds) for item in files])
             if overall >= 0.999 and unknown == 0:
                 text = "100% · nothing left to index"
                 eta_seconds = 0
+            elif summed is not None:
+                eta_seconds = summed
+                text = f"{overall:.0%} of library size · about {format_eta(summed)}"
             elif not rate or remaining_bytes <= 0:
                 eta_seconds = None
                 text = f"{overall:.0%} of library size · ETA measuring"
@@ -558,11 +737,54 @@ def format_run_stats(phase: str, elapsed: int | None, snap: BoardSnap | None) ->
 UNKNOWN_ETA_SECONDS = 10**9
 
 
-def format_current_file(snap: BoardSnap | None) -> tuple[str, float, str]:
+_OCR_LINE = re.compile(r"ocr page (\d+) of (\d+)\b")
+_OCR_NOTE = re.compile(r"Page (\d+) of (\d+)")
+
+
+def ocr_page(line: str) -> tuple[int, int] | None:
+    """Page numbers from one OCR progress line. None when the line is not a page."""
+    match = _OCR_LINE.search(line or "")
+    if match is None:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
+def ocr_note(name: str, page: int | None = None, total: int | None = None) -> str:
+    """Status sentence while a PDF or picture is being read."""
+    if page and total:
+        return f"Reading {name} with OCR. Page {page} of {total}."
+    return f"Reading {name} with OCR."
+
+
+def _ocr_bar(activity: str) -> tuple[str, float] | None:
+    if "with OCR" not in (activity or ""):
+        return None
+    match = _OCR_NOTE.search(activity)
+    if match is None:
+        return "Reading with OCR", 0.0
+    page, total = int(match.group(1)), int(match.group(2))
+    fraction = 0.0 if total <= 0 else min(1.0, page / total)
+    return f"OCR page {page:,} of {total:,}", fraction
+
+
+def ocr_list_cells(activity: str) -> tuple[str, int] | None:
+    """Status word and progress percent for the row while OCR is reading it."""
+    shown = _ocr_bar(activity)
+    if shown is None:
+        return None
+    _text, fraction = shown
+    return "OCR", int(round(fraction * 100))
+
+
+def format_current_file(snap: BoardSnap | None, activity: str = "") -> tuple[str, float, str]:
     """Title, bar fraction, and bar text for the file that is indexing."""
     item = None if snap is None else next((row for row in snap.files if row.state == "running"), None)
     if item is None:
         return "No file is indexing.", 0.0, "Idle"
+    shown = _ocr_bar(activity)
+    if shown is not None:
+        bar, fraction = shown
+        return item.name, fraction, bar
     bits = [f"{item.percent}%", f"{item.count} articles"]
     if item.chunks:
         bits.append(f"{item.chunks:,} chunks")

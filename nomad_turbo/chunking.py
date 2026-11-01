@@ -62,6 +62,13 @@ def estimate_tokens(text: str) -> int:
     return math.ceil(len(text) / CHAR_TO_TOKEN)
 
 
+def mean_tokens(texts: list[str]) -> int:
+    """Average estimated tokens in one embed call. Empty is zero."""
+    if not texts:
+        return 0
+    return math.ceil(sum(estimate_tokens(text) for text in texts) / len(texts))
+
+
 def split_chunks(text: str) -> list[str]:
     """Split the whole sanitized page into stock-sized chunks.
 

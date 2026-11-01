@@ -16,13 +16,14 @@ from nomad_turbo import __version__
 from nomad_turbo.catalog import wipe_phrase_ok
 from nomad_turbo.desktop import icon_dir, write_shortcut
 from nomad_turbo.discover import load_install, save_install, state_dir
+from nomad_turbo.file_stats import STATS_NAME, FileStats, compose_detail, detail_lines, library_location
 from nomad_turbo.progress import (
-    UNKNOWN_ETA_SECONDS,
     ProgressBook,
     format_current_file,
+    ocr_list_cells,
     format_run_stats,
     LOG_PANE_LINES,
-    fitted_list_position,
+    restored_frame,
     restored_log_top,
     log_line_visible,
     log_lines_to_drop,
@@ -34,15 +35,36 @@ from nomad_turbo.qdrant_status import changes_allowed
 from nomad_turbo.repair import format_repair_current
 from nomad_turbo.runtime import gpu_rows
 from nomad_turbo.scan import scan_library
+from nomad_turbo.schedule import (
+    COL_ARTICLES,
+    COL_ARTICLES_SORT,
+    COL_ART_MIN,
+    COL_CHK_S,
+    COL_CHUNKS,
+    COL_COLOR,
+    COL_ETA,
+    COL_MARK,
+    COL_NAME,
+    COL_PROGRESS,
+    COL_SIZE,
+    COL_STATUS,
+    COL_TYPE,
+    INDEX_HEADERS,
+    ORDER_CHOICES,
+    PRIORITY_COLOR,
+    file_type_label,
+    files_for_list_order,
+    index_store_row,
+    list_display_order,
+    row_menu_labels,
+)
 from nomad_turbo.session import Session
 from nomad_turbo.slots import (
-    MAX_BOOST_PERCENT,
-    clamp_boost_percent,
-    embed_call_budget,
+    clamp_embed_chunks,
     host_memory_mib,
-    install_boost_percent,
+    install_embed_chunks,
     pick_gpu,
-    reserve_ratio_from_percent,
+    safe_call_chunks,
 )
 from nomad_turbo.tips import TIPS
 
@@ -86,12 +108,60 @@ def window_close_action(indexing: bool) -> str:
     return "hide" if indexing else "quit"
 
 
+def describe_index_controls(app) -> str:
+    """Header texts, order choices, Measure, and the row menu. No indexing starts."""
+    lines = ["headers:"]
+    for column in app.file_tree.get_columns():
+        lines.append(column.get_title() or "")
+    lines.append("order:")
+    model = app.order_combo.get_model()
+    iterator = model.get_iter_first()
+    while iterator is not None:
+        lines.append(str(model.get_value(iterator, 0)))
+        iterator = model.iter_next(iterator)
+    lines.append("measure:")
+    lines.append(app.measure_button.get_label() or "")
+    lines.append("hide:")
+    lines.append(app.hide_finished.get_label() or "")
+    lines.append("menu:")
+    menu = app._file_menu("example.zim")
+    for item in menu.get_children():
+        lines.append(item.get_label() or "")
+    app.session.set_priority("example.zim", True)
+    lines.append("menu-priority:")
+    marked = app._file_menu("example.zim")
+    for item in marked.get_children():
+        lines.append(item.get_label() or "")
+    app.session.set_priority("example.zim", False)
+    return "\n".join(lines) + "\n"
+
+
 def index_store_types() -> tuple:
     """Article, chunk, and size columns are 64-bit. A ZIM over 2 GB does not fit in 32."""
     from gi.repository import GObject
 
     wide = GObject.TYPE_INT64
-    return (str, str, str, str, int, str, str, str, str, str, str, wide, wide, wide, int, int)
+    return (
+        str,
+        str,
+        str,
+        str,
+        str,
+        str,
+        int,
+        str,
+        str,
+        str,
+        str,
+        str,
+        str,
+        wide,
+        wide,
+        wide,
+        wide,
+        wide,
+        int,
+    )
 
 
 def repair_store_types() -> tuple:
@@ -181,7 +251,16 @@ def open_window() -> int:
     install = load_install()
     memory = _MemoryLog()
     log_path = _configure_logging(memory)
-    session = Session(install_boost_percent(install))
+    gpu = pick_gpu(gpu_rows())
+    host = host_memory_mib()
+    session = Session(
+        install_embed_chunks(
+            install,
+            gpu_total_mib=gpu[1] if gpu else None,
+            host_total_mib=host[0] if host else 0,
+            cpu_count=os.cpu_count() or 1,
+        )
+    )
     session.set_keep_control(bool(getattr(install, "keep_control", False)))
     app = _Window(install, session, memory, log_path, Gtk, GLib)
     signal.signal(signal.SIGTERM, app.on_signal)
@@ -210,6 +289,13 @@ class _Window:
     def __init__(self, install, session: Session, memory: _MemoryLog, log_path: Path, gtk, glib) -> None:
         self.install = install
         self.session = session
+        self.file_stats = FileStats(state_dir() / STATS_NAME)
+        try:
+            self.file_stats.load()
+        except Exception:
+            log.exception("could not read saved file stats")
+        if hasattr(session, "bind_file_stats"):
+            session.bind_file_stats(self.file_stats)
         self.memory = memory
         self.log_path = log_path
         self.gtk = gtk
@@ -223,7 +309,7 @@ class _Window:
         self._optimize_live = None
         self._optimize_code = None
         self._tune_hold = None
-        self._pace_memory: dict[int, float] = {}
+        self._pace_memory: dict = {}
         self._tune_applying = False
         self._tune_logged = ""
         self.repair_stop = threading.Event()
@@ -243,9 +329,16 @@ class _Window:
         self._sizing = False
         self._pane_lock = False
         self._log_split_ready = False
+        self._log_settle = None
+        self._log_placed_for = 0
+        self._host_split_ready = False
+        self._host_settle = None
         self._pane_styled = False
         self.layout_timer = None
-        self.host_window = None
+        self._frame_timer = None
+        self._frame_applied = False
+        # Ignore the window manager's first placement. Map applies the saved frame.
+        self._frame_ready_at = time.monotonic() + 10**9
         self._host_guard = False
         self.scanning = False
         self.rows_ready = False
@@ -266,16 +359,34 @@ class _Window:
 
         window = gtk.Window(title=f"Nomad TURBO Index {__version__}")
         window.set_resizable(True)
-        window.set_default_size(1180, 820)
-        # A small floor. Portion minimums stay small so this does not pin the window.
+        # 1180 by 820 until a size has been saved. A small floor. Portion
+        # minimums stay small so this does not pin the window.
+        opening = restored_frame(
+            getattr(install, "window_x", None),
+            getattr(install, "window_y", None),
+            int(getattr(install, "window_width", 0) or 0),
+            int(getattr(install, "window_height", 0) or 0),
+            default_width=1180,
+            default_height=820,
+            floor_width=480,
+            floor_height=280,
+            maximized=bool(getattr(install, "window_max", False)),
+        )
+        window.set_default_size(opening.width, opening.height)
         window.set_size_request(480, 280)
-        window.set_position(gtk.WindowPosition.CENTER)
+        if opening.x is None or opening.y is None:
+            window.set_position(gtk.WindowPosition.CENTER)
+        else:
+            window.move(opening.x, opening.y)
         try:
             window.set_wmclass("nomad-turbo", "nomad-turbo")
         except Exception:
             log.debug("could not set the window class", exc_info=True)
         self.window = window
         window.connect("delete-event", self.on_delete)
+        window.connect("configure-event", self._on_configure)
+        window.connect("map-event", self._on_map)
+        window.connect("destroy", self._on_destroy)
 
         root = gtk.Box(orientation=gtk.Orientation.VERTICAL, spacing=8)
         root.set_border_width(12)
@@ -301,9 +412,10 @@ class _Window:
         self.log_help_button.set_valign(gtk.Align.CENTER)
         self.log_help_button.connect("clicked", self.on_log_help)
         header.pack_start(self.log_help_button, False, False, 0)
-        self.host_button = gtk.ToggleButton(label="Host")
+        self.host_button = gtk.CheckButton(label="Host")
         self.host_button.set_tooltip_text(TIPS["host"])
         self.host_button.set_valign(gtk.Align.CENTER)
+        self.host_button.set_active(bool(getattr(install, "host_open", False)))
         self.host_button.connect("toggled", self.on_host)
         header.pack_start(self.host_button, False, False, 0)
         self.version_label = gtk.Label(label=__version__)
@@ -312,6 +424,13 @@ class _Window:
         project = gtk.LinkButton.new_with_label(REPO_URL, "Nomad TURBO Index")
         project.set_halign(gtk.Align.END)
         project.set_tooltip_text(TIPS["project"])
+        # The full title stays at the normal window size. A short floor can ellipsize it.
+        from gi.repository import Pango
+
+        link_label = project.get_child()
+        if link_label is not None:
+            link_label.set_ellipsize(Pango.EllipsizeMode.END)
+            link_label.set_width_chars(8)
         header.pack_end(project, False, False, 0)
         header.pack_end(self.version_label, False, False, 0)
         root.pack_start(header, False, False, 0)
@@ -356,98 +475,106 @@ class _Window:
         tree.set_tooltip_column(0)
         name_cell = gtk.CellRendererText()
         name_cell.set_property("ellipsize", Pango.EllipsizeMode.MIDDLE)
+        file_column = gtk.TreeViewColumn()
+        file_column.set_title(INDEX_HEADERS[0])
+        file_label = gtk.Label(label=INDEX_HEADERS[0])
+        file_label.set_tooltip_text(TIPS["col_file"])
+        file_label.show()
+        file_column.set_widget(file_label)
+        # The asterisk is its own cell, so ellipsizing the name cannot hide it.
+        mark_cell = gtk.CellRendererText()
+        mark_cell.set_property("foreground", PRIORITY_COLOR)
+        name_cell.set_property("ellipsize", Pango.EllipsizeMode.MIDDLE)
+        file_column.pack_start(mark_cell, False)
+        file_column.pack_start(name_cell, True)
+        file_column.add_attribute(mark_cell, "text", COL_MARK)
+        file_column.add_attribute(name_cell, "text", COL_NAME)
+        file_column.add_attribute(name_cell, "foreground", COL_COLOR)
         self._add_column(
             tree,
             "index:File",
-            headed(
-                "File",
-                TIPS["col_file"],
-                name_cell,
-                text=1,
-                foreground=10,
-            ),
-            text_index=1,
+            file_column,
+            text_index=COL_NAME,
             minimum=180,
             maximum=460,
             expand=True,
-            sort_index=1,
         )
         self._add_column(
             tree,
-            "index:Kind",
-            headed("Kind", TIPS["col_kind"], gtk.CellRendererText(), text=2),
-            text_index=2,
+            "index:File type",
+            headed(INDEX_HEADERS[1], TIPS["col_type"], gtk.CellRendererText(), text=COL_TYPE),
+            text_index=COL_TYPE,
             minimum=64,
-            maximum=120,
-            sort_index=2,
+            maximum=140,
+        )
+        self._add_column(
+            tree,
+            "index:Size",
+            headed(INDEX_HEADERS[2], TIPS["col_size"], gtk.CellRendererText(), text=COL_SIZE),
+            text_index=COL_SIZE,
+            minimum=70,
+            maximum=140,
         )
         self._add_column(
             tree,
             "index:Status",
-            headed("Status", TIPS["col_status"], gtk.CellRendererText(), text=3),
-            text_index=3,
+            headed(INDEX_HEADERS[3], TIPS["col_status"], gtk.CellRendererText(), text=COL_STATUS),
+            text_index=COL_STATUS,
             minimum=80,
             maximum=160,
-            sort_index=3,
         )
         self._add_column(
             tree,
             "index:Progress",
             headed(
-                "Progress",
+                INDEX_HEADERS[4],
                 TIPS["col_progress"],
                 gtk.CellRendererProgress(),
-                value=4,
+                value=COL_PROGRESS,
             ),
             text_index=None,
             minimum=160,
             maximum=280,
-            sort_index=4,
         )
         self._add_column(
             tree,
             "index:Articles",
-            headed("Articles", TIPS["col_articles"], gtk.CellRendererText(), text=5),
-            text_index=5,
+            headed(INDEX_HEADERS[5], TIPS["col_articles"], gtk.CellRendererText(), text=COL_ARTICLES),
+            text_index=COL_ARTICLES,
             minimum=90,
             maximum=240,
-            sort_index=11,
+        )
+        self._add_column(
+            tree,
+            "index:art/min",
+            headed(INDEX_HEADERS[6], TIPS["col_art_min"], gtk.CellRendererText(), text=COL_ART_MIN),
+            text_index=COL_ART_MIN,
+            minimum=70,
+            maximum=140,
         )
         self._add_column(
             tree,
             "index:Chunks",
-            headed("Chunks", TIPS["col_chunks"], gtk.CellRendererText(), text=6),
-            text_index=6,
+            headed(INDEX_HEADERS[7], TIPS["col_chunks"], gtk.CellRendererText(), text=COL_CHUNKS),
+            text_index=COL_CHUNKS,
             minimum=80,
             maximum=160,
-            sort_index=12,
         )
         self._add_column(
             tree,
-            "index:Size",
-            headed("Size", TIPS["col_size"], gtk.CellRendererText(), text=7),
-            text_index=7,
+            "index:chk/s",
+            headed(INDEX_HEADERS[8], TIPS["col_chk_s"], gtk.CellRendererText(), text=COL_CHK_S),
+            text_index=COL_CHK_S,
             minimum=70,
             maximum=120,
-            sort_index=13,
-        )
-        self._add_column(
-            tree,
-            "index:Rate",
-            headed("Rate", TIPS["col_rate"], gtk.CellRendererText(), text=8),
-            text_index=8,
-            minimum=120,
-            maximum=280,
-            sort_index=14,
         )
         self._add_column(
             tree,
             "index:ETA",
-            headed("ETA", TIPS["col_eta"], gtk.CellRendererText(), text=9),
-            text_index=9,
+            headed(INDEX_HEADERS[9], TIPS["col_eta"], gtk.CellRendererText(), text=COL_ETA),
+            text_index=COL_ETA,
             minimum=70,
             maximum=140,
-            sort_index=15,
         )
         scrolled = gtk.ScrolledWindow()
         scrolled.set_policy(gtk.PolicyType.AUTOMATIC, gtk.PolicyType.AUTOMATIC)
@@ -457,6 +584,7 @@ class _Window:
         scrolled.set_min_content_height(1)
         scrolled.set_vexpand(True)
         self.file_tree = tree
+        tree.connect("button-press-event", self.on_file_press)
         self.index_list = scrolled
         # Shared rows keep this cluster short. The list above it gets the spare height.
         lower = gtk.Box(orientation=gtk.Orientation.VERTICAL, spacing=4)
@@ -479,27 +607,19 @@ class _Window:
         self.overall.set_hexpand(True)
         self.overall.set_valign(gtk.Align.CENTER)
         self.overall.set_tooltip_text(TIPS["library_bar"])
-        slider_label = gtk.Label(label="Embed batch")
-        slider_label.set_tooltip_text(TIPS["slider"])
-        slider_label.set_valign(gtk.Align.CENTER)
-        self.scale = gtk.Scale.new_with_range(gtk.Orientation.HORIZONTAL, 10, MAX_BOOST_PERCENT, 5)
-        self.scale.set_value(session.get_percent())
-        self.scale.set_hexpand(True)
-        # The live percent sits above the thumb. The overclock end is a label
-        # past the track so it stays clear of the 100% mark.
-        self.scale.set_draw_value(True)
-        self.scale.set_value_pos(gtk.PositionType.TOP)
-        self.scale.set_size_request(-1, 52)
-        self.scale.set_valign(gtk.Align.CENTER)
-        for mark in (10, 100):
-            self.scale.add_mark(mark, gtk.PositionType.BOTTOM, f"{mark}%")
-        self.scale.add_mark(MAX_BOOST_PERCENT, gtk.PositionType.BOTTOM, None)
-        self.scale.set_tooltip_text(TIPS["slider"])
-        self.scale.connect("format-value", lambda _scale, value: f"{int(round(value))}%")
-        self.scale.connect("value-changed", self.on_slider)
-        self.scale_end = gtk.Label(label=f"{MAX_BOOST_PERCENT}%")
-        self.scale_end.set_valign(gtk.Align.END)
-        self.scale_end.set_tooltip_text(TIPS["slider"])
+        batch_label = gtk.Label(label="Embed batch")
+        batch_label.set_tooltip_text(TIPS["slider"])
+        batch_label.set_valign(gtk.Align.CENTER)
+        self.chunk_entry = gtk.Entry()
+        self.chunk_entry.set_width_chars(6)
+        self.chunk_entry.set_text(str(session.get_chunks()))
+        self.chunk_entry.set_valign(gtk.Align.CENTER)
+        self.chunk_entry.set_tooltip_text(TIPS["slider"])
+        self.chunk_entry.connect("changed", self.on_chunks)
+        self.recommend_button = gtk.Button(label="Recommended")
+        self.recommend_button.set_valign(gtk.Align.CENTER)
+        self.recommend_button.set_tooltip_text(TIPS["recommend"])
+        self.recommend_button.connect("clicked", self.on_recommend)
         bars = gtk.Box(orientation=gtk.Orientation.HORIZONTAL, spacing=8)
         bars.pack_start(self.current_label, True, True, 0)
         bars.pack_start(self.current_bar, True, True, 0)
@@ -565,6 +685,33 @@ class _Window:
         self.delete_tip = TIPS["delete"]
         self.delete_button.set_tooltip_text(TIPS["delete"])
         self.delete_button.get_style_context().add_class("destructive-action")
+        order_label = gtk.Label(label="Order")
+        order_label.set_tooltip_text(TIPS["order"])
+        order_label.set_valign(gtk.Align.CENTER)
+        self.order_combo = gtk.ComboBoxText()
+        self.order_combo.set_tooltip_text(TIPS["order"])
+        self.order_combo.set_valign(gtk.Align.CENTER)
+        for choice, label in ORDER_CHOICES:
+            self.order_combo.append(choice, label)
+        self.order_combo.set_active_id(self.session.get_order())
+        self.order_combo.connect("changed", self.on_order)
+        self.measure_button = gtk.Button(label="Measure")
+        self.measure_button.set_tooltip_text(TIPS["measure"])
+        self.measure_button.set_valign(gtk.Align.CENTER)
+        self.measure_button.connect("clicked", self.on_measure)
+        self.hide_finished = gtk.CheckButton(label="Hide finished")
+        self.hide_finished.set_active(bool(getattr(install, "hide_finished", False)))
+        self.hide_finished.set_halign(gtk.Align.START)
+        self.hide_finished.set_valign(gtk.Align.CENTER)
+        self.hide_finished.set_tooltip_text(TIPS["hide_finished"])
+        self.hide_finished.connect("toggled", self.on_hide_finished)
+        # Own row, so the long order names do not widen the button row past the window floor.
+        order_row = gtk.Box(orientation=gtk.Orientation.HORIZONTAL, spacing=8)
+        order_row.pack_start(order_label, False, False, 0)
+        order_row.pack_start(self.order_combo, False, False, 0)
+        order_row.pack_start(self.measure_button, False, False, 0)
+        order_row.pack_start(self.hide_finished, False, False, 0)
+        lower.pack_start(order_row, False, False, 0)
         buttons.pack_start(self.keep_check, False, False, 0)
         for button in (self.start_button, self.stop_button, self.rescan_button, self.export_button):
             buttons.pack_start(button, False, False, 0)
@@ -572,22 +719,21 @@ class _Window:
         self.tune_auto = gtk.CheckButton(label="Auto")
         self.tune_auto.set_tooltip_text(TIPS["tune_auto"])
         self.tune_auto.set_active(bool(getattr(install, "tune_auto", False)))
+        self.session.set_tune_auto(bool(getattr(install, "tune_auto", False)))
         self.tune_auto.connect("toggled", self.on_tune_auto)
-        self.scale.set_sensitive(not self.tune_auto.get_active())
+        self.chunk_entry.set_sensitive(not self.tune_auto.get_active())
         buttons.pack_start(self.tune_auto, False, False, 0)
-        buttons.pack_start(slider_label, False, False, 0)
-        buttons.pack_start(self.scale, True, True, 0)
-        buttons.pack_start(self.scale_end, False, False, 0)
+        buttons.pack_start(batch_label, False, False, 0)
+        buttons.pack_start(self.chunk_entry, False, False, 0)
+        buttons.pack_start(self.recommend_button, False, False, 0)
         buttons.pack_end(self.delete_button, False, False, 0)
         lower.pack_start(buttons, False, False, 0)
         self.index_buttons = buttons
-        self.index_pane = self._make_pane()
-        # The list takes extra space and can shrink. The controls keep their
-        # 48px floor (shrink is off) so the scroller stays in the pane.
-        self.index_pane.pack1(scrolled, True, True)
-        self.index_pane.pack2(self._portion(lower), False, False)
-        self._track_pane(self.index_pane, "index_pane")
-        index.pack_start(self.index_pane, True, True, 0)
+        self.index_controls = lower
+        # The list takes extra height. The controls stay at the bottom of the
+        # page, against the bar above the log.
+        index.pack_start(self.index_list, True, True, 0)
+        index.pack_start(self.index_controls, False, False, 0)
         self._build_repair_page(headed)
         self._build_about_page()
 
@@ -597,7 +743,7 @@ class _Window:
         self.debug_check = gtk.CheckButton(label="Debug")
         self.error_check.set_active(True)
         self.info_check.set_active(True)
-        self.debug_check.set_active(True)
+        self.debug_check.set_active(False)
         self.error_check.set_tooltip_text(TIPS["errors"])
         self.info_check.set_tooltip_text(TIPS["info"])
         self.debug_check.set_tooltip_text(TIPS["debug"])
@@ -613,8 +759,8 @@ class _Window:
         log_head.pack_start(self.debug_check, False, False, 0)
         log_head.pack_start(self.follow_check, False, False, 0)
         self.log_filters = log_head
-        # The Log row is the last thing above the split, so the bar sits under it.
-        # The log text is the other side. Neither side sets a tall size request,
+        # The log row is the first thing under the bar, so it stays against it.
+        # The log text fills the rest. Neither side sets a tall size request,
         # so the window edges stay free.
         log_open = bool(getattr(install, "log_open", True))
         self.log_arrow = gtk.Image.new_from_icon_name(
@@ -637,6 +783,7 @@ class _Window:
         log_header.pack_start(self.log_open_button, False, False, 0)
         log_header.pack_start(log_title_box, False, False, 0)
         log_header.pack_start(log_head, False, False, 0)
+        self.log_header = log_header
         self.log_view = gtk.TextView()
         self.log_view.set_editable(False)
         self.log_view.set_monospace(True)
@@ -653,16 +800,28 @@ class _Window:
         log_scroll.set_no_show_all(not log_open)
         log_scroll.set_visible(log_open)
         self.stack.set_vexpand(True)
-        top = gtk.Box(orientation=gtk.Orientation.VERTICAL, spacing=8)
-        top.pack_start(self.stack, True, True, 0)
-        top.pack_start(log_header, False, False, 0)
+        log_box = gtk.Box(orientation=gtk.Orientation.VERTICAL, spacing=4)
+        log_box.set_vexpand(True)
+        log_box.pack_start(log_header, False, False, 0)
+        log_box.pack_start(log_scroll, True, True, 0)
+        self.log_box = log_box
         self.content_pane = self._make_pane()
-        # Extra window height goes to the pages. The log keeps its dragged size
-        # until the pages are at their floor, and the log itself can still shrink.
-        self.content_pane.pack1(top, True, False)
-        self.content_pane.pack2(log_scroll, False, True)
+        # Extra window height goes to the pages. Inside a page the list takes
+        # it and the controls stay on the bottom, against this bar. The log
+        # row is the top of the other side. The log can shrink. The pages do
+        # not shrink below the controls.
+        self.content_pane.pack1(self.stack, True, False)
+        self.content_pane.pack2(log_box, False, True)
         self._track_log_pane(self.content_pane)
-        root.pack_start(self.content_pane, True, True, 0)
+        from nomad_turbo.host_window import HostPanel
+
+        self.host_panel = HostPanel(install, self.gtk, self.glib)
+        self.host_pane = self._make_pane(gtk.Orientation.HORIZONTAL)
+        self.host_pane.pack1(self.content_pane, True, True)
+        self._track_host_pane(self.host_pane)
+        if bool(getattr(install, "host_open", False)):
+            self.host_pane.pack2(self.host_panel.widget, False, True)
+        root.pack_start(self.host_pane, True, True, 0)
         self._build_tray()
         self.refresh_usage()
 
@@ -749,6 +908,8 @@ class _Window:
         self.hidden = False
         self.window.show()
         self.window.present()
+        if getattr(self, "host_button", None) is not None and self.host_button.get_active():
+            self.host_panel.start()
 
     def run(self) -> None:
         self.window.show_all()
@@ -847,48 +1008,277 @@ class _Window:
     def on_host(self, button) -> None:
         if self._host_guard:
             return
-        if button.get_active():
-            try:
-                self._open_host()
-            except Exception:
-                log.exception("could not open the host window")
-                self._host_guard = True
-                button.set_active(False)
-                self._host_guard = False
-            return
-        self._close_host()
-
-    def _open_host(self) -> None:
-        if self.host_window is not None:
-            self.host_window.present()
-            return
-        from nomad_turbo.host_window import HostWindow
-
-        self.host_window = HostWindow(self.install, self.gtk, self.glib, self._host_closed)
-        self.host_window.window.show_all()
-
-    def _host_closed(self) -> None:
-        self.host_window = None
-        self._host_guard = True
+        shown = bool(button.get_active())
         try:
-            self.host_button.set_active(False)
-        finally:
+            self._show_host(shown)
+        except Exception:
+            log.exception("could not show the host meters")
+            self._host_guard = True
+            button.set_active(False)
             self._host_guard = False
+            shown = False
+            try:
+                self._show_host(False)
+            except Exception:
+                log.exception("could not hide the host meters")
+        self.install.host_open = shown
+        try:
+            save_install(self.install)
+        except Exception:
+            log.exception("could not save the host setting")
 
-    def _close_host(self) -> None:
-        window = self.host_window
-        self.host_window = None
-        if window is not None:
-            window.close()
+    def _show_host(self, shown: bool) -> None:
+        """Show or hide the side pane. The sampler runs only while it is shown."""
+        widget = self.host_panel.widget
+        pane = self.host_pane
+        if shown:
+            if widget.get_parent() is None:
+                pane.pack2(widget, False, True)
+            widget.show_all()
+            pane._user_drag = False
+            self._host_split_ready = False
+            self.host_panel.start()
+            self._place_host_split()
+            return
+        self.host_panel.stop()
+        if widget.get_parent() is pane:
+            pane.remove(widget)
+
+    def _place_host_split(self) -> None:
+        """Keep the saved host width. The pages keep the rest."""
+        pane = getattr(self, "host_pane", None)
+        if pane is None or not self.host_button.get_active():
+            return
+        width = int(pane.get_allocated_width() or 0)
+        if width < 480:
+            return
+        saved = int(getattr(self.install, "host_width", 0) or 0)
+        panel = saved if saved >= 180 else 320
+        panel = min(panel, width - 300)
+        panel = max(180, panel)
+        position = width - panel
+        if abs(int(pane.get_position()) - position) <= 1:
+            return
+        self._pane_lock = True
+        try:
+            pane.set_position(int(position))
+        finally:
+            self._pane_lock = False
+
+    def _mark_host_settled(self, width: int) -> bool:
+        self._host_settle = None
+        pane = getattr(self, "host_pane", None)
+        if pane is None:
+            return False
+        current = int(pane.get_allocated_width() or 0)
+        if abs(current - int(width)) <= 2:
+            self._host_split_ready = True
+        return False
+
+    def _track_host_pane(self, pane) -> None:
+        def on_size(_widget, allocation) -> None:
+            if not self.host_button.get_active():
+                return
+            if getattr(pane, "_button_down", False) or getattr(pane, "_user_drag", False):
+                self._host_split_ready = True
+                return
+            if self._host_split_ready:
+                return
+            width = int(allocation.width or 0)
+            if width < 480:
+                return
+            self._place_host_split()
+            if self._host_settle:
+                self.glib.source_remove(self._host_settle)
+            self._host_settle = self.glib.timeout_add(200, self._mark_host_settled, width)
+
+        def on_release(_widget, event) -> bool:
+            if getattr(event, "button", 1) == 1:
+                pane._button_down = False
+            return False
+
+        def on_grab_broken(*_args) -> bool:
+            pane._button_down = False
+            return False
+
+        def on_position(widget, _pspec) -> None:
+            if self._pane_lock or not getattr(widget, "_user_drag", False):
+                return
+            if not self.host_button.get_active():
+                return
+            width = int(widget.get_allocated_width() or 0)
+            position = int(widget.get_position())
+            panel = width - position
+            if panel < 180 or position < 300:
+                return
+            self.install.host_width = int(panel)
+            self._save_layout_soon()
+
+        pane.connect("size-allocate", on_size)
+        pane.connect("button-press-event", self._mark_pane_drag)
+        pane.connect("button-release-event", on_release)
+        pane.connect("grab-broken-event", on_grab_broken)
+        pane.connect("notify::position", on_position)
+
+    def _screen_span(self) -> tuple[int, int]:
+        screen = self.window.get_screen()
+        if screen is None:
+            return 0, 0
+        return int(screen.get_width() or 0), int(screen.get_height() or 0)
+
+    def _opening_place(self):
+        width, height = self._screen_span()
+        return restored_frame(
+            getattr(self.install, "window_x", None),
+            getattr(self.install, "window_y", None),
+            int(getattr(self.install, "window_width", 0) or 0),
+            int(getattr(self.install, "window_height", 0) or 0),
+            default_width=1180,
+            default_height=820,
+            floor_width=480,
+            floor_height=280,
+            screen_width=width,
+            screen_height=height,
+            maximized=bool(getattr(self.install, "window_max", False)),
+        )
+
+    def _apply_frame(self) -> bool:
+        """Put the saved size and place on the window after it is mapped.
+
+        The first configure from the window manager is not the saved place.
+        Applying again on idle beats that placement. The log bar is placed
+        after this size, not at the short allocation that comes first.
+        """
+        place = self._opening_place()
+        self.window.resize(place.width, place.height)
+        if place.x is not None and place.y is not None:
+            self.window.move(place.x, place.y)
+        if place.maximized:
+            self.window.maximize()
+        pane = getattr(self, "content_pane", None)
+        if pane is not None and not getattr(pane, "_user_drag", False):
+            self._log_split_ready = False
+        host = getattr(self, "host_pane", None)
+        if host is not None and not getattr(host, "_user_drag", False):
+            self._host_split_ready = False
+        if getattr(self, "host_button", None) is not None and self.host_button.get_active():
+            self.host_panel.start()
+            self._place_host_split()
+        return False
+
+    def _on_map(self, *_args) -> bool:
+        if self._frame_applied:
+            return False
+        self._frame_applied = True
+        self._apply_frame()
+        self.glib.idle_add(self._apply_frame)
+        self._frame_ready_at = time.monotonic() + 0.8
+        self._schedule_frame_save(900)
+        return False
+
+    def _on_configure(self, *_args) -> bool:
+        if time.monotonic() < self._frame_ready_at:
+            return False
+        self._remember_frame()
+        self._schedule_frame_save(400)
+        return False
+
+    def _schedule_frame_save(self, delay: int) -> None:
+        if self._frame_timer:
+            self.glib.source_remove(self._frame_timer)
+        self._frame_timer = self.glib.timeout_add(delay, self._save_frame)
+
+    def _remember_frame(self) -> None:
+        window = self.window
+        if not window.get_visible():
+            return
+        try:
+            maximized = bool(window.is_maximized())
+        except Exception:
+            maximized = False
+        self.install.window_max = maximized
+        if maximized:
+            # Keep the size from before maximize. The grown log top belongs to
+            # the maximized frame and would crush the log after unmaximize.
+            return
+        width, height = window.get_size()
+        if width >= 480 and height >= 280:
+            x, y = window.get_position()
+            self.install.window_width = int(width)
+            self.install.window_height = int(height)
+            self.install.window_x = int(x)
+            self.install.window_y = int(y)
+        # The log bar moves when the window is resized. Save that top with the
+        # frame so the next open keeps the log's thickness, not an old top.
+        pane = getattr(self, "content_pane", None)
+        button = getattr(self, "log_open_button", None)
+        if (
+            pane is not None
+            and button is not None
+            and button.get_active()
+            and self._log_split_ready
+            and not getattr(pane, "_button_down", False)
+        ):
+            position = int(pane.get_position())
+            if position > 80:
+                self.install.log_split = position
+
+    def _save_frame(self) -> bool:
+        self._frame_timer = None
+        if time.monotonic() < self._frame_ready_at:
+            return False
+        self._remember_frame()
+        try:
+            save_install(self.install)
+        except Exception:
+            log.exception("could not save the window place")
+        return False
+
+    def _flush_frame(self) -> None:
+        if self._frame_timer:
+            self.glib.source_remove(self._frame_timer)
+            self._frame_timer = None
+        if self.layout_timer:
+            self.glib.source_remove(self.layout_timer)
+            self.layout_timer = None
+        self._frame_ready_at = 0
+        self._save_frame()
+
+    def _on_destroy(self, *_args) -> None:
+        self._frame_ready_at = time.monotonic() + 10**9
+        for name in ("_frame_timer", "layout_timer", "_log_settle", "_host_settle"):
+            timer = getattr(self, name, None)
+            if timer:
+                self.glib.source_remove(timer)
+                setattr(self, name, None)
+        panel = getattr(self, "host_panel", None)
+        if panel is not None:
+            panel.stop()
+
+    def _flush_stats(self) -> None:
+        stats = getattr(self, "file_stats", None)
+        if stats is None:
+            return
+        try:
+            stats.save()
+        except Exception:
+            log.exception("could not save file stats")
 
     def on_delete(self, *_args) -> bool:
         indexing = self._work_alive()
+        self._flush_stats()
+        self._flush_frame()
         if window_close_action(indexing) == "hide" and self.indicator is not None:
             self.hidden = True
             self.window.hide()
+            panel = getattr(self, "host_panel", None)
+            if panel is not None:
+                panel.stop()
             log.info("window closed to the tray. Turbo keeps running.")
             return True
-        self._close_host()
+        panel = getattr(self, "host_panel", None)
+        if panel is not None:
+            panel.stop()
         self._stop_all()
         self.session.close_requested = True
         if indexing:
@@ -927,7 +1317,50 @@ class _Window:
         self.status.set_text(f"Scan failed: {message}")
         return False
 
+    def _remember_library(self, book: ProgressBook, rows) -> None:
+        """Save this scan and forget files that are no longer in the library."""
+        stats = getattr(self, "file_stats", None)
+        if stats is None:
+            return
+        host = getattr(self.install, "storage_host", "") or ""
+        root = getattr(self.install, "container_storage", "/app/storage") or "/app/storage"
+        present: set[str] = set()
+        for row in rows:
+            present.add(row.source)
+            stats.note_library(
+                row.source,
+                name=row.name,
+                file_type=file_type_label(row.name),
+                size_bytes=int(row.size_bytes or 0),
+                location=library_location(host, root, row.source),
+                mtime=row.mtime,
+                articles=int(row.articles or 0),
+                total_articles=row.total_articles,
+                chunks=int(row.chunks or 0),
+                state=row.state,
+            )
+        stats.prune(present)
+        if hasattr(book, "restore_saved"):
+            book.restore_saved(stats)
+        if hasattr(self.session, "set_priority"):
+            for source in stats.priorities():
+                if source in present:
+                    self.session.set_priority(source, True)
+        if hasattr(self.session, "note_zim_date"):
+            known = getattr(self.session, "zim_date_known", None)
+            for source, raw in stats.zim_dates():
+                if source not in present:
+                    continue
+                if callable(known) and known(source):
+                    continue
+                self.session.note_zim_date(source, raw)
+        stats.save()
+
     def _scan_ready(self, book: ProgressBook, found, indexed: int) -> bool:
+        try:
+            self._remember_library(book, found.rows)
+        except Exception:
+            log.exception("could not restore saved file stats")
         self.session.bind_book(book)
         self.rows_ready = True
         self.scanning = False
@@ -977,7 +1410,9 @@ class _Window:
         widget = column.get_widget()
         if widget is not None:
             tip = widget.get_tooltip_text() or ""
-            extra = " Drag the edge to resize. Click the heading to sort."
+            extra = " Drag the edge to resize."
+            if sort_index is not None:
+                extra += " Click the heading to sort."
             if "Drag the edge" not in tip:
                 widget.set_tooltip_text((tip + extra).strip())
         saved = self._saved_width(key)
@@ -1095,23 +1530,17 @@ class _Window:
             self.gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
         )
 
-    def _make_pane(self):
-        """A tall, visible split. Both sides can shrink so the window can too."""
+    def _make_pane(self, orientation=None):
+        """A visible split. The log bar is vertical. The host bar runs the other way."""
         self._style_panes()
-        pane = self.gtk.Paned(orientation=self.gtk.Orientation.VERTICAL)
+        if orientation is None:
+            orientation = self.gtk.Orientation.VERTICAL
+        pane = self.gtk.Paned(orientation=orientation)
         pane.set_wide_handle(True)
         pane.set_vexpand(True)
+        pane.set_hexpand(True)
         return pane
 
-    def _portion(self, child):
-        """Scroll the controls when a split is dragged smaller than their text."""
-        scrolled = self.gtk.ScrolledWindow()
-        scrolled.set_policy(self.gtk.PolicyType.AUTOMATIC, self.gtk.PolicyType.AUTOMATIC)
-        scrolled.set_min_content_height(48)
-        scrolled.set_propagate_natural_height(True)
-        scrolled.set_vexpand(True)
-        scrolled.add(child)
-        return scrolled
 
     def _mark_pane_drag(self, pane, event) -> bool:
         # A window resize also moves the bar. Only a drag on the bar is saved.
@@ -1119,135 +1548,6 @@ class _Window:
             pane._user_drag = True
             pane._button_down = True
         return False
-
-    def _queue_pane_place(self, pane, key: str) -> None:
-        # A later allocate can arrive while the idle is waiting. Remember it
-        # instead of dropping it, or the bar stays where the first tiny size put it.
-        if getattr(pane, "_place_queued", False):
-            pane._place_again = True
-            return
-        pane._place_queued = True
-
-        def place() -> bool:
-            pane._place_queued = False
-            again = bool(getattr(pane, "_place_again", False))
-            pane._place_again = False
-            if getattr(pane, "_button_down", False):
-                if again:
-                    self._queue_pane_place(pane, key)
-                return False
-            # set_position during size-allocate does not move a page that
-            # was hidden, so the bar is placed on the next idle.
-            height = int(pane.get_allocated_height() or 0)
-            if height <= 1:
-                if again:
-                    self._queue_pane_place(pane, key)
-                return False
-            saved = int(getattr(self.install, key, 0) or 0)
-            controls = 0
-            child = pane.get_child2()
-            if saved <= 0 and child is not None:
-                _minimum, controls = child.get_preferred_height()
-            list_min = 0
-            listing = pane.get_child1()
-            if listing is not None:
-                preferred, _natural = listing.get_preferred_height()
-                list_min = int(preferred or 0)
-                # Preferred height can miss the column headers. GTK then keeps
-                # that taller minimum and slides the extra pixels above the pane.
-                # Trust that distance only while it is still header-sized.
-                origin = listing.translate_coordinates(pane, 0, 0)
-                if origin is not None and int(origin[1]) < 0:
-                    covered = int(pane.get_position()) - int(origin[1])
-                    if list_min < covered <= 120:
-                        list_min = covered
-            # The pane must be able to hold the header and the control strip.
-            # Do not keep raising this from an expanded list, or the window
-            # grows past the 480×280 floor.
-            needed = int(list_min) + 48 + 8
-            _width, requested = pane.get_size_request()
-            if 0 < needed <= 160 and requested != needed:
-                pane.set_size_request(-1, needed)
-            target = fitted_list_position(saved, height, controls, list_min)
-            # On a short pane, put the divider at the header so the list top
-            # stays inside. A tall pane keeps the spare space on the list.
-            if height <= 220:
-                limit = height - 48 - 8
-                if limit > 8:
-                    target = min(max(target, list_min), limit)
-            position = int(pane.get_position())
-            if abs(position - target) <= 1 and not again:
-                return False
-            if abs(position - target) <= 1:
-                if again:
-                    self._queue_pane_place(pane, key)
-                return False
-            # A rejected position must not queue another idle for the same size.
-            fit_key = (height, target)
-            if getattr(pane, "_fit_key", None) != fit_key:
-                pane._fit_key = fit_key
-                pane._fit_count = 0
-            if int(getattr(pane, "_fit_count", 0)) >= 3:
-                return False
-            pane._fit_count = int(pane._fit_count) + 1
-            self._pane_lock = True
-            try:
-                pane.set_position(target)
-            finally:
-                self._pane_lock = False
-            if again or getattr(pane, "_place_again", False):
-                pane._place_again = False
-                self._queue_pane_place(pane, key)
-            return False
-
-        self.glib.idle_add(place)
-
-    def _show_pane_page(self, _stack, _pspec=None) -> None:
-        """A hidden page keeps its old allocation until it is shown."""
-        name = self.stack.get_visible_child_name()
-        if name == "index":
-            pane, key = self.index_pane, "index_pane"
-        elif name == "repair":
-            pane, key = self.repair_pane, "repair_pane"
-        else:
-            return
-        pane.queue_resize()
-        self._queue_pane_place(pane, key)
-
-    def _track_pane(self, pane, key: str) -> None:
-        def on_size(_widget, allocation) -> None:
-            if allocation.height <= 0 or getattr(pane, "_button_down", False):
-                return
-            self._queue_pane_place(pane, key)
-
-        def on_release(_widget, event) -> bool:
-            if getattr(event, "button", 1) == 1:
-                pane._button_down = False
-                self._queue_pane_place(pane, key)
-            return False
-
-        def on_grab_broken(*_args) -> bool:
-            pane._button_down = False
-            return False
-
-        def on_position(widget, _pspec) -> None:
-            if self._pane_lock or not getattr(widget, "_user_drag", False):
-                return
-            position = int(widget.get_position())
-            if position < 48:
-                return
-            setattr(self.install, key, position)
-            self._save_layout_soon()
-
-        pane.connect("size-allocate", on_size)
-        listing = pane.get_child1()
-        if listing is not None:
-            # The header can grow after the pane's own allocate. Place again.
-            listing.connect("size-allocate", on_size)
-        pane.connect("button-press-event", self._mark_pane_drag)
-        pane.connect("button-release-event", on_release)
-        pane.connect("grab-broken-event", on_grab_broken)
-        pane.connect("notify::position", on_position)
 
     def _place_log_split(self, pane, height: int) -> None:
         if height < 160 or not self.log_open_button.get_active():
@@ -1263,12 +1563,67 @@ class _Window:
         finally:
             self._pane_lock = False
 
+    def _mark_log_split_settled(self, height: int) -> bool:
+        self._log_settle = None
+        pane = getattr(self, "content_pane", None)
+        if pane is None:
+            return False
+        current = int(pane.get_allocated_height() or 0)
+        if abs(current - int(height)) <= 2:
+            self._log_split_ready = True
+        return False
+
+    def _collapse_log(self) -> None:
+        """Leave only the log row under the bar while the text is hidden."""
+        pane = getattr(self, "content_pane", None)
+        header = getattr(self, "log_header", None)
+        if pane is None or header is None or self.log_open_button.get_active():
+            return
+        height = int(pane.get_allocated_height() or 0)
+        if height < 40:
+            return
+        minimum, _natural = header.get_preferred_height()
+        keep = max(int(minimum or 0), 24)
+        position = max(0, height - keep)
+        if abs(int(pane.get_position()) - position) <= 2:
+            return
+        self._pane_lock = True
+        try:
+            pane.set_position(position)
+        finally:
+            self._pane_lock = False
+
     def _track_log_pane(self, pane) -> None:
         def on_size(_widget, allocation) -> None:
-            if self._log_split_ready or allocation.height < 160:
+            if not self.log_open_button.get_active():
+                self._collapse_log()
                 return
-            self._log_split_ready = True
-            self._place_log_split(pane, allocation.height)
+            # A drag owns the bar. After that, a window resize keeps the log's
+            # pixel height and the drag handler records the new top.
+            if getattr(pane, "_button_down", False) or getattr(pane, "_user_drag", False):
+                self._log_split_ready = True
+                return
+            if self._log_split_ready:
+                return
+            height = int(allocation.height or 0)
+            # The first allocation is often short. Placing once at that size
+            # leaves the log stuck there after the window grows.
+            if height < 160:
+                return
+            self._place_log_split(pane, height)
+            self._log_placed_for = height
+            if self._log_settle:
+                self.glib.source_remove(self._log_settle)
+            self._log_settle = self.glib.timeout_add(200, self._mark_log_split_settled, height)
+
+        def on_release(_widget, event) -> bool:
+            if getattr(event, "button", 1) == 1:
+                pane._button_down = False
+            return False
+
+        def on_grab_broken(*_args) -> bool:
+            pane._button_down = False
+            return False
 
         def on_position(widget, _pspec) -> None:
             if self._pane_lock or not getattr(widget, "_user_drag", False):
@@ -1283,6 +1638,8 @@ class _Window:
 
         pane.connect("size-allocate", on_size)
         pane.connect("button-press-event", self._mark_pane_drag)
+        pane.connect("button-release-event", on_release)
+        pane.connect("grab-broken-event", on_grab_broken)
         pane.connect("notify::position", on_position)
 
     def on_follow(self, button) -> None:
@@ -1312,8 +1669,10 @@ class _Window:
         self.log_filters.set_visible(expanded)
         self.log_scroll.set_no_show_all(not expanded)
         self.log_scroll.set_visible(expanded)
-        if expanded and self._log_split_ready:
+        if expanded:
             self._place_log_split(self.content_pane, int(self.content_pane.get_allocated_height() or 0))
+        else:
+            self._collapse_log()
         try:
             save_install(self.install)
         except Exception:
@@ -1328,9 +1687,176 @@ class _Window:
         except Exception:
             log.exception("could not save the stay-on setting")
 
+    def on_order(self, combo) -> None:
+        """Choose which unfinished file comes next. The one already running stays."""
+        choice = combo.get_active_id() or "library"
+        self.session.set_order(choice)
+        self.refresh_rows()
+
+    def on_hide_finished(self, button) -> None:
+        """Show or hide indexed files. The setting is kept for the next open."""
+        self.install.hide_finished = bool(button.get_active())
+        try:
+            save_install(self.install)
+        except Exception:
+            log.exception("could not save the hide-finished setting")
+        self.refresh_rows()
+
+    def on_measure(self, *_args) -> None:
+        """Sample each unfinished file, then resume or stop the way Stop does."""
+        if hasattr(self.session, "measuring") and self.session.measuring():
+            return
+        running = (
+            self.session.view()["phase"] in ("waiting", "running")
+            and self.thread is not None
+            and self.thread.is_alive()
+        )
+        if running:
+            self.session.start_measure(from_idle=False)
+            self.session.set_note("Measuring each unfinished file for about five minutes.")
+            return
+        if not self.rows_ready or not self.qdrant_ready or self._work_alive():
+            return
+        self.session.start_measure(from_idle=True)
+        if not self.on_start(False):
+            self.session.set_measuring(False)
+
+    def on_file_press(self, tree, event):
+        if getattr(event, "button", 1) != 3:
+            return False
+        info = tree.get_path_at_pos(int(event.x), int(event.y))
+        if not info:
+            return False
+        path = info[0]
+        tree.set_cursor(path, None, False)
+        source = tree.get_model()[path][0]
+        menu = self._file_menu(str(source))
+        # GTK drops the menu if nothing in Python still holds it.
+        self._row_menu = menu
+        if hasattr(menu, "popup_at_pointer"):
+            menu.popup_at_pointer(event)
+        else:
+            menu.popup(None, None, None, None, event.button, event.time)
+        return True
+
+    def _file_menu(self, source: str):
+        priority = source in self.session.priorities()
+        labels = row_menu_labels(priority=priority)
+        menu = self.gtk.Menu()
+        now = self.gtk.MenuItem()
+        now.set_label(labels[0])
+        now.set_tooltip_text(TIPS["index_now"])
+        now.connect("activate", lambda *_args, src=source: self.on_index_now(src))
+        menu.append(now)
+        mark = self.gtk.MenuItem()
+        mark.set_label(labels[1])
+        mark.set_tooltip_text(TIPS["priority"])
+        mark.connect("activate", lambda *_args, src=source, on=not priority: self.on_priority(src, on))
+        menu.append(mark)
+        details = self.gtk.MenuItem()
+        details.set_label(labels[2])
+        details.set_tooltip_text(TIPS["details"])
+        details.connect("activate", lambda *_args, src=source: self.on_details(src))
+        menu.append(details)
+        menu.show_all()
+        return menu
+
+    def file_detail_rows(self, source: str) -> list[tuple[str, str]]:
+        """The facts the details window shows for one file."""
+        live = None
+        book = self.session.get_book() if hasattr(self.session, "get_book") else None
+        if book is not None and hasattr(book, "snapshot"):
+            try:
+                snap = book.snapshot()
+            except Exception:
+                snap = None
+            if snap is not None:
+                live = next((item for item in snap.files if item.source == source), None)
+        stats = getattr(self, "file_stats", None)
+        saved = stats.get(source) if stats is not None else None
+        priority = source in self.session.priorities() if hasattr(self.session, "priorities") else None
+        zim = None
+        if hasattr(self.session, "zim_date_known") and self.session.zim_date_known(source):
+            zim = self.session.zim_date(source) or ""
+        location = library_location(
+            getattr(self.install, "storage_host", "") or "",
+            getattr(self.install, "container_storage", "/app/storage") or "/app/storage",
+            source,
+        )
+        stat = compose_detail(
+            source,
+            saved,
+            name=live.name if live is not None else "",
+            file_type=live.file_type if live is not None else "",
+            size_bytes=live.size_bytes if live is not None else 0,
+            location=location,
+            mtime=live.mtime if live is not None else None,
+            zim_date=zim,
+            articles=live.articles if live is not None else None,
+            total_articles=live.total_articles if live is not None else None,
+            chunks=live.chunks if live is not None else None,
+            state=live.state if live is not None else "",
+            priority=priority,
+            have_live=live is not None,
+        )
+        return detail_lines(stat)
+
+    def on_details(self, source: str) -> None:
+        """Show the saved facts for one file. This does not start indexing."""
+        gtk = self.gtk
+        rows = self.file_detail_rows(source)
+        title = next((value for label, value in rows if label == "Name" and value and value != "—"), "File details")
+        dialog = gtk.Dialog(
+            title=title,
+            parent=self.window,
+            flags=gtk.DialogFlags.MODAL,
+        )
+        dialog.set_default_size(520, 460)
+        dialog.add_button("Close", gtk.ResponseType.CLOSE)
+        scroll = gtk.ScrolledWindow()
+        scroll.set_policy(gtk.PolicyType.NEVER, gtk.PolicyType.AUTOMATIC)
+        grid = gtk.Grid(column_spacing=16, row_spacing=6)
+        grid.set_border_width(12)
+        for index, (label, value) in enumerate(rows):
+            caption = gtk.Label(label=label)
+            caption.set_xalign(0)
+            shown = gtk.Label(label=value)
+            shown.set_xalign(0)
+            shown.set_selectable(True)
+            shown.set_line_wrap(True)
+            shown.set_max_width_chars(48)
+            grid.attach(caption, 0, index, 1, 1)
+            grid.attach(shown, 1, index, 1, 1)
+        scroll.add(grid)
+        dialog.get_content_area().pack_start(scroll, True, True, 0)
+        dialog.show_all()
+        dialog.run()
+        dialog.destroy()
+
+    def on_index_now(self, source: str) -> None:
+        """Leave the embed call already running, then index this file."""
+        self.session.request_index_now(source)
+        running = self.thread is not None and self.thread.is_alive()
+        if running:
+            self.session.set_note("That file is next.")
+            return
+        self.on_start(False)
+
+    def on_priority(self, source: str, on: bool) -> None:
+        self.session.set_priority(source, bool(on))
+        stats = getattr(self, "file_stats", None)
+        if stats is not None:
+            stats.set_priority(source, bool(on))
+            try:
+                stats.save()
+            except Exception:
+                log.exception("could not save the priority for %s", source)
+        self.refresh_rows()
+
     def on_tune_auto(self, button) -> None:
         active = bool(button.get_active())
-        self.scale.set_sensitive(not active)
+        self.session.set_tune_auto(active)
+        self.chunk_entry.set_sensitive(not active)
         self._tune_hold = None
         self.install.tune_auto = active
         try:
@@ -1339,21 +1865,61 @@ class _Window:
             log.exception("could not save the auto batch setting")
         self._apply_tune()
 
-    def on_slider(self, scale) -> None:
-        percent = clamp_boost_percent(int(round(scale.get_value())))
-        self.session.set_percent(percent)
-        if not self._tune_applying:
-            self._tune_hold = None
+    def on_chunks(self, entry) -> None:
+        """Apply a typed chunk count as the digits change. The next call uses it."""
+        if self._tune_applying:
+            return
+        text = entry.get_text().strip()
+        if not text.isdigit():
+            return
+        typed = int(text)
+        if typed < 1:
+            return
+        count = clamp_embed_chunks(typed)
+        if count != typed:
+            self._tune_applying = True
+            try:
+                entry.set_text(str(count))
+            finally:
+                self._tune_applying = False
+        self.session.set_chunks(count)
+        self._tune_hold = None
+        self._queue_chunk_save(count)
         self.refresh_usage()
+
+    def on_recommend(self, *_args) -> None:
+        """Set the chunk count to the safe call for the computer running Turbo."""
+        gpu_total = self.live_gpu[1] if self.live_gpu else None
+        count = safe_call_chunks(
+            gpu_total_mib=gpu_total,
+            host_total_mib=self.host_total_mib,
+            cpu_count=self.cpu_count,
+        )
+        self._tune_hold = None
+        self._show_chunk_count(count)
+        self._queue_chunk_save(count)
+        self.refresh_usage()
+
+    def _show_chunk_count(self, count: int) -> None:
+        count = clamp_embed_chunks(count)
+        self.session.set_chunks(count)
+        shown = str(count)
+        if self.chunk_entry.get_text().strip() != shown:
+            self._tune_applying = True
+            try:
+                self.chunk_entry.set_text(shown)
+            finally:
+                self._tune_applying = False
+
+    def _queue_chunk_save(self, count: int) -> None:
         if self.save_timer:
             self.glib.source_remove(self.save_timer)
-        self.save_timer = self.glib.timeout_add(400, self._save_percent, percent)
+        self.save_timer = self.glib.timeout_add(400, self._save_chunks, int(count))
 
-    def _save_percent(self, percent: int) -> bool:
+    def _save_chunks(self, count: int) -> bool:
         self.save_timer = None
         try:
-            self.install.boost_percent = percent
-            self.install.reserve_ratio = reserve_ratio_from_percent(min(percent, 100))
+            self.install.embed_chunks = int(count)
             save_install(self.install)
         except Exception:
             log.exception("could not save the embed batch size")
@@ -1362,9 +1928,9 @@ class _Window:
     def on_filter(self, *_args) -> None:
         self.filter_dirty = True
 
-    def on_start(self, wipe: bool) -> None:
+    def on_start(self, wipe: bool) -> bool:
         if not self.rows_ready or self._work_alive() or not self.qdrant_ready:
-            return
+            return False
         self.session.stop.clear()
         self.session.wipe_confirmed = bool(wipe)
         self.session.set_phase("waiting")
@@ -1372,6 +1938,7 @@ class _Window:
         self._finish_told = False
         self.thread = threading.Thread(target=self._run, args=(wipe,), name="nomad-turbo")
         self.thread.start()
+        return True
 
     def on_delete_index(self, *_args) -> None:
         if not self.rows_ready or self._work_alive() or not self.qdrant_ready:
@@ -1539,20 +2106,35 @@ class _Window:
         import nomad_turbo.packing as packing
         import nomad_turbo.pool as pool
         import nomad_turbo.runtime as runtime
+        import nomad_turbo.schedule as schedule
+        import nomad_turbo.session as session_mod
         import nomad_turbo.slots as slots
         import nomad_turbo.store as store
+        import nomad_turbo.tune as tune
 
         # Start loads the modules again so a fix applies without reopening the window.
+        # tune is reloaded so Auto picks up a batch-rule fix on this Start.
         # slots is first because pool and engine bind its functions at import.
         # chunking is before packing because packing binds the fit helpers at import.
+        # session is reloaded before engine, then the live object takes the new class.
+        # The object was built when the window opened. Leaving it on the old class
+        # makes the first recorded embed call abort the file.
         importlib.reload(slots)
+        importlib.reload(session_mod)
         importlib.reload(store)
         importlib.reload(runtime)
+        importlib.reload(schedule)
         importlib.reload(decisions)
         importlib.reload(chunking)
         importlib.reload(packing)
         importlib.reload(pool)
         importlib.reload(engine)
+        importlib.reload(tune)
+        if self.session.__class__ is not session_mod.Session:
+            try:
+                self.session.__class__ = session_mod.Session
+            except TypeError:
+                log.warning("session recorder kept the copy loaded when the window opened")
         execute = engine.execute
 
         write_shortcut(True)
@@ -1578,6 +2160,8 @@ class _Window:
 
     def on_tick(self) -> bool:
         self.tick += 1
+        if self.tick % 4 == 0:
+            self._flush_stats()
         snap = None
         view = {"phase": "", "note": "", "error": ""}
         try:
@@ -1613,6 +2197,7 @@ class _Window:
                 self._log_failed = True
                 log.exception("log pane failed")
         if self.session.close_requested and not self._work_alive():
+            self._flush_frame()
             self._release_log_pane()
             self.qdrant_stop.set()
             self.gtk.main_quit()
@@ -1630,6 +2215,10 @@ class _Window:
         self.start_button.set_sensitive(library_idle and changes)
         self.delete_button.set_sensitive(library_idle and changes)
         self.rescan_button.set_sensitive(library_idle)
+        measuring = bool(self.session.measuring()) if hasattr(self.session, "measuring") else False
+        self.measure_button.set_sensitive(
+            self.rows_ready and changes and not measuring and not repairing and not deleting and (library_idle or running)
+        )
         self._gate_tip(self.start_button, self.start_tip)
         self._gate_tip(self.delete_button, self.delete_tip)
         self.stop_button.set_sensitive(running or deleting)
@@ -1651,41 +2240,43 @@ class _Window:
         if book is None:
             return None
         snap = book.snapshot()
-        seen = {item.source for item in snap.files}
+        priorities = self.session.priorities() if hasattr(self.session, "priorities") else set()
+        dates = self.session.zim_dates() if hasattr(self.session, "zim_dates") else {}
+        source = next((item.source for item in snap.files if item.state == "running"), "")
+        hide = bool(self.hide_finished.get_active()) if hasattr(self, "hide_finished") else False
+        visible = list_display_order(
+            files_for_list_order(snap.files, priorities=priorities, dates=dates),
+            self.session.get_order() if hasattr(self.session, "get_order") else "library",
+            current=source or None,
+            hide_finished=hide,
+        )
+        activity = ""
+        if hasattr(self.session, "view"):
+            activity = self.session.view().get("note") or ""
+        seen = set(visible)
         for index in range(len(self.store) - 1, -1, -1):
             if self.store[index][0] not in seen:
                 del self.store[index]
         existing = self._iters_by_source(self.store)
-        for item in snap.files:
-            kind = "Upload" if item.origin == "upload" else "ZIM"
-            rate_sort = int(item.articles_per_minute or 0)
-            eta_sort = UNKNOWN_ETA_SECONDS if item.eta_seconds is None else int(item.eta_seconds)
-            values = (
-                item.source,
-                item.name,
-                kind,
-                item.status,
-                item.percent,
-                item.count,
-                item.chunks_text,
-                item.size_text,
-                item.rate_text,
-                item.eta,
-                item.color,
-                int(item.articles),
-                int(item.chunks),
-                int(item.size_bytes),
-                rate_sort,
-                eta_sort,
-            )
+        by_source = {item.source: item for item in snap.files}
+        for item_source in visible:
+            item = by_source.get(item_source)
+            if item is None:
+                continue
+            values = index_store_row(item, priority=item.source in priorities)
+            if item.state == "running":
+                cells = ocr_list_cells(activity)
+                if cells is not None:
+                    status, percent = cells
+                    values = (*values[:COL_STATUS], status, percent, *values[COL_PROGRESS + 1 :])
             if item.source in existing:
                 self._set_row(self.store, existing[item.source], values)
             else:
                 self.store.append(values)
-        source = next((item.source for item in snap.files if item.state == "running"), "")
+        self._reorder_store(self.store, visible)
         self._refit_columns(self.file_tree)
         self._follow_files(self.file_tree, source)
-        title, fraction, text = format_current_file(snap)
+        title, fraction, text = format_current_file(snap, activity)
         self._show(self.current_label, title)
         self.current_label.set_tooltip_text(title if source else TIPS["file_now"])
         self.current_bar.set_fraction(min(1.0, max(0.0, fraction)))
@@ -1693,6 +2284,22 @@ class _Window:
         self.overall.set_fraction(min(1.0, max(0.0, snap.overall_fraction)))
         self._show(self.overall, snap.overall_text)
         return snap
+
+    def _reorder_store(self, store, sources: list[str]) -> None:
+        """Put store rows into sources order. Gtk maps each new slot to the old one."""
+        positions = {}
+        iterator = store.get_iter_first()
+        index = 0
+        while iterator is not None:
+            positions[store.get_value(iterator, 0)] = index
+            iterator = store.iter_next(iterator)
+            index += 1
+        if len(positions) != len(sources) or any(source not in positions for source in sources):
+            return
+        new_order = [positions[source] for source in sources]
+        if new_order == list(range(len(new_order))):
+            return
+        store.reorder(new_order)
 
     def _iters_by_source(self, store):
         """Row iterators stay valid when a sort column moves the row."""
@@ -1749,7 +2356,7 @@ class _Window:
         if self.hidden and (indexing or repairing):
             self.indicator.set_status(status.ATTENTION)
             if indexing:
-                label = f"{view['percent']}%"
+                label = str(view.get("chunks", view["percent"]))
             elif getattr(self.repair_board, "kind", "") == "scan":
                 label = "scan"
             else:
@@ -1757,7 +2364,7 @@ class _Window:
             self.indicator.set_label(label, "100%")
         else:
             self.indicator.set_status(status.ACTIVE)
-            self.indicator.set_label(f"{view['percent']}%" if indexing else "", "100%")
+            self.indicator.set_label(str(view.get("chunks", view["percent"])) if indexing else "", "chunks")
         if repairing and hasattr(self, "tray_stop"):
             scanning = getattr(self.repair_board, "kind", "") == "scan"
             self.tray_stop.set_label("Stop scan" if scanning else "Stop repair")
@@ -1797,16 +2404,8 @@ class _Window:
 
     def refresh_usage(self) -> None:
         view = self.session.view()
-        percent = view["percent"]
-        gpu_total = self.live_gpu[1] if self.live_gpu else None
-        chunks = embed_call_budget(
-            percent,
-            gpu_total_mib=gpu_total,
-            host_total_mib=self.host_total_mib,
-            cpu_count=self.cpu_count,
-        )
+        chunks = int(view.get("chunks", view["percent"]))
         text = usage_text(
-            set_percent=percent,
             chunks=chunks,
             server_up=view["active_slots"] > 0 and view["phase"] in ("waiting", "running"),
             slots_ignored=bool(self.install.slots),
@@ -1826,8 +2425,8 @@ class _Window:
         self._apply_tune()
 
     def _apply_tune(self) -> None:
-        """Show the live batch advice. Auto moves the slider only after finished calls earn it."""
-        from nomad_turbo.tune import EmbedSample, tune_advice
+        """Show the live batch advice. Auto changes the chunk count only after finished calls earn it."""
+        from nomad_turbo.tune import EmbedSample, content_kind, tune_advice
 
         if self._tune_applying or not hasattr(self, "tune_label"):
             return
@@ -1837,13 +2436,23 @@ class _Window:
         free = None
         if gpu and gpu[1]:
             free = max(0, int(gpu[1]) - int(gpu[2]))
-        samples = [
-            EmbedSample(percent, chunks, seconds, ok)
-            for percent, chunks, seconds, ok in self.session.embed_calls()
-        ]
+        samples = []
+        for item in self.session.embed_calls():
+            size, chunks, seconds, ok = item[:4]
+            kind = item[4] if len(item) > 4 else ""
+            article_size = item[5] if len(item) > 5 else 0
+            samples.append(EmbedSample(int(size), int(chunks), float(seconds), bool(ok), str(kind), int(article_size)))
+        live_kind = ""
+        book = self.session.get_book()
+        if book is not None:
+            snap = book.snapshot()
+            current = next((row for row in snap.files if row.state == "running"), None)
+            if current is not None:
+                live_kind = content_kind(current.source or current.name)
+        count = int(view.get("chunks", view["percent"]))
         advice = tune_advice(
             samples,
-            view["percent"],
+            count,
             auto=bool(self.tune_auto.get_active()) if hasattr(self, "tune_auto") else False,
             running=running,
             optimizing=bool(view.get("optimize_hold")),
@@ -1852,20 +2461,18 @@ class _Window:
             call_count=self.session.embed_call_count(),
             now=time.monotonic(),
             memory=self._pace_memory,
+            kind=live_kind,
         )
         self._tune_hold = advice.hold
         self._show(self.tune_label, advice.text)
         self.tune_label.set_tooltip_text(f"{TIPS['tune']} {advice.text}".strip())
-        if not advice.move or advice.percent == view["percent"]:
+        if not advice.move or advice.count == count:
             return
         if advice.text != self._tune_logged:
             self._tune_logged = advice.text
             log.info("embed batch: %s", advice.text)
-        self._tune_applying = True
-        try:
-            self.scale.set_value(advice.percent)
-        finally:
-            self._tune_applying = False
+        self._show_chunk_count(advice.count)
+        self._queue_chunk_save(advice.count)
 
     def refresh_log(self) -> None:
         show_info = self.info_check.get_active()
@@ -2153,11 +2760,9 @@ class _Window:
         optimize_row.pack_start(self.repair_optimize_bar, True, True, 0)
         lower.pack_start(optimize_row, False, False, 0)
         self.repair_buttons = buttons
-        self.repair_pane = self._make_pane()
-        self.repair_pane.pack1(scrolled, True, True)
-        self.repair_pane.pack2(self._portion(lower), False, False)
-        self._track_pane(self.repair_pane, "repair_pane")
-        page.pack_start(self.repair_pane, True, True, 0)
+        self.repair_controls = lower
+        page.pack_start(self.repair_list, True, True, 0)
+        page.pack_start(self.repair_controls, False, False, 0)
         self.stack.add_titled(page, "repair", "Repair")
         self.repair_page = page
 
@@ -2211,7 +2816,6 @@ class _Window:
         page.pack_start(scroll, True, True, 0)
         self.stack.add_titled(page, "about", "About")
         self.about_page = page
-        self.stack.connect("notify::visible-child-name", self._show_pane_page)
 
     def _set_repair_status(self, text: str) -> None:
         self._show(self.repair_status, text)

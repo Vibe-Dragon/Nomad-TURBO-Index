@@ -46,6 +46,7 @@ def log_help_text() -> str:
         (
             "Where a line goes",
             "Errors, Info, and Debug only change which lines the pane draws. "
+            "Debug starts off, so article-by-article lines stay out of the pane. "
             "The log file still records every line, including the ones those boxes hide. "
             "Follow only scrolls the pane.",
         ),
@@ -83,9 +84,11 @@ def log_help_text() -> str:
         ),
         (
             "Embed batch",
-            "\"<n> chunks per call at <percent>%\" is the size of the next embed call. "
-            "\"embed batch:\" is Auto, or the recommendation, saying why the slider moved. "
+            "\"<n> chunks per call\" is the size of the next embed call. "
+            "\"embed batch:\" is Auto, or the recommendation, saying why the chunk count moved. "
             "\"one embed server is up\" means the server started. One server stays up. "
+            "\"embed sequences\" is that server adding or dropping a second sequence. "
+            "Each sequence keeps 2048 tokens. "
             "\"embedder not ready yet\" means the model is still loading. "
             "\"embedder call failed\" means that call will be tried again.",
         ),

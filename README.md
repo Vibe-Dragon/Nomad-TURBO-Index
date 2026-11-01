@@ -11,7 +11,7 @@ Nomad TURBO Index speeds up a stock [Project NOMAD](https://github.com/Crosstalk
 - Turbo leaves out navigation, scripts, and similar chrome.
 - Turbo reads upload PDFs and pictures itself.
 - Turbo pauses only file embedding and restores the ingest policy found at start.
-- The call size scales with detected hardware and can be set to 150%.
+- The call size is a chunk count. Recommended is the safe call for the computer running Turbo, and Auto can go above it.
 
 ## Turbo runs outside the admin container and does not patch it
 
@@ -36,18 +36,12 @@ command = [
 
 ## Turbo uses its own embed server and larger calls instead of stock's small embed jobs
 
-Stock NOMAD queues small embed jobs on `file-embeddings` and talks to Ollama one batch at a time. Turbo leaves that worker idle and talks to one `llama-server` it started from the same Ollama image NOMAD already has. The model is loaded once. The slider changes how many chunks the next HTTP call sends. It does not start a second server.
+Stock NOMAD queues small embed jobs on `file-embeddings` and talks to Ollama one batch at a time. Turbo leaves that worker idle and talks to one `llama-server` it started from the same Ollama image NOMAD already has. The model is loaded once. The chunk count changes how many chunks the next HTTP call sends. It does not start a second server. That server can open a second sequence when the card has room for another 2048-token context. Each sequence keeps that context. Long calls that get slower send it back to one sequence.
 
 ```python
-def batch_width(self, percent: int) -> int:
-    """Chunks the next call sends. One server. The width follows the computer running Turbo."""
-    gpu_total = self.total_mib if self.use_gpu and self.total_mib > 0 else None
-    return embed_call_budget(
-        percent,
-        gpu_total_mib=gpu_total,
-        host_total_mib=self.host_total_mib or 0,
-        cpu_count=self.cpu_count,
-    )
+def call_width(self, chunks: int) -> int:
+    """Chunks the next call sends. The argument is already a chunk count."""
+    return clamp_embed_chunks(chunks)
 ```
 
 A call that is already in flight finishes at the old width. The next call uses the new one.
@@ -97,7 +91,7 @@ Sections whose heading is "References", "See also", "External links", and the sa
 
 Stock NOMAD stores how many articles it has finished. The next batch opens the ZIM, starts at the first article, and counts forward until it reaches that number. The batch after that opens the file and counts from the first article again.
 
-Turbo stores the path of the last article it checkpointed. One reader opens the ZIM and walks forward until it reaches that path. Articles it passes are not parsed. The file stays open, and later embed calls continue with the next article. They do not go back to the start and count up to the saved number.
+Turbo stores the path of the last article it checkpointed. One reader opens the ZIM and walks forward until it reaches that path. Articles it passes are not parsed. The file stays open, and later embed calls continue with the next article. They do not go back to the start and count up to the saved number. While that walk is going, a second reader loads upcoming clusters into the cache libzim already chose, up to half of that cache. It does not raise the cache. If that prefetch stops, the article thread keeps going.
 
 This build of libzim can look up one path, and that lookup returns only that entry, not the rest of the file. The reader cannot jump to the saved article and then iterate the tail. It walks forward once, when the reader opens the file, and then stays there. A checkpoint that has no path still uses the article count.
 
@@ -131,7 +125,7 @@ A crash resumes after the last article that was checkpointed. The checkpoint is 
 
 ## Turbo reads upload PDFs and pictures itself
 
-Stock embeds an upload from inside the admin container. Turbo reads plain text, DOCX, and EPUB on the host. For a PDF or a picture it runs the OCR libraries that are already in the NOMAD image, then chunks and embeds that text with its own server. It does not hand the file to NOMAD's embedder.
+Stock embeds an upload from inside the admin container. Turbo reads plain text, DOCX, and EPUB on the host. For a PDF or a picture it runs the OCR libraries that are already in the NOMAD image, then chunks and embeds that text with its own server. It does not hand the file to NOMAD's embedder. While that read is going, the file line names the file, the row says OCR, the bar shows the OCR page, and each page is written to the log. OCR does not use the GPU. A Measure sample's five minutes start after the read, when embedding starts. A file left before any of it was stored stays waiting.
 
 ```javascript
 // Read one uploaded PDF or image with the OCR libraries in the NOMAD image.
@@ -171,15 +165,13 @@ def stock_should_continue(previous: str | None) -> bool:
 
 Stop does not delete the index. Delete is a separate button. It asks you to type DELETE, removes stored vectors and ingest rows, and does not start indexing. ZIM files and uploads stay on disk.
 
-## The call size scales with detected hardware and can be set to 150%
+## The call size is a chunk count
 
-There is no fixed chunk ceiling and no graphics-card name in the math. When a GPU is present, the safe 100% call is computed from that card's memory. Otherwise it is computed from system RAM and the CPU count. The same inputs always give the same count. A machine with more memory gets a 100% call at least as large as a machine with less. A machine with no GPU still gets a finite plan.
+There is no fixed chunk ceiling and no graphics-card name in the math. When a GPU is present, the safe call is computed from that card's memory. Otherwise it is computed from system RAM and the CPU count. The same inputs always give the same count. A machine with more memory gets a safe call at least as large as a machine with less. A machine with no GPU still gets a finite plan. That safe call is the **Recommended** count. It is a start, not a maximum. A larger count does not change GPU clocks.
 
-The slider runs from 10% to 100% of that budget. Above 100% is an overclock, up to 150%. 150% adds half of the safe call, rounded down to a whole number of chunks. A new install does not start at 150%. The default is 55% (`reserve_ratio` 0.45) until you move the slider. One embed server stays up either way. Past 100% can be slower if the card is already full. It is there for people who want to try past the safe size.
+The control is a text field. Type a chunk count and the next embed call uses it. The call already in flight finishes at the old size. One embed server stays up. A saved percent from an older version opens as the chunk count that percent meant, so the old figure is not used as a raw chunk count.
 
-Moving the slider during a run changes the next embed call. The usage line updates as you move it. The call that is already in flight finishes at the old size. When the next call starts, the log says how many chunks it will send and the percent you set. The server is not restarted.
-
-The line under the buttons recommends from finished embed calls, not from the card's listed memory. After three full calls it says whether chunks are keeping up, whether this setting is slower than a smaller one, or whether the embed server struggled. A segment rewrite is called out on its own, because a larger batch will not speed that wait. **Auto**, beside the slider, raises the setting while those calls keep up and steps down when a larger call is clearly slower than the nearest smaller size it still remembers, or the call fails. It keeps that neighbor's pace after the recent calls have moved on, so a long stay at one setting can still step down. A fast sample from earlier in the climb does not pull the slider down. A step that is not faster does not keep going. A slowdown smaller than about a fifth is left alone. It then waits about a minute and a half, and through more finished calls, before trying one step higher again, so it does not bounce. If the pace of the work changes a lot, it tries sooner. One odd slow call does not cut the batch. A probe that keeps up waits again before the next step. If the calls are still keeping up at 150%, that is the top of the slider, not proof the card has more room. Card memory only stops the climb when the live reading has little free memory left. Auto does not start a second server.
+The line under the buttons follows finished embed calls, not the card's listed memory. **Auto**, beside the field, raises the count while a larger count is still faster. A tie does not force another climb. It can go above the old top of the percent slider. It steps down when a larger count is clearly slower, when the embed server fails the call, or when free card memory is low. A brief slow patch that later calls do not repeat does not move the count. Article length does not move the count, and a pace from another article length is not used. Another publication's pace is not a verdict. A segment rewrite is called out on its own, because a larger batch will not speed that wait. Auto does not start a second server.
 
 ```python
 full = safe_call_chunks(
@@ -187,13 +179,9 @@ full = safe_call_chunks(
     host_total_mib=host_total_mib,
     cpu_count=cpu_count,
 )
-pct = clamp_boost_percent(percent)
-if pct > 100:
-    extra = max(1, full * (pct - 100) // 100)
-    return full + extra
 ```
 
-`python3 -m nomad_turbo plan` prints the hardware-derived size. It does not pause NOMAD or start containers.
+`python3 -m nomad_turbo plan` prints the recommended size and the saved chunk count. It does not pause NOMAD or start containers.
 
 ## Disclaimer
 
@@ -231,9 +219,9 @@ You have to type DELETE. It removes stored knowledge points and ingest rows. Ind
 
 A GPU is used when the machine has one. With no GPU, the call size comes from system RAM and the CPU count. The package does not depend on a specific driver or a specific card. It installs on Debian, Ubuntu, and Linux Mint. It needs Python 3, GTK, Docker usable by your user, and NOMAD already running.
 
-### What does the slider do, and what is 150%?
+### What does the chunk count do?
 
-The slider is a share of the budget detected on your computer. 10% to 100% stays inside that budget. 150% is an overclock past it: half again the safe call, rounded down to whole chunks. A new install starts at 55%. One embed server stays up. Moving the slider during a run changes the next call. The call already running is left alone. Past 100% can be slower when the card is already busy. **Auto** next to the slider follows finished calls in both directions. It remembers the size just below the current one, and it steps down when a larger call is clearly slower than that neighbor, or the call fails. A long stay at one setting does not erase that neighbor. A fast sample from earlier in the climb does not pull the slider down. A step that is not faster does not keep going. It then waits about a minute and a half before trying one step higher again. A small slowdown does not move it. If the pace of the work changes a lot, it tries sooner.
+The field is how many chunks the next embed call sends. **Recommended** sets it to the safe call detected from the memory and CPU of the computer running Turbo. That is a start, not a maximum. Typing a number changes the next call. The call already running is left alone. One embed server stays up. A larger count does not change GPU clocks. A saved percent from an older version opens as the chunk count that percent meant. **Auto** follows finished embed calls. It raises the count while a larger count is still faster, and a tie does not force another climb. It can go above the old top. It steps down when a larger count is clearly slower, or the call fails. A brief slow patch that the next calls do not repeat is left alone. Article length does not move the count, and a pace from another article length is not used. Another publication's pace is not a verdict.
 
 ### Will this stay current when I update NOMAD?
 
@@ -283,13 +271,13 @@ Click the icon. The window scans the library. Opening it does not start or stop 
 
 **Start indexing** pauses NOMAD's file embedding and continues from the saved article. The reader opens the ZIM once, walks to that article, and keeps going from there. **Rescan** reads the library again. It does not pause NOMAD or start indexing. **Stop** finishes the embed call already running. It does not delete the index. When the run started on Manual, unfinished files are not handed back to stock NOMAD. **Delete index** sits at the right end of the button row. You must type DELETE. Indexing does not start. ZIM files and uploads stay.
 
-The header shows the package version beside **Index**, **Repair**, and **About**. **Host** opens a separate window for CPU, memory, GPU, and video memory, plus the used space, size, read speed, and write speed of each disk the library uses. A folder on its own disk is its own line. That window resizes on its own, and its size and place are remembered. The header link opens the [Nomad TURBO Index repository](https://github.com/Vibe-Dragon/Nomad-TURBO-Index). **About** is its own page. It shows this Turbo version, states that this version was tested with Project NOMAD 1.35.1, and links to that repository and the [Project NOMAD repository](https://github.com/Crosstalk-Solutions/project-nomad). It names the author Vibe-Dragon, the MIT license, Copyright 2026, that these notes are updated when I get to it, and that I am not responsible if Turbo messes up an index.
+The header shows the package version beside **Index**, **Repair**, and **About**. **Host** is a checkbox. It shows CPU, memory, GPU, and video memory, plus the used space, size, read speed, and write speed of each disk the library uses, in a pane beside the pages. A folder on its own disk is its own line. A vertical bar sets that pane's width. Whether it is open, and that width, are remembered. The header link opens the [Nomad TURBO Index repository](https://github.com/Vibe-Dragon/Nomad-TURBO-Index). **About** is its own page. It shows this Turbo version, states that this version was tested with Project NOMAD 1.35.1, and links to that repository and the [Project NOMAD repository](https://github.com/Crosstalk-Solutions/project-nomad). It names the author Vibe-Dragon, the MIT license, Copyright 2026, that these notes are updated when I get to it, and that I am not responsible if Turbo messes up an index.
 
-The file list is the part that grows. On Index, the current-file bar and the library bar share one row under the list. The optimization bar sits above the list and appears when indexing is waiting on a segment rewrite. The usage line and the card line share the next row. The usage line reads `Set 55% · <chunks> chunks per call. Embed server: idle.` The chunk count is the budget for that setting on your machine. Once a run has started the server, that line says `One embed server is running.` Above 100% it adds `Overclock past the detected budget.` The card line on that same row reads `Card memory in use: <used> / <total> MiB`, or `No GPU detected. The embed server will use the CPU.` The stats line is under those. **Stay on after the last file** shares the button row with **Start indexing**, **Stop**, **Rescan**, and **Export log**. **Embed batch** is on that same row, between **Export log** and **Delete index**. At the default window size, with the log open and the drag bars left where a new install puts them, each file list is at least half its page. Extra height goes to the list. Hover any button, checkbox, column heading, progress bar, or those lines for what they do.
+The file list is the part that grows. On Index, the current-file bar and the library bar share one row under the list. The optimization bar sits above the list and appears when indexing is waiting on a segment rewrite. The usage line and the card line share the next row. The usage line reads `<chunks> chunks per call. Embed server: idle.` Once a run has started the server, that line says `One embed server is running.` The card line on that same row reads `Card memory in use: <used> / <total> MiB`, or `No GPU detected. The embed server will use the CPU.` The stats line is under those. **Stay on after the last file** shares the button row with **Start indexing**, **Stop**, **Rescan**, and **Export log**. **Embed batch**, the chunk field, **Recommended**, and **Auto** are on that same row, between **Export log** and **Delete index**. At the default window size, with the log open, each file list is at least half its page. Extra height goes to the list. Hover any button, checkbox, column heading, progress bar, or those lines for what they do.
 
 The Qdrant line sits under the Index / Repair / About switch. **Start indexing**, **Delete index**, **Scan**, and **Start repair** stay off until that line says `Qdrant is ready for changes.` **Rescan** does not wait.
 
-The window edges resize the whole window. The smallest size it asks for is 480 by 280. Each page has a drag bar between the file list and the controls. At that size the file list keeps a non-zero height and the controls stay in their scroller, so they can be scrolled into view when the window is short. The log bar sits under the Log row. Column edges resize. Those positions are remembered. Blue names are ZIM files and amber names are uploads. That note is on the File heading, and on the Index status line's tip. Repair's longer instructions are on the repair status tip.
+The window edges resize the whole window. The smallest size it asks for is 480 by 280. If the controls need more height than that, the window stays tall enough to keep them on screen. That size and its place on the screen are saved, and a maximized window opens maximized. The controls stay under the file list, against the bar above the log. That bar changes the list height. The log row stays against the other side of the bar. Whether the log is open, and that bar, are remembered. Column edges resize. Those positions are remembered. Blue names are ZIM files and amber names are uploads. That note is on the File heading, and on the Index status line's tip. Repair's longer instructions are on the repair status tip.
 
 If Turbo dies while the embed queue is paused, the next time the window opens it puts the ingest policy back and resumes NOMAD embedding. If a repair delete may still be running, embedding stays paused. `nomad-turbo recover` does the same thing.
 
@@ -301,21 +289,24 @@ Closing the window while a run is going hides it to the tray. The tray menu can 
 
 The Index page is the library list.
 
-- **File.** Blue names are ZIM files. Amber names are uploads. Hover a row for the full path.
-- **Kind.** ZIM library, or a file uploaded to the knowledge base.
+- **File.** Blue names are ZIM files. Amber names are uploads. Hover a row for the full path. A red asterisk to the left of the name means that file is prioritized.
+- **File type.** zim, pdf, docx, epub, txt, md, rtf, or an image extension such as jpg or png.
+- **Size.** The file on disk.
 - **Status.** Waiting, indexing, indexed, partial, failed, or needs NOMAD.
 - **Progress.** How far this file is through its articles.
 - **Articles.** Stored so far, and the total when it is known.
+- **art/min.** Articles per minute for the file being indexed. Other rows stay blank.
 - **Chunks.** Embedded pieces stored for this file. A long page is many chunks.
-- **Size.** The file on disk.
-- **Rate.** Articles per minute swing with page length. Chunks per second stay steadier.
-- **ETA.** Time left for this file at its recent article rate.
+- **chk/s.** Chunks per second for the file being indexed.
+- **ETA.** Time left for this file. After Measure, a sampled file keeps that ETA.
 
-The file being indexed has its own bar. The library bar on the same row is the whole library, weighed by file size, and the time left for what remains. **Embed batch** is on the button row, between **Export log** and **Delete index**. Moving it during a run changes the next embed call.
+**Order** chooses which unfinished file comes next, and the file list follows that same order. The file already in progress stays at the top and keeps going. Prioritized files come next, in that order, and finished files stay at the bottom. **Hide finished** takes the indexed files out of the list. Right-click a row for **Index now**, to set or clear priority, or for **Details**. Details shows the file's size, location on disk, download date, ZIM date, article and chunk counts, slowest and fastest speeds, the last measured ETA, and whether it is prioritized. Those facts are saved and come back the next time Turbo opens. A file that leaves the library is forgotten. Priority comes back with them. **Measure** indexes each unfinished file for about five minutes, then resumes a run that was already going, or stops the way **Stop** does when Measure started from idle.
+
+The file being indexed has its own bar. The library bar on the same row is the whole library, weighed by file size, and the time left for what remains. **Embed batch** is the chunk field on the button row, between **Export log** and **Delete index**. Typing a count during a run changes the next embed call.
 
 An optimization bar appears above the file list while indexing is paused so a segment can be rewritten. Each new pause starts that bar's clock over. Qdrant does not report how far the in-memory build is, so the bar moves without a percent. The stats line counts articles per minute, chunks per minute, skipped pages, and bad pages. Skipped pages had no text. Bad pages could not be read or parsed. A long page is indexed in full.
 
-The list keeps the active file near the top. Click a heading to sort. Drag a column edge to resize it. That width is remembered.
+The list keeps the file being indexed at the top. Drag a column edge to resize it. That width is remembered.
 
 ## Resource spikes while indexing
 
@@ -417,7 +408,7 @@ The status line under the page switch is one of these until the collection answe
 - `Qdrant is running. The ready check has not passed. Not ready for changes.`
 - `Qdrant is still writing. Do not restart it or delete the index.`
 
-A large collection can be up and still on the last of those while it finishes a write. **Start indexing**, **Delete index**, **Scan**, and **Start repair** stay off. The second line names the container, how long it has been up, the health check, the ready check, and whether the collection answered. When the collection does not answer, that line also says a restart would replay the write, and it says whether the open segment is still gaining vectors. When Docker returned a log line, it is included as `Last log:`.
+A large collection can be up and still on the last of those while it finishes a write. **Start indexing**, **Delete index**, **Scan**, and **Start repair** stay off. The second line names the container, how long it has been up, the health check, the ready check, and whether the collection answered. When the collection does not answer, that line also says a restart would replay the write, and it says whether the open segment is still gaining vectors. The check does not read the container log.
 
 `Qdrant is ready for changes.` is the line that turns those buttons on.
 
@@ -444,6 +435,8 @@ Pressing the button writes `Optimize stuck segments: checking.` Then one of `ref
 ### The embed server is not ready
 
 Before Start, the usage line says `Embed server: idle.` After Start, Turbo waits while `llama-server` loads the model. New waits are logged as `embedder not ready yet: ...`. That wait is about three minutes. The usage line then says `One embed server is running.`
+
+`<n> chunks per call` is the size of the next embed call. `embed batch:` is Auto, or the recommendation, saying why the count moved. `embed sequences <n>, <tokens> tokens each` means that one server added or dropped a second sequence. Each sequence keeps 2048 tokens. `long calls were slower with 2 sequences, staying at 1` means it went back to one sequence.
 
 A call that gets HTTP 408, 429, 500, 502, 503, or 504 is logged as `embedder call failed (HTTP 503: ...). Trying again.` The code in the message is the code that came back. Turbo tries that call up to three times. The error that remains is `embedder HTTP 503: ...`. The file is then tried once more from the same article. A second failure at that article is `file failed`.
 
@@ -476,6 +469,6 @@ def embed_input(chunk: str, prefix: str = DOCUMENT_PREFIX) -> tuple[str, str]:
 
 ## What this does not do
 
-It does not upgrade NOMAD, edit compose, or copy files into the admin container. It does not start one embed server per slider notch. It does not delete points unless you type DELETE or you run a repair for a file that is gone.
+It does not upgrade NOMAD, edit compose, or copy files into the admin container. It does not start one embed server per chunk count. It does not delete points unless you type DELETE or you run a repair for a file that is gone.
 
 The license is MIT. See `LICENSE`.

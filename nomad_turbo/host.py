@@ -1,4 +1,4 @@
-"""Host meters for the separate window.
+"""Host meters for the side pane.
 
 CPU, memory, GPU, video memory, and each disk the library uses come from the
 machine Turbo is running on. Nothing here names a GPU model or a disk model.
@@ -510,7 +510,11 @@ def query_gpus() -> list[GpuRow]:
 
 
 class HostSampler:
-    """One background reading a second. The window copies the history."""
+    """One background reading a second. The pane copies the history.
+
+    stop pauses the loop. start resumes it. The thread stays up so a quick
+    hide and show does not lose the next reading.
+    """
 
     def __init__(self, storage: str) -> None:
         self.storage = storage
@@ -523,9 +527,9 @@ class HostSampler:
         self._stamp: float | None = None
 
     def start(self) -> None:
+        self._stop.clear()
         if self._thread is not None and self._thread.is_alive():
             return
-        self._stop.clear()
         self._thread = threading.Thread(target=self._loop, name="nomad-turbo-host", daemon=True)
         self._thread.start()
 
@@ -537,15 +541,20 @@ class HostSampler:
             return list(self.history)
 
     def _loop(self) -> None:
-        while not self._stop.is_set():
+        while True:
+            if self._stop.is_set():
+                time.sleep(0.2)
+                continue
             started = time.monotonic()
             try:
                 self._once()
             except Exception:
                 log.debug("host sample failed", exc_info=True)
-            remaining = 1.0 - (time.monotonic() - started)
-            if self._stop.wait(max(0.0, remaining)):
-                return
+            end = started + 1.0
+            while time.monotonic() < end:
+                if self._stop.is_set():
+                    break
+                time.sleep(0.05)
 
     def _once(self) -> None:
         now = time.monotonic()

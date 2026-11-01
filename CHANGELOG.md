@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.1.4
+
+### Moderate
+
+- The embed batch is a chunk count. Typing it changes the next embed call. **Recommended** sets the count to the safe call detected from the memory and CPU of the computer running Turbo. A saved percent opens as the chunk count that percent meant. **Auto** follows finished embed calls. It can go above the old top while a larger count is still faster. It steps down when a larger count is clearly slower, when the embed server fails the call, or when free card memory is low. A brief slow patch that later calls do not repeat does not move the count. Article length does not move the count, and a pace from another article length is not used. Another publication's pace is not a verdict.
+- One embed server can open a second sequence when the card has room for another 2048-token context. Each sequence keeps that context. Long calls that get slower send it back to one sequence. The log says `embed sequences`.
+- **Debug** starts off in the log pane. The session log file still records those lines.
+
+### Minor
+
+- The main window opens at the size and place it had when it last closed, and maximized if it was maximized. The log bar is placed again after the window has that size.
+- The file list and the controls under it are one section. The bar above the log sizes that section by changing the list height. The controls stay against the top of the bar, and the log row stays against the bottom of it. **Host** is a checkbox. It opens a side pane, and a vertical bar sets that pane's width. Whether Host is open, that width, and the log bar are remembered.
+- The file list shows File type, then Size, and splits the pace into art/min and chk/s. Order chooses how unfinished files are indexed, and the list follows that order: the file in progress, then prioritized files, then the rest, with indexed files at the bottom. Hide finished takes those indexed files out of the list. Right-click a row for Index now or priority. Measure samples each unfinished file for about five minutes and fills in the ETAs.
+- The Qdrant status line no longer reads the container log. That read does not return, and a copy left behind keeps Docker busy after the window is closed.
+- A PDF or picture stays on the file line while OCR reads it. Its row says OCR, and that row's progress is the page. The bar shows the page, and each page is written to the log as it finishes. That read does not use up the five-minute Measure sample. A file left before any of it was stored stays waiting.
+- Right-click a file for Details. Size, location, dates, article and chunk counts, slowest and fastest speeds, the last measured ETA, and priority are saved with that file. Opening Turbo again shows them. A file that leaves the library is dropped from that record.
+- The ZIM reader loads upcoming clusters while it reads the current page. It uses half of the cache libzim already chose and does not raise that cache. If the prefetch stops, the file continues.
+
 ## 1.1.3
 
 ### Moderate
@@ -24,7 +42,7 @@
 ### Major
 
 - Indexing pauses before a new upsert when a plain segment is past the 4 GiB vector cap, or when free space is under twice the segment that would be copied. Points already stored stay. The pause is what stops that segment from growing past the size a later rewrite can copy.
-- The embed-batch slider goes to 150%. 10% to 100% stay inside the budget detected on the computer running Turbo. Above 100% is an overclock. 150% adds half of the safe call, rounded down to a whole number of chunks. A new install still starts at 55%. Moving the slider during a run changes the next embed call. The call already in flight is left alone. One embed server stays up.
+- The embed-batch slider goes to 150%. 10% to 100% stay inside the budget detected on the computer running Turbo. Above 100% sends more chunks than the safe call. It does not change GPU clocks. 150% adds half of the safe call, rounded down to a whole number of chunks. A new install still starts at 55%. Moving the slider during a run changes the next embed call. The call already in flight is left alone. One embed server stays up.
 
 ### Moderate
 

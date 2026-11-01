@@ -6,6 +6,8 @@ even when the process health check has already passed.
 
 from __future__ import annotations
 
+import os
+import signal
 import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -255,11 +257,53 @@ def _plain_ok(url: str, timeout: float = 2) -> bool:
         return False
 
 
-def _docker(*args: str, timeout: float = 5) -> str:
+def _kill_group(proc: subprocess.Popen) -> None:
+    """Stop a command and anything it started. A timed-out read stays otherwise."""
     try:
-        return subprocess.check_output(["docker", *args], text=True, stderr=subprocess.STDOUT, timeout=timeout)
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+        os.killpg(proc.pid, signal.SIGKILL)
+    except OSError:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+    try:
+        proc.communicate(timeout=2)
+    except (subprocess.TimeoutExpired, OSError):
+        if proc.stdout is not None:
+            proc.stdout.close()
+        try:
+            proc.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            return
+
+
+def _run_captured(argv: list[str], timeout: float) -> str:
+    """Run a command and return its output. Empty when it fails or does not finish."""
+    try:
+        proc = subprocess.Popen(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,
+        )
+    except OSError:
         return ""
+    try:
+        out, _unused = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_group(proc)
+        return ""
+    except OSError:
+        _kill_group(proc)
+        return ""
+    if proc.returncode != 0:
+        return ""
+    return out or ""
+
+
+def _docker(*args: str, timeout: float = 5) -> str:
+    return _run_captured(["docker", *args], timeout)
 
 
 def find_qdrant_container() -> str:
@@ -307,7 +351,11 @@ def probe_qdrant(
     storage: str | None = None,
     previous_vectors: int | None = None,
 ) -> QdrantView:
-    """Ask Docker and Qdrant. A starting collection is not poked with a long call."""
+    """Ask Docker and Qdrant. A starting collection is not poked with a long call.
+
+    The container log is left alone. Reading it does not return, and a copy
+    left behind keeps Docker busy after the window is closed.
+    """
     name = container if container is not None else find_qdrant_container()
     status = "missing"
     started = ""
@@ -329,9 +377,6 @@ def probe_qdrant(
     vectors = None
     if storage and running and health_ok and ready_ok and not collection_ok:
         vectors = open_segment_vectors(storage, collection)
-    activity = ""
-    if name and running:
-        activity = activity_from_text(_docker("logs", "--tail", "40", name))
     return describe_qdrant(
         running=running,
         status=status,
@@ -339,8 +384,8 @@ def probe_qdrant(
         ready_ok=ready_ok,
         collection_ok=collection_ok,
         collection=collection,
-        activity=activity,
         uptime=uptime_text(started) if running else "",
+        activity="",
         vectors=vectors,
         previous_vectors=previous_vectors,
         collection_status=collection_status,

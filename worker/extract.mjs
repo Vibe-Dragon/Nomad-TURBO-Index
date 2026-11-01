@@ -11,7 +11,8 @@ import { pathToFileURL } from "node:url";
 import { isMainThread, parentPort, Worker } from "node:worker_threads";
 
 const require = createRequire("/app/package.json");
-const { Archive } = require("@openzim/libzim");
+const libzim = require("@openzim/libzim");
+const { Archive } = libzim;
 const { Parser } = require("htmlparser2");
 
 const SKIP_TAGS = new Set([
@@ -82,6 +83,59 @@ function itemSize(item) {
   } catch {
     return 0;
   }
+}
+
+// Half of whatever cap libzim already chose. The lookahead keeps about that
+// much decompressed data loaded ahead of the article thread. It does not
+// raise the cap: a larger cache on a file that does not reuse clusters fills
+// swap without skipping the first read.
+export function lookaheadBudget(cacheMax) {
+  const max = Number(cacheMax);
+  if (!(max > 0) || !Number.isFinite(max)) return 0;
+  return Math.floor(max / 2);
+}
+
+export function lookaheadShouldWait(aheadBytes, budget) {
+  const cap = Number(budget);
+  if (!(cap > 0) || !Number.isFinite(cap)) return true;
+  return (Number(aheadBytes) || 0) >= cap;
+}
+
+export function notePrefetch(state, seq, bytes) {
+  const size = Math.max(0, Number(bytes) || 0);
+  state.inflight.push({ seq, bytes: size });
+  state.ahead += size;
+}
+
+export function noteConsumed(state, mainSeq) {
+  const done = Number(mainSeq) || 0;
+  while (state.inflight.length && state.inflight[0].seq <= done) {
+    state.ahead -= state.inflight.shift().bytes;
+  }
+  if (state.ahead < 0) state.ahead = 0;
+  return state.ahead;
+}
+
+function clusterCacheBudget() {
+  try {
+    if (typeof libzim.getClusterCacheMaxSize !== "function") return 0;
+    return lookaheadBudget(libzim.getClusterCacheMaxSize());
+  } catch {
+    return 0;
+  }
+}
+
+// One byte is enough to make libzim decompress the cluster into its cache.
+// The copy is not kept. The article thread reads the page itself.
+function touchArticle(item) {
+  const size = itemSize(item);
+  try {
+    if (item && typeof item.getData === "function") item.getData(0, 1);
+    else if (item && item.data != null) void item.data;
+  } catch {
+    // The article thread still reads this page.
+  }
+  return size;
 }
 
 function cutUtf8(buf) {
@@ -306,6 +360,80 @@ function* entries(archive, afterPath) {
   }
 }
 
+function* selectedArticles(archive, afterPath, skip) {
+  let seen = 0;
+  const resumeSkip = !afterPath && (Number(skip) || 0) > 0;
+  const limitSkip = Number(skip) || 0;
+  for (const entry of entries(archive, afterPath)) {
+    if (!isArticle(entry)) continue;
+    seen += 1;
+    if (resumeSkip && seen <= limitSkip) continue;
+    yield entry;
+  }
+}
+
+function prefetchArticles({ zimPath, afterPath, skip, budget, seq }) {
+  const seqView = new Int32Array(seq);
+  const archive = new Archive(zimPath);
+  const state = { inflight: [], ahead: 0 };
+  let articleSeq = 0;
+  for (const entry of selectedArticles(archive, afterPath || "", skip)) {
+    if (Atomics.load(seqView, 1) === 1) return;
+    articleSeq += 1;
+    while (true) {
+      if (Atomics.load(seqView, 1) === 1) return;
+      const mainSeq = Atomics.load(seqView, 0);
+      noteConsumed(state, mainSeq);
+      if (articleSeq <= mainSeq) break;
+      if (!lookaheadShouldWait(state.ahead, budget)) break;
+      Atomics.wait(seqView, 0, mainSeq, 1000);
+    }
+    if (articleSeq <= Atomics.load(seqView, 0)) continue;
+    let bytes = 1;
+    try {
+      bytes = Math.max(1, touchArticle(entry.item));
+    } catch {
+      bytes = 1;
+    }
+    noteConsumed(state, Atomics.load(seqView, 0));
+    if (articleSeq <= Atomics.load(seqView, 0)) continue;
+    notePrefetch(state, articleSeq, bytes);
+  }
+}
+
+function startLookahead(zimPath, afterPath, skip) {
+  const budget = clusterCacheBudget();
+  if (!(budget > 0)) return null;
+  const shared = new SharedArrayBuffer(8);
+  const view = new Int32Array(shared);
+  const worker = new Worker(new URL(import.meta.url));
+  worker.on("error", (error) => {
+    console.error(`cluster lookahead stopped: ${error && error.message ? error.message : error}`);
+  });
+  worker.postMessage({
+    prefetch: true,
+    zimPath,
+    afterPath: afterPath || "",
+    skip: Number(skip) || 0,
+    budget,
+    seq: shared,
+  });
+  console.error(`cluster lookahead ${budget} bytes`);
+  return { worker, view };
+}
+
+function publishRead(lookahead, articleSeq) {
+  if (!lookahead) return;
+  Atomics.store(lookahead.view, 0, articleSeq);
+  Atomics.notify(lookahead.view, 0);
+}
+
+function stopLookahead(lookahead) {
+  if (!lookahead) return;
+  Atomics.store(lookahead.view, 1, 1);
+  Atomics.notify(lookahead.view, 0);
+}
+
 function payloadOf(msg) {
   if (msg.error) throw new Error(msg.error);
   return msg;
@@ -453,6 +581,37 @@ async function selfTest() {
   } finally {
     await Promise.all(workers.map((worker) => worker.terminate()));
   }
+  if (lookaheadBudget(0) !== 0 || lookaheadBudget(512) !== 256) {
+    throw new Error("lookahead budget was not half of a positive cap");
+  }
+  if (lookaheadBudget(536870912) !== 268435456) {
+    throw new Error("lookahead budget changed the library-sized cap");
+  }
+  if (!lookaheadShouldWait(1, 0) || !lookaheadShouldWait(100, 100) || lookaheadShouldWait(40, 100)) {
+    throw new Error("lookahead wait condition is wrong");
+  }
+  const gap = { inflight: [], ahead: 0 };
+  notePrefetch(gap, 1, 40);
+  notePrefetch(gap, 2, 60);
+  if (gap.ahead !== 100 || !lookaheadShouldWait(gap.ahead, 100)) {
+    throw new Error("prefetch bytes were not counted");
+  }
+  if (noteConsumed(gap, 1) !== 60) throw new Error("consuming one article left the wrong gap");
+  if (noteConsumed(gap, 2) !== 0) throw new Error("consuming the gap did not clear it");
+  notePrefetch(gap, 3, 10);
+  noteConsumed(gap, 9);
+  if (gap.ahead !== 0 || gap.inflight.length !== 0) {
+    throw new Error("a passed article stayed in the lookahead");
+  }
+  if (typeof libzim.getClusterCacheMaxSize === "function") {
+    const before = Number(libzim.getClusterCacheMaxSize());
+    if (lookaheadBudget(before) !== Math.floor(before / 2)) {
+      throw new Error("live cache cap did not split in half");
+    }
+    if (Number(libzim.getClusterCacheMaxSize()) !== before) {
+      throw new Error("reading the lookahead budget changed the cache cap");
+    }
+  }
   console.error("self-test ok");
 }
 
@@ -484,12 +643,22 @@ async function main() {
       description: meta(archive, "Description"),
     }) + "\n",
   );
+  // Date lookup only. Do not walk articles, and do not share the extract container.
+  if (process.argv.includes("--meta-only")) {
+    return;
+  }
 
   const workers = startWorkers();
+  let lookahead = null;
+  try {
+    lookahead = startLookahead(zimPath, afterPath, skip);
+  } catch (error) {
+    console.error(`cluster lookahead stopped: ${error && error.message ? error.message : error}`);
+  }
   let cursor = 0;
   const flight = [];
-  let seen = 0;
   let emitted = 0;
+  let articleSeq = 0;
 
   async function flushOne() {
     const job = flight.shift();
@@ -519,10 +688,8 @@ async function main() {
   }
 
   try {
-    for (const entry of entries(archive, afterPath)) {
-      if (!isArticle(entry)) continue;
-      seen += 1;
-      if (!afterPath && seen <= skip) continue;
+    for (const entry of selectedArticles(archive, afterPath, skip)) {
+      articleSeq += 1;
       index += 1;
       let raw = "";
       let path = "";
@@ -560,6 +727,7 @@ async function main() {
       } else {
         done = raw ? worker.run(raw) : Promise.resolve({ sections: [] });
       }
+      publishRead(lookahead, articleSeq);
       flight.push({
         index,
         path,
@@ -573,7 +741,10 @@ async function main() {
     while (flight.length && !(limit && emitted >= limit)) await flushOne();
     await emit(JSON.stringify({ type: "done", articles: index }) + "\n");
   } finally {
-    await Promise.all(workers.map((worker) => worker.terminate()));
+    stopLookahead(lookahead);
+    const closing = workers.map((worker) => worker.terminate());
+    if (lookahead) closing.push(lookahead.worker.terminate());
+    await Promise.all(closing);
   }
 }
 
@@ -582,7 +753,18 @@ const launchedDirectly = process.argv[1]
 
 if (!isMainThread) {
   const open = new Map();
+  let prefetching = false;
   parentPort.on("message", (msg) => {
+    if (msg && msg.prefetch) {
+      if (prefetching) return;
+      prefetching = true;
+      try {
+        prefetchArticles(msg);
+      } catch (error) {
+        console.error(`cluster lookahead stopped: ${error && error.message ? error.message : error}`);
+      }
+      return;
+    }
     if (msg.abort) {
       open.delete(msg.id);
       return;

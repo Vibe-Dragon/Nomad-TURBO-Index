@@ -35,18 +35,26 @@ ROOT = Path(__file__).resolve().parents[1]
 PAGE_TIPS = (
     "qdrant",
     "slider",
+    "recommend",
     "tune",
     "tune_auto",
     "usage",
     "col_file",
-    "col_kind",
+    "col_type",
     "col_status",
     "col_progress",
     "col_articles",
+    "col_art_min",
     "col_chunks",
+    "col_chk_s",
     "col_size",
-    "col_rate",
     "col_eta",
+    "order",
+    "measure",
+    "hide_finished",
+    "index_now",
+    "priority",
+    "details",
     "file_bar",
     "library_bar",
     "keep",
@@ -213,23 +221,32 @@ class HardwareBudgetTest(unittest.TestCase):
             ),
         )
 
-    def test_the_slider_can_save_150_and_a_new_session_is_not_forced_there(self):
+    def test_the_chunk_count_is_saved_as_chunks_and_a_new_session_is_not_forced_high(self):
         session = Session(55)
-        self.assertEqual(session.get_percent(), 55)
-        session.set_percent(110)
-        self.assertEqual(session.get_percent(), 110)
-        session.set_percent(150)
-        self.assertEqual(session.get_percent(), 150)
-        session.set_percent(500)
-        self.assertEqual(session.get_percent(), 150)
-        session.set_percent(1)
-        self.assertEqual(session.get_percent(), 10)
+        self.assertEqual(session.get_chunks(), 55)
+        session.set_chunks(110)
+        self.assertEqual(session.get_chunks(), 110)
+        session.set_chunks(200)
+        self.assertEqual(session.get_chunks(), 200)
+        session.set_percent(0)
+        self.assertEqual(session.get_chunks(), 1)
+        self.assertNotEqual(session.get_chunks(), 10)
 
     def test_the_usage_line_shows_the_chunk_count(self):
-        line = usage_text(set_percent=150, chunks=70, server_up=False)
-        self.assertIn("150%", line)
+        line = usage_text(chunks=70, server_up=False)
         self.assertIn("70 chunks per call", line)
-        self.assertIn("Overclock", line)
+        self.assertNotIn("%", line)
+        self.assertNotIn("Overclock", line)
+        self.assertNotIn("overclock", line.lower())
+
+    def test_the_window_is_a_chunk_field_not_a_percent_scale(self):
+        window = (ROOT / "nomad_turbo" / "window.py").read_text(encoding="utf-8")
+        self.assertIn("gtk.Entry()", window)
+        self.assertIn('label="Recommended"', window)
+        self.assertIn('label="Auto"', window)
+        self.assertNotIn("gtk.Scale", window)
+        self.assertNotIn("MAX_BOOST_PERCENT", window)
+        self.assertNotIn("self.scale", window)
 
 
 class TooltipTest(unittest.TestCase):
@@ -253,13 +270,20 @@ class TooltipTest(unittest.TestCase):
         self.assertIn("not handed back", stop.lower())
         self.assertIn("stock NOMAD", stop)
         slider = TIPS["slider"]
-        self.assertIn("10%", slider)
-        self.assertIn("100%", slider)
-        self.assertIn("150%", slider)
         self.assertIn("next embed call", slider)
-        self.assertIn("overclock", slider.lower())
-        self.assertIn("budget", slider.lower())
+        self.assertIn("chunk", slider.lower())
+        self.assertNotIn("overclock", slider.lower())
+        self.assertNotIn("150%", slider)
+        self.assertNotIn("10%", slider)
+        recommend = TIPS["recommend"]
+        self.assertIn("safe call", recommend.lower())
+        self.assertIn("start", recommend.lower())
+        self.assertNotIn("overclock", recommend.lower())
         self.assertIn("chunk count", TIPS["usage"].lower())
+        auto = TIPS["tune_auto"].lower()
+        self.assertIn("article", auto)
+        self.assertIn("old top", auto)
+        self.assertNotIn("overclock", auto)
         keep = TIPS["keep"]
         self.assertIn("found at Start", keep)
         self.assertIn("Manual", keep)

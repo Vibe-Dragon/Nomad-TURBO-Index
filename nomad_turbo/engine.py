@@ -18,7 +18,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from nomad_turbo.chunking import DOCUMENT_PREFIX, keywords
+from nomad_turbo.chunking import DOCUMENT_PREFIX, keywords, mean_tokens
 from nomad_turbo.decisions import (
     article_outcome,
     choose_resume,
@@ -35,6 +35,7 @@ from nomad_turbo.catalog import origin_for, wipe_allowed
 from nomad_turbo.desktop import write_shortcut
 from nomad_turbo.discover import Install, load_install, state_dir
 from nomad_turbo.packing import ArticleFeed, PreparedArticle, prepare_article
+from nomad_turbo.progress import ocr_note, ocr_page
 from nomad_turbo.plain import read_text
 from nomad_turbo.pool import EmbedPool
 from nomad_turbo.runtime import (
@@ -48,11 +49,24 @@ from nomad_turbo.runtime import (
     queuectl,
     release_extract,
     read_visual,
+    read_zim_date,
     start_extract,
     stop_ours,
 )
+from nomad_turbo.schedule import (
+    SWITCH_REASONS,
+    OrderFile,
+    apply_sample_batch,
+    engine_switch_reason,
+    file_type_label,
+    interrupt_outcome,
+    measure_ending,
+    open_index_now,
+    pick_next,
+)
 from nomad_turbo.session import Session
-from nomad_turbo.slots import install_boost_percent, pick_gpu
+from nomad_turbo.slots import install_embed_chunks, pick_gpu, safe_call_chunks
+from nomad_turbo.tune import content_kind
 from nomad_turbo.store import (
     clear_ingest_rows,
     collection_ready,
@@ -217,10 +231,55 @@ def _announce_hold(session: Session | None, reason: str) -> None:
         session.set_note("Indexing.")
 
 
-def _note_embed_call(session, percent: int, chunks: int, seconds: float, ok: bool) -> None:
+def _note_embed_call(
+    session,
+    size: int,
+    chunks: int,
+    seconds: float,
+    ok: bool,
+    kind: str = "",
+    article_size: int = 0,
+    tokens: int = 0,
+) -> None:
     note = getattr(session, "note_embed_call", None)
-    if callable(note):
-        note(percent, chunks, seconds, ok)
+    if not callable(note):
+        return
+    try:
+        note(size, chunks, seconds, ok, kind, article_size, tokens)
+    except TypeError as exc:
+        # A window opened before this argument existed still has the shorter
+        # method. Start reloads this file and not that object. Raising here
+        # abandons the current file and walks the rest of the library.
+        if "positional" not in str(exc):
+            raise
+        note(size, chunks, seconds, ok, kind, article_size)
+
+
+def _next_call_chunks(pool, session, install) -> int:
+    """Chunks the next embed call sends.
+
+    The session stores a chunk count. A pool that only knows the old percent
+    helper is asked for that count anyway, which is what the segment tests stub.
+    """
+    if session is not None and hasattr(session, "get_chunks"):
+        chunks = int(session.get_chunks())
+    else:
+        use_gpu = bool(getattr(pool, "use_gpu", False))
+        total = int(getattr(pool, "total_mib", 0) or 0)
+        gpu_total = total if use_gpu and total > 0 else None
+        chunks = install_embed_chunks(
+            install,
+            gpu_total_mib=gpu_total,
+            host_total_mib=int(getattr(pool, "host_total_mib", 0) or 0),
+            cpu_count=int(getattr(pool, "cpu_count", 1) or 1),
+        )
+    direct = getattr(pool, "call_width", None)
+    if callable(direct):
+        return max(1, int(direct(chunks)))
+    legacy = getattr(pool, "batch_width", None)
+    if callable(legacy):
+        return max(1, int(legacy(chunks)))
+    return max(1, int(chunks))
 
 
 def _segment_hold(install: Install) -> str:
@@ -328,6 +387,7 @@ class FileWork:
     jobs: list[tuple[str, int]] = field(default_factory=list)
     total_articles: int | None = None
     touched: bool = False
+    mtime: float | None = None
     skipped: int = 0
     bad: int = 0
     # Copied onto every point. False only when the ingest row turned the file off.
@@ -373,15 +433,28 @@ def _wants_control(session: Session | None, install: Install) -> bool:
 
 
 def _queue_has_work(session: Session | None, finished: set[str], failed: set[str]) -> bool | None:
-    """False when the window already knows there is nothing left to index."""
+    """False when the window already knows there is nothing left to index.
+
+    A failed file is still work when Index now or priority names it. The
+    batch step is what puts that file back, and only when it is still on disk.
+    """
     book = session.get_book() if session else None
     listed = getattr(book, "listed", None)
     if not callable(listed):
         return None
+    retry: set[str] = set()
+    if session is not None:
+        now = session.index_now() if hasattr(session, "index_now") else None
+        if now:
+            retry.add(now)
+        priorities = session.priorities() if hasattr(session, "priorities") else ()
+        retry.update(priorities)
     for source, state in listed():
-        if state in ("indexed", "deferred", "failed"):
+        if source in finished:
             continue
-        if source in finished or source in failed:
+        if state in ("indexed", "deferred"):
+            continue
+        if (state == "failed" or source in failed) and source not in retry:
             continue
         return True
     return False
@@ -534,6 +607,13 @@ def _watch_library(install: Install, session: Session | None, stop: threading.Ev
             log.exception("library scan failed")
         if stop.wait(SCAN_SECONDS):
             return
+
+
+def _open_state(work: FileWork) -> str:
+    """Partial means some of the file is stored. Nothing stored is still waiting."""
+    if int(work.articles or 0) > 0 or int(work.chunks or 0) > 0:
+        return "partial"
+    return "pending"
 
 
 def _report(session: Session | None, work: FileWork, state: str) -> None:
@@ -716,6 +796,10 @@ def _work_list(install: Install, jobs: list[dict], finished: set[str]) -> list[F
             if data.get("totalArticles"):
                 total = int(data["totalArticles"])
             chunks = max(chunks, int(data.get("chunksSoFar") or 0))
+        try:
+            mtime = host.stat().st_mtime
+        except OSError:
+            mtime = None
         work.append(
             FileWork(
                 host=host,
@@ -726,6 +810,7 @@ def _work_list(install: Install, jobs: list[dict], finished: set[str]) -> list[F
                 chunks=chunks,
                 jobs=[(job_id, offset) for job_id, offset, _data in entries],
                 total_articles=total,
+                mtime=mtime,
             )
         )
     return work
@@ -931,9 +1016,9 @@ class _UpsertPipe:
 
 
 def _after_batch(pool: EmbedPool, session: Session | None, install: Install) -> None:
-    """Start the one embed server. Moving the slider does not start another."""
-    percent = session.get_percent() if session else install_boost_percent(install)
-    pool.apply_target(percent, batch_open=False)
+    """Start the one embed server. Changing the chunk count does not start another."""
+    chunks = _next_call_chunks(pool, session, install)
+    pool.apply_target(chunks, batch_open=False)
     pool.publish(session)
 
 
@@ -944,6 +1029,7 @@ def _index_zim(
     stop: threading.Event,
     session: Session | None,
     retire: threading.Event | None = None,
+    switch_check=None,
 ) -> None:
     _load_point_active(install, work)
     already = count_source(install, work.source)
@@ -998,7 +1084,7 @@ def _index_zim(
     def _pull(timeout: float):
         nonlocal archive
         deadline = time.monotonic() + timeout
-        while not stop.is_set() and not (retire is not None and retire.is_set()):
+        while not stop.is_set() and not (retire is not None and retire.is_set()) and not (switch_check and switch_check()):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return None
@@ -1016,6 +1102,9 @@ def _index_zim(
                 if event.get("totalArticles"):
                     work.total_articles = int(event["totalArticles"])
                     _report(session, work, "running")
+                note_date = getattr(session, "note_zim_date", None)
+                if callable(note_date) and "date" in event:
+                    note_date(work.source, str(event.get("date") or ""))
                 continue
             if event.get("type") == "article":
                 event["_archive"] = archive
@@ -1025,7 +1114,7 @@ def _index_zim(
         return None
 
     try:
-        outcome = _consume_articles(install, pool, work, stop, session, stored, _pull, retire)
+        outcome = _consume_articles(install, pool, work, stop, session, stored, _pull, retire, switch_check)
         if outcome == "done":
             work.done = True
             work.touched = True
@@ -1044,15 +1133,23 @@ def _index_zim(
         release_extract(proc)
 
 
-def _halt_reason(stop: threading.Event, retire: threading.Event | None) -> str | None:
+def _halt_reason(stop: threading.Event, retire: threading.Event | None = None, switch_check=None) -> str | None:
+    """Why to leave the file. `replaced` drops points. A switch keeps them.
+
+    The check runs between embed calls, so the call already running finishes first.
+    """
     if retire is not None and retire.is_set():
         return "replaced"
+    if switch_check is not None:
+        asked = switch_check()
+        if asked:
+            return str(asked)
     if stop.is_set():
         return "stopped"
     return None
 
 
-def _consume_articles(install, pool, work, stop, session, seen, pull, retire=None) -> str:
+def _consume_articles(install, pool, work, stop, session, seen, pull, retire=None, switch_check=None) -> str:
     """Embed across articles. Checkpoint an article only after its points are stored."""
     feed = ArticleFeed()
     pipe = _UpsertPipe()
@@ -1061,13 +1158,13 @@ def _consume_articles(install, pool, work, stop, session, seen, pull, retire=Non
     last_width = None
     error = None
     try:
-        while _halt_reason(stop, retire) is None:
-            percent = session.get_percent() if session else install_boost_percent(install)
-            width = pool.batch_width(percent)
+        while _halt_reason(stop, retire, switch_check) is None:
+            width = _next_call_chunks(pool, session, install)
             if width != last_width:
-                log.info("%s chunks per call at %s%%", width, percent)
+                log.info("%s chunks per call", width)
                 last_width = width
-            while feed.pending() < width and not ended and _halt_reason(stop, retire) is None:
+            kind = content_kind(getattr(work, "source", "") or "")
+            while feed.pending() < width and not ended and _halt_reason(stop, retire, switch_check) is None:
                 item = pull(0.5)
                 if item is None:
                     break
@@ -1079,7 +1176,7 @@ def _consume_articles(install, pool, work, stop, session, seen, pull, retire=Non
                     ended = True
                     break
                 feed.add(_prepare_article(install, work, item, seen))
-            if _halt_reason(stop, retire):
+            if _halt_reason(stop, retire, switch_check):
                 break
             if feed.pending() == 0:
                 ready = feed.drain_ready()
@@ -1092,6 +1189,8 @@ def _consume_articles(install, pool, work, stop, session, seen, pull, retire=Non
             if not pool.urls:
                 raise RuntimeError("the embed server is not running")
             texts = feed.next_inputs(width)
+            article_size = feed.call_article_size()
+            token_mean = mean_tokens(texts)
             started = time.monotonic()
             try:
                 vectors = embed(pool.urls[0], install.embed_model, texts)
@@ -1122,12 +1221,21 @@ def _consume_articles(install, pool, work, stop, session, seen, pull, retire=Non
                     )
                 continue
             except Exception:
-                _note_embed_call(session, percent, len(texts), time.monotonic() - started, False)
+                elapsed = time.monotonic() - started
+                _note_embed_call(
+                    session, width, len(texts), elapsed, False, kind, article_size, token_mean
+                )
                 raise
             else:
-                # A short leftover batch is not the size the slider asked for.
+                elapsed = time.monotonic() - started
+                # A short leftover batch is not the size that was asked for.
                 if len(texts) >= max(4, width // 2):
-                    _note_embed_call(session, percent, len(texts), time.monotonic() - started, True)
+                    _note_embed_call(
+                        session, width, len(texts), elapsed, True, kind, article_size, token_mean
+                    )
+                note_sequences = getattr(pool, "note_sequences", None)
+                if callable(note_sequences):
+                    note_sequences(token_mean, len(texts), elapsed, stop)
             ready = feed.push_vectors(vectors)
             if ready:
                 pipe.submit(lambda batch=ready: _store_ready(install, work, seen, session, batch, stop))
@@ -1143,8 +1251,9 @@ def _consume_articles(install, pool, work, stop, session, seen, pull, retire=Non
                 log.error("upsert failed after another error: %s", exc)
     if error is not None:
         raise error
-    reason = _halt_reason(stop, retire)
-    if reason:
+    reason = _halt_reason(stop, retire, switch_check)
+    # A file that finished during the call already running is indexed, not abandoned.
+    if reason and not saw_done:
         raise RuntimeError(reason)
     return "done" if saw_done else "closed"
 
@@ -1156,10 +1265,14 @@ def _index_plain(
     stop: threading.Event,
     session: Session | None,
     retire: threading.Event | None = None,
+    switch_check=None,
 ) -> None:
-    if _halt_reason(stop, retire):
-        if retire is not None and retire.is_set():
-            raise RuntimeError("replaced")
+    reason = _halt_reason(stop, retire, switch_check)
+    if reason == "replaced" or (retire is not None and retire.is_set()):
+        raise RuntimeError("replaced")
+    if reason in SWITCH_REASONS:
+        raise RuntimeError(reason)
+    if reason:
         return
     _load_point_active(install, work)
     existing = count_source(install, work.source)
@@ -1174,7 +1287,30 @@ def _index_plain(
         _report(session, work, "indexed")
         return
     if work.kind in ("pdf", "image"):
-        text = read_visual(install, str(work.host), work.kind, stop)
+        name = work.host.name
+        _report(session, work, "running")
+        if session is not None:
+            session.set_note(ocr_note(name))
+
+        def _ocr_status(line: str) -> None:
+            log.info("ocr: %s", line[:300])
+            found = ocr_page(line)
+            if session is None or found is None:
+                return
+            session.set_note(ocr_note(name, found[0], found[1]))
+
+        text = read_visual(install, str(work.host), work.kind, stop, _ocr_status)
+        # The five-minute sample is embedding time. The OCR read does not use it up.
+        if (
+            session is not None
+            and callable(getattr(session, "measuring", None))
+            and session.measuring()
+        ):
+            arm = getattr(session, "arm_measure_clock", None)
+            if callable(arm):
+                arm()
+        if session is not None:
+            session.set_note("Indexing.")
     else:
         text = read_text(work.host, work.kind)
     if text is None:
@@ -1182,6 +1318,8 @@ def _index_plain(
         work.done = True
         work.deferred = True
         _report(session, work, "deferred")
+        if session is not None:
+            session.set_note("Indexing.")
         return
     _report(session, work, "running")
     article = {
@@ -1200,7 +1338,7 @@ def _index_plain(
         sent = True
         return article
 
-    outcome = _consume_articles(install, pool, work, stop, session, set(), _pull, retire)
+    outcome = _consume_articles(install, pool, work, stop, session, set(), _pull, retire, switch_check)
     if outcome != "done":
         return
     work.done = True
@@ -1269,6 +1407,200 @@ def _finalize(install: Install, previous: str, files: list[FileWork]) -> bool:
         log.info("ingest policy left on %s.", chosen)
     (state_dir() / "result").write_text("partial" if partial else "done")
     return partial
+
+
+def settle_file_stop(install: Install, session: Session | None, work: FileWork, reason: str) -> str:
+    """Checkpoint a switch, or drop a file that left the disk.
+
+    A switch keeps stored points and does not hand the file to NOMAD.
+    The disappeared-file path is the only one that deletes points.
+    """
+    outcome = interrupt_outcome(reason="replaced" if reason == "replaced" else reason, finished=bool(work.done))
+    if outcome == "drop":
+        _request_drop(install, session, work.source)
+        work.removed = True
+        work.touched = False
+        work.done = False
+        return outcome
+    _write_checkpoint(work)
+    if outcome == "indexed":
+        work.done = True
+        _report(session, work, "indexed")
+    else:
+        _report(session, work, _open_state(work))
+    return outcome
+
+
+def finish_measure_pass(session, stop: threading.Event) -> str:
+    """End Measure. Idle starts stop the run. A run already going keeps indexing."""
+    action = measure_ending(from_idle=bool(session.measure_from_idle()), pass_complete=True)
+    session.set_measuring(False)
+    if action == "stop":
+        session.set_note("Measure finished.")
+        stop.set()
+    else:
+        session.set_note("Indexing.")
+    return action
+
+
+def _recommended_chunks(pool) -> int:
+    """The same safe call the Recommended control uses."""
+    use_gpu = bool(getattr(pool, "use_gpu", False))
+    total = int(getattr(pool, "total_mib", 0) or 0)
+    gpu_total = total if use_gpu and total > 0 else None
+    return safe_call_chunks(
+        gpu_total_mib=gpu_total,
+        host_total_mib=int(getattr(pool, "host_total_mib", 0) or 0),
+        cpu_count=int(getattr(pool, "cpu_count", 1) or 1),
+    )
+
+
+def _learn_zim_dates(install: Install, session, works: list[FileWork], stop: threading.Event | None = None) -> None:
+    """Read every missing ZIM Date before the next file is chosen.
+
+    One archive at a time, through nomad-turbo-zimdate. This does not start
+    indexing and does not take the extractor. An unreadable date is remembered
+    so the file's modification time is used and docker is not asked again.
+    """
+    if session is None or not str(session.get_order()).startswith("date"):
+        return
+    known = getattr(session, "zim_date_known", None)
+    if not callable(known):
+        return
+    try:
+        for work in works:
+            if stop is not None and stop.is_set():
+                return
+            if work.kind != "zim" or known(work.source):
+                continue
+            try:
+                raw = read_zim_date(install, str(work.host))
+            except Exception:
+                log.exception("could not read the ZIM date for %s", work.host.name)
+                raw = None
+            session.note_zim_date(work.source, raw)
+    finally:
+        stats = session.file_stats() if hasattr(session, "file_stats") else None
+        if stats is not None and hasattr(stats, "save"):
+            try:
+                stats.save()
+            except Exception:
+                log.exception("could not save file stats")
+
+
+def _order_rows(works: list[FileWork], session) -> list[OrderFile]:
+    book = session.get_book() if session is not None and hasattr(session, "get_book") else None
+    snap = None
+    if book is not None and hasattr(book, "snapshot"):
+        try:
+            snap = book.snapshot()
+        except Exception:
+            snap = None
+    by_source = {item.source: item for item in getattr(snap, "files", ())} if snap is not None else {}
+    priorities = session.priorities() if session is not None and hasattr(session, "priorities") else set()
+    dates = session.zim_dates() if session is not None and hasattr(session, "zim_dates") else {}
+    rows: list[OrderFile] = []
+    for index, work in enumerate(works):
+        item = by_source.get(work.source)
+        total = item.total_articles if item is not None else work.total_articles
+        articles = item.articles if item is not None else work.articles
+        chunks = item.chunks if item is not None else work.chunks
+        size = int(item.size_bytes) if item is not None else 0
+        if size <= 0:
+            try:
+                size = int(work.host.stat().st_size)
+            except OSError:
+                size = 0
+        state = item.state if item is not None else "pending"
+        if state == "indexed":
+            completed = 1.0
+        elif total:
+            completed = min(1.0, max(0.0, int(articles) / int(total)))
+        else:
+            completed = 0.0
+        eta = None
+        if item is not None and item.eta_seconds is not None and state != "indexed":
+            eta = float(item.eta_seconds)
+        raw_date = dates.get(work.source) if dates else None
+        rows.append(
+            OrderFile(
+                source=work.source,
+                name=work.host.name,
+                file_type=file_type_label(work.host.name),
+                size_bytes=int(size),
+                mtime=work.mtime,
+                zim_date=raw_date or None,
+                articles_total=int(total) if total else None,
+                completed=completed,
+                chunks=int(chunks),
+                measured_eta=eta,
+                state=state,
+                walk_index=index,
+                priority=work.source in priorities,
+            )
+        )
+    return rows
+
+
+def _note_sample(session, work: FileWork) -> None:
+    if session is None or not hasattr(session, "measuring") or not session.measuring():
+        return
+    session.note_sampled(work.source)
+    book = session.get_book()
+    keep = getattr(book, "keep_measured_rate", None)
+    if callable(keep):
+        keep(work.source)
+
+
+def _queue_batch(install: Install, session, jobs: list[dict], finished: set[str], failed: set[str]) -> list[FileWork]:
+    """Unfinished files in library-walk order. Index now and priority can retry a failure."""
+    if session is not None:
+        now = session.index_now() if hasattr(session, "index_now") else None
+        priorities = session.priorities() if hasattr(session, "priorities") else set()
+        for source in priorities:
+            failed.discard(source)
+        if now:
+            failed.discard(now)
+    return [item for item in _work_list(install, jobs, finished) if item.source not in failed]
+
+
+def _next_work(install: Install, pool, session, batch: list[FileWork], stop: threading.Event):
+    """The one file this pass should index, plus the measure clock and priority epoch.
+
+    An empty work means Measure finished or nothing matched. The action is
+    `stop`, `resume`, or empty.
+    """
+    if session is not None:
+        _learn_zim_dates(install, session, batch, stop)
+    if not batch:
+        return None, None, 0, ""
+    choice = session.get_order() if session is not None and hasattr(session, "get_order") else "library"
+    rows = _order_rows(batch, session)
+    index_now = open_index_now(session, rows) if session is not None else None
+    if session is not None and hasattr(session, "index_now") and session.index_now() and index_now is None:
+        session.clear_index_now()
+    measuring = bool(session is not None and hasattr(session, "measuring") and session.measuring())
+    defer = session.sampled() if measuring else set()
+    picked = pick_next(
+        rows,
+        choice=choice,
+        current=None,
+        index_now=index_now,
+        defer=defer,
+    )
+    if picked.target is None:
+        if measuring:
+            return None, None, 0, finish_measure_pass(session, stop)
+        return None, None, 0, ""
+    work = next(item for item in batch if item.source == picked.target)
+    armed = session.arm_priority() if session is not None and hasattr(session, "arm_priority") else 0
+    sample_started = None
+    if measuring and index_now != work.source and pool is not None:
+        auto = bool(session.tune_auto()) if hasattr(session, "tune_auto") else False
+        apply_sample_batch(session, auto=auto, recommended=_recommended_chunks(pool))
+        arm = getattr(session, "arm_measure_clock", None)
+        sample_started = arm() if callable(arm) else time.monotonic()
+    return work, sample_started, armed, ""
 
 
 def execute(
@@ -1368,8 +1700,12 @@ def execute(
                         jobs = list_jobs(install)
                     except Exception:
                         log.exception("could not refresh the embed queue")
-                    batch = [item for item in _work_list(install, jobs, finished) if item.source not in failed]
+                    batch = _queue_batch(install, session, jobs, finished, failed)
                 if not batch:
+                    if session is not None and hasattr(session, "measuring") and session.measuring() and pending is False:
+                        action = finish_measure_pass(session, stop)
+                        if action == "stop" or stop.is_set():
+                            break
                     keep = _wants_control(session, install)
                     downloads = _downloads_pending(install)
                     settling = pending is True
@@ -1393,78 +1729,97 @@ def execute(
                     stop.wait(SCAN_SECONDS)
                     continue
                 idle_note = ""
-                stopped_early = False
-                for work in batch:
-                    if stop.is_set():
-                        stopped_early = True
+                work, sample_started, armed, action = _next_work(install, pool, session, batch, stop)
+                if work is None:
+                    if action == "stop" or stop.is_set():
                         break
-                    if not _wait_to_write(install, stop, session):
-                        stopped_early = True
-                        break
-                    _flush_drops(install, session, stop)
-                    touched.append(work)
-                    if not work.host.exists():
-                        _request_drop(install, session, work.source)
-                        work.removed = True
-                        work.touched = False
-                        continue
-                    live.begin(work.source)
-                    try:
-                        if work.kind == "zim":
-                            _index_zim(install, pool, work, stop, session, live.retire)
-                        else:
-                            _index_plain(install, pool, work, stop, session, live.retire)
-                    except Exception as exc:
-                        if str(exc) == "replaced" or live.retire.is_set():
-                            _request_drop(install, session, work.source)
-                            work.removed = True
-                            work.touched = False
-                            work.done = False
-                            continue
-                        if stop.is_set() or str(exc) == "stopped":
-                            log.info("stopping at %s article %s", work.source, work.articles)
-                            _report(session, work, "partial")
-                            stopped_early = True
-                            break
-                        if _rules().qdrant_write_held(str(exc)):
-                            log.warning(
-                                "qdrant is not taking writes. Staying on %s at article %s: %s",
-                                work.source,
-                                work.articles,
-                                exc,
-                            )
-                            _report(session, work, "partial")
-                            if session:
-                                session.set_note(QDRANT_HOLD_NOTE)
-                            if stop.wait(QDRANT_HOLD_SECONDS):
-                                log.info("stopping at %s article %s", work.source, work.articles)
-                                stopped_early = True
-                            break
-                        if repeat_failure(retried, work.source, work.articles):
-                            log.exception("file failed: %s", work.source)
-                            _report(session, work, "failed")
-                            failed.add(work.source)
-                        else:
-                            log.warning(
-                                "will try %s again from article %s after an error: %s",
-                                work.source,
-                                work.articles,
-                                exc,
-                            )
-                            _report(session, work, "partial")
+                    continue
+                if stop.is_set() or not _wait_to_write(install, stop, session):
+                    break
+                _flush_drops(install, session, stop)
+                touched.append(work)
+                if not work.host.exists():
+                    _request_drop(install, session, work.source)
+                    work.removed = True
+                    work.touched = False
+                    continue
+
+                def switch_check(started=sample_started, source=work.source, epoch=armed):
+                    # A PDF re-arms this clock after OCR, so the sample starts then.
+                    moment = started
+                    if session is not None:
+                        measuring = getattr(session, "measuring", None)
+                        clock = getattr(session, "measure_clock", None)
+                        if callable(measuring) and measuring() and callable(clock):
+                            live = clock()
+                            if live is not None:
+                                moment = live
+                    rows = _order_rows(batch, session) if session is not None else None
+                    return engine_switch_reason(session, source, moment, time.monotonic(), epoch, rows)
+
+                live.begin(work.source)
+                try:
+                    if work.kind == "zim":
+                        _index_zim(install, pool, work, stop, session, live.retire, switch_check)
                     else:
-                        if work.done:
+                        _index_plain(install, pool, work, stop, session, live.retire, switch_check)
+                except Exception as exc:
+                    text = str(exc)
+                    if text == "replaced" or live.retire.is_set():
+                        settle_file_stop(install, session, work, "replaced")
+                        continue
+                    if text in SWITCH_REASONS:
+                        outcome = settle_file_stop(install, session, work, text)
+                        if text == "measure":
+                            _note_sample(session, work)
+                        if outcome == "indexed":
                             finished.add(work.source)
                             _forget_source_jobs(install, work.source)
-                        elif stop.is_set():
-                            _report(session, work, "partial")
-                            stopped_early = True
-                    finally:
-                        live.end()
-                    if stopped_early:
+                            if session is not None and hasattr(session, "clear_index_now"):
+                                session.clear_index_now(work.source)
+                        continue
+                    if stop.is_set() or text == "stopped":
+                        log.info("stopping at %s article %s", work.source, work.articles)
+                        _report(session, work, _open_state(work))
                         break
-                if stopped_early:
-                    break
+                    if _rules().qdrant_write_held(text):
+                        log.warning(
+                            "qdrant is not taking writes. Staying on %s at article %s: %s",
+                            work.source,
+                            work.articles,
+                            exc,
+                        )
+                        _report(session, work, _open_state(work))
+                        if session:
+                            session.set_note(QDRANT_HOLD_NOTE)
+                        if stop.wait(QDRANT_HOLD_SECONDS):
+                            log.info("stopping at %s article %s", work.source, work.articles)
+                        break
+                    if repeat_failure(retried, work.source, work.articles):
+                        log.exception("file failed: %s", work.source)
+                        _report(session, work, "failed")
+                        failed.add(work.source)
+                    else:
+                        log.warning(
+                            "will try %s again from article %s after an error: %s",
+                            work.source,
+                            work.articles,
+                            exc,
+                        )
+                        _report(session, work, _open_state(work))
+                else:
+                    if work.done:
+                        finished.add(work.source)
+                        _forget_source_jobs(install, work.source)
+                        if session is not None and hasattr(session, "clear_index_now"):
+                            session.clear_index_now(work.source)
+                        if session is not None and hasattr(session, "measuring") and session.measuring():
+                            _note_sample(session, work)
+                    elif stop.is_set():
+                        _report(session, work, _open_state(work))
+                        break
+                finally:
+                    live.end()
         finally:
             watch_stop.set()
             watch_thread.join(timeout=30)

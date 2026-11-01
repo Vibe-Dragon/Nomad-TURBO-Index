@@ -1,14 +1,11 @@
-"""Separate window for the host meters.
+"""Host meters for the side pane.
 
-The Index and Repair pages stay as they are. This frame resizes on its own
-and remembers its size and place.
+The header checkbox shows and hides this pane. Sampling runs only while it
+is shown. The main window remembers the pane's width.
 """
 
 from __future__ import annotations
 
-import logging
-
-from nomad_turbo.discover import save_install
 from nomad_turbo.host import (
     HostPoint,
     HostSampler,
@@ -20,8 +17,6 @@ from nomad_turbo.host import (
     vram_caption,
 )
 from nomad_turbo.tips import TIPS
-
-log = logging.getLogger("nomad_turbo")
 
 _CPU = (0.35, 0.68, 0.95)
 _RAM = (0.35, 0.80, 0.72)
@@ -62,29 +57,24 @@ def _paint_series(cr, width: int, height: int, values, low: float, high: float, 
     _stroke(cr, segments, rgb, height, fill)
 
 
-class HostWindow:
-    """CPU, RAM, GPU, vRAM, and the disks the library uses. Closed on its own."""
+class HostPanel:
+    """CPU, RAM, GPU, vRAM, and the disks the library uses."""
 
-    def __init__(self, install, gtk, glib, on_close) -> None:
+    def __init__(self, install, gtk, glib) -> None:
         self.install = install
         self.gtk = gtk
         self.glib = glib
-        self.on_close = on_close
-        self._closed = False
         self._timer = None
-        self._save_timer = None
         self._points: list[HostPoint] = []
         self.sampler = HostSampler(install.storage_host)
-        window = gtk.Window(title="Nomad TURBO Host")
-        window.set_resizable(True)
-        width = int(getattr(install, "host_width", 0) or 0)
-        height = int(getattr(install, "host_height", 0) or 0)
-        window.set_default_size(width or 460, height or 720)
-        window.set_size_request(300, 420)
-        self.window = window
         root = gtk.Box(orientation=gtk.Orientation.VERTICAL, spacing=6)
-        root.set_border_width(12)
-        window.add(root)
+        root.set_margin_start(8)
+        root.set_margin_end(4)
+        root.set_hexpand(False)
+        root.set_vexpand(True)
+        # Wide enough to read a disk line. The bar beside the pages sets the rest.
+        root.set_size_request(220, -1)
+        self.widget = root
         self.cpu_label = self._caption(gtk, "CPU")
         self.ram_label = self._caption(gtk, "RAM")
         self.gpu_label = self._caption(gtk, "GPU")
@@ -93,7 +83,8 @@ class HostWindow:
         self.disk_label.set_xalign(0)
         self.disk_label.set_yalign(0)
         self.disk_label.set_line_wrap(True)
-        self.disk_label.set_max_width_chars(48)
+        self.disk_label.set_width_chars(28)
+        self.disk_label.set_max_width_chars(32)
         self.disk_label.set_tooltip_text(TIPS["host_disk"])
         self.cpu_area = self._graph(gtk)
         self.ram_area = self._graph(gtk)
@@ -112,14 +103,21 @@ class HostWindow:
         self.ram_area.connect("draw", self._draw_ram)
         self.gpu_area.connect("draw", self._draw_gpu)
         self.vram_area.connect("draw", self._draw_vram)
-        window.connect("delete-event", self._on_delete)
-        window.connect("configure-event", self._on_configure)
-        saved_x = getattr(install, "host_x", None)
-        saved_y = getattr(install, "host_y", None)
-        if saved_x is not None and saved_y is not None:
-            window.move(int(saved_x), int(saved_y))
+
+    def start(self) -> None:
+        """Read the host while the pane is on screen."""
+        if self._timer is not None:
+            self.sampler.start()
+            return
         self.sampler.start()
-        self._timer = glib.timeout_add(500, self._refresh)
+        self._timer = self.glib.timeout_add(500, self._refresh)
+
+    def stop(self) -> None:
+        """Pause readings when the pane is hidden or the window closes."""
+        if self._timer is not None:
+            self.glib.source_remove(self._timer)
+            self._timer = None
+        self.sampler.stop()
 
     def _caption(self, gtk, text: str):
         from gi.repository import Pango
@@ -135,9 +133,6 @@ class HostWindow:
         area.set_vexpand(True)
         area.set_size_request(-1, 48)
         return area
-
-    def present(self) -> None:
-        self.window.present()
 
     def _latest(self) -> HostPoint | None:
         return self._points[-1] if self._points else None
@@ -169,7 +164,7 @@ class HostWindow:
         return int(widget.get_allocated_width() or 0), int(widget.get_allocated_height() or 0)
 
     def _refresh(self) -> bool:
-        if self._closed:
+        if self._timer is None:
             return False
         self._points = self.sampler.snapshot()
         latest = self._latest()
@@ -181,52 +176,3 @@ class HostWindow:
         for area in (self.cpu_area, self.ram_area, self.gpu_area, self.vram_area):
             area.queue_draw()
         return True
-
-    def _on_configure(self, *_args) -> bool:
-        if self._closed:
-            return False
-        if self._save_timer:
-            self.glib.source_remove(self._save_timer)
-        self._save_timer = self.glib.timeout_add(400, self._save_place)
-        return False
-
-    def _save_place(self) -> bool:
-        self._save_timer = None
-        width, height = self.window.get_size()
-        x, y = self.window.get_position()
-        if width < 200 or height < 200:
-            return False
-        self.install.host_width = int(width)
-        self.install.host_height = int(height)
-        self.install.host_x = int(x)
-        self.install.host_y = int(y)
-        try:
-            save_install(self.install)
-        except Exception:
-            log.exception("could not save the host window")
-        return False
-
-    def _on_delete(self, *_args) -> bool:
-        self._shutdown()
-        return False
-
-    def close(self) -> None:
-        self._shutdown()
-        self.window.destroy()
-
-    def _shutdown(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        if self._timer:
-            self.glib.source_remove(self._timer)
-            self._timer = None
-        if self._save_timer:
-            self.glib.source_remove(self._save_timer)
-            self._save_timer = None
-        self._save_place()
-        self.sampler.stop()
-        callback = self.on_close
-        self.on_close = None
-        if callback is not None:
-            callback()

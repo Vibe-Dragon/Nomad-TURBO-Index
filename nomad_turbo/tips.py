@@ -15,21 +15,60 @@ TIPS: dict[str, str] = {
     "qdrant_gate": (
         "Qdrant is not ready for changes yet. This stays off until the collection answers."
     ),
-    "col_file": "Blue names are ZIM files. Amber names are uploads. Hover a row for its full path.",
-    "col_kind": "ZIM library or a file uploaded to the knowledge base.",
-    "col_status": "Waiting, indexing, indexed, partial, failed, or needs NOMAD.",
+    "col_file": (
+        "Blue names are ZIM files. Amber names are uploads. Hover a row for its full path. "
+        "A red asterisk to the left of the name means that file is prioritized."
+    ),
+    "col_type": "The file type: zim, pdf, docx, epub, txt, md, rtf, or an image extension such as jpg or png.",
+    "col_status": "Waiting, indexing, OCR, indexed, partial, failed, or needs NOMAD.",
     "col_progress": "How far this file is through its articles.",
     "col_articles": "Articles stored so far, and the total when it is known.",
+    "col_art_min": "Articles per minute for the file being indexed. Other rows stay blank.",
     "col_chunks": "Embedded pieces stored for this file. A long page is many chunks.",
+    "col_chk_s": "Chunks per second for the file being indexed. This pace stays steadier than articles per minute.",
     "col_size": "Size of the file on disk.",
-    "col_rate": (
-        "This file's recent pace. Articles per minute swing with page length. "
-        "Chunks per second stay steadier."
+    "col_eta": (
+        "Time left for this file. The file being indexed uses its recent article rate. "
+        "After Measure, a file with a known article count keeps the ETA from its sample."
     ),
-    "col_eta": "Time left for this file at its recent article rate.",
-    "file_now": "The file being indexed right now.",
+    "order": (
+        "The order unfinished files are indexed in, and the order of this list. "
+        "The file already in progress stays at the top and keeps going. "
+        "Prioritized files come next, in this same order. Finished files stay at the bottom."
+    ),
+    "hide_finished": "Hide files that are already indexed. While this is off, those files stay at the bottom of the list.",
+    "measure": (
+        "Index each unfinished file for about five minutes, priority files first, "
+        "then go on to the next. Reading a PDF or picture with OCR happens first and "
+        "does not count as those five minutes. "
+        "Each sample starts at the recommended batch when Auto is on, "
+        "or stays on the batch you set when Auto is off. "
+        "The ETAs update from those samples. "
+        "If a run is already going, indexing resumes afterward. Stop ends the pass."
+    ),
+    "index_now": (
+        "Finish the embed call already running, save that file, and index this one next. "
+        "Stored entries are kept."
+    ),
+    "priority": (
+        "Index this file before files that are not marked. "
+        "Marked files follow the selected order. "
+        "A red asterisk sits to the left of the name. "
+        "The mark is remembered after Turbo is closed."
+    ),
+    "details": (
+        "Saved facts for this file: size, location, dates, article and chunk counts, "
+        "slowest and fastest speeds, the last measured ETA, and whether it is prioritized. "
+        "These stay after Turbo is closed. A file that leaves the library is forgotten."
+    ),
+    "file_now": (
+        "The file being indexed right now. "
+        "While a PDF or picture is being read, this line names that file."
+    ),
     "file_bar": (
-        "Progress of the file being indexed. The library bar beside it is the whole library, weighed by file size."
+        "Progress of the file being indexed. While OCR is reading a PDF or picture, "
+        "the bar shows the page it is on. "
+        "The library bar beside it is the whole library, weighed by file size."
     ),
     "library_bar": "Share of the library finished, by file size, and the ETA for what is left.",
     "index_optimize": (
@@ -43,23 +82,28 @@ TIPS: dict[str, str] = {
         "A long page is indexed in full and stored as many chunks."
     ),
     "slider": (
-        "How many chunks the next embed call sends, as a percent of the budget detected on the computer running Turbo. "
-        "10% to 100% stays inside that budget. 150% is an overclock past that budget. "
-        "Moving it during a run changes the next embed call. "
+        "How many chunks the next embed call sends. "
+        "Type a count and the next call uses it. "
+        "Recommended sets the count to the safe call detected from the memory and CPU of the computer running Turbo. "
         "One embed server stays up. A call that is already running is left alone. "
         "The line under the buttons says whether finished calls are keeping up."
     ),
+    "recommend": (
+        "Set the chunk count to the safe call for the computer running Turbo. "
+        "That count comes from detected memory and CPU. It is a start, not a maximum."
+    ),
     "tune": (
         "What the last full embed calls say about this batch size. "
-        "It follows chunks per second on those calls. It does not guess from the card. "
+        "It follows chunks per second on those calls, and it keeps a pace for each kind of content. "
+        "One page length is not its own pace. It does not guess from the card. "
         "A segment rewrite is not something a larger batch will speed up."
     ),
     "tune_auto": (
-        "Raise the batch while full embed calls keep up, and step down when a larger call "
-        "is clearly slower than the nearest smaller size still remembered, or the embed server struggles. "
-        "A long stay at one setting does not forget those sizes. A small slowdown is left alone. "
-        "Auto tries one step higher again after a short wait, and sooner when the pace of the work changes a lot. "
-        "150% is only the top of the slider. "
+        "Move the chunk count while a larger count is still faster. "
+        "Step down when a larger count is clearly slower, the embed server fails the call, "
+        "or free card memory is low. A brief slow patch that later calls do not repeat is left alone. "
+        "Article length does not move the count, and a pace from another article length is not used. "
+        "Another publication's pace is not a verdict. Auto can go above the old top. "
         "One embed server stays up. A call already running is left alone."
     ),
     "usage": (
@@ -96,15 +140,19 @@ TIPS: dict[str, str] = {
         "Warnings and errors. Unchecking this only hides them in the pane. The log file still records them."
     ),
     "info": "Ordinary progress lines. Unchecking this only hides them in the pane.",
-    "debug": "Detail lines, including one line per article. Unchecking this only hides them in the pane.",
+    "debug": (
+        "Detail lines, including one line per article. "
+        "The pane starts with these hidden. Checking Debug shows them here. "
+        "The log file still records them either way."
+    ),
     "follow": (
         "On jumps to the newest line and stays there. Scroll up to hold your place. "
         "Off keeps the page where it is while new lines arrive."
     ),
     "log": (
-        "Show or hide the log. The bar under this row sizes the log inside the window. "
-        "Each page has its own bar between the file list and the controls. "
-        "The window edges resize the whole window. Those positions are remembered."
+        "Show or hide the log text. The bar above this row sizes the list and the log. "
+        "The controls stay against the top of that bar, and this row stays against the bottom. "
+        "The window edges resize the whole window. The size, the place, and that bar are remembered."
     ),
     "project": (
         "Open this project's repository."
@@ -112,8 +160,8 @@ TIPS: dict[str, str] = {
     "nomad_repo": "Open the Project NOMAD repository.",
     "version": "This copy of Nomad TURBO Index. About names the Project NOMAD version it was tested with.",
     "host": (
-        "Open a separate window for CPU, memory, GPU, video memory, and the disks the library uses. "
-        "Resize that window and place it where you want. The size and place are remembered."
+        "Show or hide the host meters beside the pages. The vertical bar sets the width of that pane. "
+        "Whether it is open, and that width, are remembered."
     ),
     "host_disk": (
         "Used space and size of each disk the library uses, and how fast that disk is reading and writing. "
@@ -121,8 +169,8 @@ TIPS: dict[str, str] = {
     ),
     "legend": (
         "Blue names are ZIM files. Amber names are files you uploaded. "
-        "Drag a column edge to resize it. Drag a bar to resize the list, the controls, or the log. "
-        "Click a heading to sort."
+        "Drag a column edge to resize it. The bar above the log changes the list height. "
+        "The controls stay under the list."
     ),
     "repair_page": (
         "Scan checks the library and the index and changes nothing. "

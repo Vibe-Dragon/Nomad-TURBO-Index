@@ -26,10 +26,15 @@ OVERHEAD_RATIO = 0.04
 HOST_FLOOR_MIN_MIB = 2048
 HOST_FLOOR_RATIO = 0.25
 
-# Slider ends. 10 through 100 stay inside the detected budget.
-# 150 is the overclock and is never the default for a new install.
+# Older percent slider. 10 through 100 stay inside the detected budget.
+# 150 is only the old top of that slider. A saved percent still converts
+# through it. The chunk count Auto uses is not limited to 150.
 MIN_BOOST_PERCENT = 10
 MAX_BOOST_PERCENT = 150
+# Typed or saved chunk counts. One chunk is the floor. The high cap only
+# rejects an absurd number. It is not a performance ceiling.
+MIN_EMBED_CHUNKS = 1
+MAX_EMBED_CHUNKS = 100_000
 
 # MiB kept for the embed model beside the batch. This is the weight file
 # and a little runtime, not a graphics card.
@@ -44,6 +49,19 @@ MIN_CALL_CHUNKS = 8
 CPU_MIB_PER_CHUNK = 256
 CPU_CHUNKS_PER_CORE = 4
 
+# One llama-server. A second sequence is another slot in that server, not
+# another process. Each slot keeps this context. The total context is the
+# slot count times this number, so a long chunk is not squeezed into a
+# smaller window. 256 MiB is the room one extra context must have. It is
+# not a graphics card.
+SEQUENCE_CONTEXT = 2048
+SEQUENCE_MIB = 256
+# A call this long is the one that must not get slower. Shorter calls are
+# the ones a second sequence can share a forward with.
+LONG_CALL_TOKENS = 256
+SEQUENCE_SAMPLES = 6
+LONG_CALL_SAMPLES = 3
+
 
 @dataclass(frozen=True)
 class SlotPlan:
@@ -51,6 +69,72 @@ class SlotPlan:
     use_gpu: bool
     gpu_index: int | None
     reason: str
+
+
+def embed_server_shape(sequences: int, ctx_per_sequence: int = SEQUENCE_CONTEXT) -> tuple[int, int]:
+    """(slot count, total context). Each slot keeps the full context."""
+    count = 2 if int(sequences) >= 2 else 1
+    ctx = max(1, int(ctx_per_sequence))
+    return count, count * ctx
+
+
+def embed_sequences(use_gpu: bool, free_mib: int, per_sequence_mib: int = SEQUENCE_MIB) -> int:
+    """One sequence, or two when the free memory can hold another context.
+
+    CPU stays at one. The count is not a particular card.
+    """
+    if not use_gpu:
+        return 1
+    cost = int(per_sequence_mib)
+    if cost <= 0 or int(free_mib) < cost:
+        return 1
+    return 2
+
+
+class SequencePace:
+    """When a second sequence may stay.
+
+    Long calls have to be at least as fast as they were with one sequence.
+    Short calls may use the second sequence once a few calls have been seen.
+    """
+
+    def __init__(self) -> None:
+        self.one_long: list[float] = []
+        self.many_long: list[float] = []
+        self.calls_at_width = 0
+        self.locked_at_one = False
+        self.tried_two = False
+
+    def note(self, sequences: int, mean_tokens: int, chunks: int, seconds: float) -> None:
+        self.calls_at_width += 1
+        if seconds <= 0 or chunks <= 0 or int(mean_tokens) < LONG_CALL_TOKENS:
+            return
+        pace = float(chunks) / float(seconds)
+        if int(sequences) <= 1:
+            self.one_long.append(pace)
+        else:
+            self.many_long.append(pace)
+
+    def mark_resized(self) -> None:
+        self.calls_at_width = 0
+
+    def decision(self, current: int, fits: bool) -> tuple[int, str]:
+        if self.locked_at_one or (int(current) <= 1 and self.tried_two):
+            return 1, ""
+        if int(current) <= 1:
+            if fits and self.calls_at_width >= SEQUENCE_SAMPLES:
+                self.tried_two = True
+                return 2, "up"
+            return 1, ""
+        # A long call with no one-sequence sample stays on two sequences.
+        # Reloading to measure it made the server restart on every mix of lengths.
+        if len(self.one_long) >= LONG_CALL_SAMPLES and len(self.many_long) >= LONG_CALL_SAMPLES:
+            one = sum(self.one_long) / len(self.one_long)
+            many = sum(self.many_long) / len(self.many_long)
+            if many < one:
+                self.locked_at_one = True
+                return 1, "slower"
+        return int(current), ""
 
 
 def gpu_overhead_mib(total_mib: int) -> int:
@@ -67,17 +151,31 @@ def dedicate_percent(reserve_ratio: float) -> int:
 def reserve_ratio_from_percent(percent: int) -> float:
     """Chat reserve left over after the indexing share. 100% leaves no reserve.
 
-    The embed-call slider can go to 150%. That overclock is stored on
+    The old percent slider could go to 150%. That extra share is stored on
     Install.boost_percent, not as a negative reserve. This helper still
-    clamps to 10–100 for the older process-count math.
+    clamps to 10–100 for the older process-count math. It does not change
+    GPU clocks.
     """
     pct = min(100, max(10, int(percent)))
     return (100 - pct) / 100.0
 
 
 def clamp_boost_percent(percent: int) -> int:
-    """Slider percent. 10 through 100 stay inside the budget. 150 is the overclock."""
+    """Old slider percent, from 10 through 150. Used only to read a saved percent."""
     return min(MAX_BOOST_PERCENT, max(MIN_BOOST_PERCENT, int(percent)))
+
+
+def clamp_embed_chunks(count: int) -> int:
+    """Chunk count for one embed call.
+
+    The floor is one chunk. The high cap rejects an absurd typed number.
+    It is not a limit Auto stops at when a larger count is still faster.
+    """
+    try:
+        value = int(count)
+    except (TypeError, ValueError):
+        return MIN_EMBED_CHUNKS
+    return min(MAX_EMBED_CHUNKS, max(MIN_EMBED_CHUNKS, value))
 
 
 def install_boost_percent(install: object) -> int:
@@ -143,10 +241,10 @@ def embed_call_budget(
 
     100% is the safe size from GPU memory when a GPU is present, otherwise
     from system RAM and the CPU count. 10% through 100% scale that size.
-    Above 100% is an overclock: strictly more chunks than 100% on the same
-    inputs. 150% adds half of the safe call, rounded down to a whole number.
-    The same inputs always return the same count. There is no single chunk
-    ceiling for every machine, and no GPU model name is used.
+    Above 100% adds chunks past that safe call on the same inputs. It does
+    not change GPU clocks. 150% adds half of the safe call, rounded down to
+    a whole number. The same inputs always return the same count. There is
+    no single chunk ceiling for every machine, and no GPU model name is used.
     """
     full = safe_call_chunks(
         gpu_total_mib=gpu_total_mib,
@@ -160,6 +258,34 @@ def embed_call_budget(
     if full <= MIN_CALL_CHUNKS:
         return full
     return MIN_CALL_CHUNKS + (pct - 10) * (full - MIN_CALL_CHUNKS) // 90
+
+
+def install_embed_chunks(
+    install: object,
+    *,
+    gpu_total_mib: int | None,
+    host_total_mib: int,
+    cpu_count: int,
+) -> int:
+    """Chunk count saved for the next embed call.
+
+    A stored chunk count is used as itself. An older percent is converted
+    through the safe-call formula, so the percent figure is not used as a
+    raw chunk count.
+    """
+    raw = getattr(install, "embed_chunks", None)
+    if raw is not None:
+        try:
+            return clamp_embed_chunks(int(raw))
+        except (TypeError, ValueError):
+            pass
+    percent = install_boost_percent(install)
+    return embed_call_budget(
+        percent,
+        gpu_total_mib=gpu_total_mib,
+        host_total_mib=host_total_mib,
+        cpu_count=cpu_count,
+    )
 
 
 def host_floor_mib(total_mib: int) -> int:

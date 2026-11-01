@@ -190,14 +190,23 @@ def embed_model_path(install: Install) -> str:
     return model_blob_from_manifest(data)
 
 
-def start_embedder(install: Install, index: int, use_gpu: bool, gpu_index: int | None) -> tuple[str, str]:
-    """One llama-server. Ollama itself forces embedding to one stream per process.
+def start_embedder(
+    install: Install,
+    index: int,
+    use_gpu: bool,
+    gpu_index: int | None,
+    sequences: int = 1,
+) -> tuple[str, str]:
+    """One llama-server. The model is loaded once.
 
-    A wider server (`-np` above 1) made short chunks faster and long chunks
-    several times slower, so the server stays at one slot with a wide batch.
-    The model is loaded once. Callers send many chunks per request.
+    Sequences are slots in that server. Each keeps a 2048-token context, and
+    the total context grows with the slot count. Callers send many chunks
+    per request.
     """
     del index  # one server, whatever the pool asks for
+    from nomad_turbo.slots import embed_server_shape
+
+    slot_count, total_ctx = embed_server_shape(sequences)
     name = "nomad-turbo-embed"
     _remove_ours(name)
     command = [
@@ -248,9 +257,9 @@ def start_embedder(install: Install, index: int, use_gpu: bool, gpu_index: int |
         "-ngl",
         "999" if use_gpu and gpu_index is not None else "0",
         "-c",
-        "2048",
+        str(total_ctx),
         "-np",
-        "1",
+        str(slot_count),
         "-b",
         "8192",
         "-ub",
@@ -454,6 +463,73 @@ def embed(base_url: str, model: str, texts: list[str]) -> list[list[float]]:
     return collect_embeddings(post, texts)
 
 
+# Date reads use their own container so they cannot remove the live extractor.
+ZIM_DATE_NAME = "nomad-turbo-zimdate"
+
+
+def zim_date_command(install: Install, host_zim: str) -> list[str]:
+    """Docker argv that prints one ZIM's Date and exits.
+
+    The container name is not the extractor. This does not pause NOMAD
+    and does not index articles.
+    """
+    return [
+        "docker",
+        "run",
+        "--rm",
+        "--name",
+        ZIM_DATE_NAME,
+        "--label",
+        "nomad-turbo=zimdate",
+        "--network",
+        "none",
+        "--pull",
+        "never",
+        "-v",
+        f"{install.storage_host}:{install.container_storage}:ro",
+        "-v",
+        f"{EXTRACT}:/app/nomad-turbo-extract.mjs:ro",
+        "-w",
+        "/app",
+        "--entrypoint",
+        "node",
+        install.admin_image,
+        "/app/nomad-turbo-extract.mjs",
+        "--zim",
+        host_to_container(install, host_zim),
+        "--meta-only",
+    ]
+
+
+def read_zim_date(install: Install, host_zim: str, *, run=None) -> str | None:
+    """Archive Date for one zim. Failure returns None and leaves the extractor alone."""
+    command = zim_date_command(install, host_zim)
+    if ZIM_DATE_NAME == "nomad-turbo-extract":
+        raise RuntimeError_("a date read must not use the extract container")
+    if run is None:
+        _remove_ours(ZIM_DATE_NAME)
+        run = subprocess.run
+    try:
+        completed = run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=90, check=False)
+    except (OSError, subprocess.SubprocessError):
+        log.warning("could not read the ZIM date for %s", host_zim)
+        return None
+    if getattr(completed, "returncode", 1) != 0:
+        return None
+    raw = getattr(completed, "stdout", "") or ""
+    for line in raw.splitlines():
+        text = line.strip()
+        if not text:
+            continue
+        try:
+            event = json.loads(text)
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") == "meta":
+            return str(event.get("date") or "")
+    return None
+
+
 def start_extract(install: Install, host_zim: str, skip: int, after_path: str | None, index_start: int) -> subprocess.Popen:
     name = "nomad-turbo-extract"
     _remove_ours(name)
@@ -503,6 +579,7 @@ def read_visual(
     host_path: str,
     kind: str,
     stop: threading.Event | None = None,
+    on_status=None,
 ) -> str | None:
     """Text of one uploaded PDF or picture, using the NOMAD image's OCR libraries.
 
@@ -549,33 +626,52 @@ def read_visual(
     except OSError as exc:
         log.warning("could not start ocr: %s", exc)
         return None
-    box: dict[str, tuple[str, str]] = {}
+    out_box = {"text": ""}
 
-    def _wait() -> None:
-        box["out"] = proc.communicate()
+    def _stdout() -> None:
+        if proc.stdout is None:
+            return
+        out_box["text"] = proc.stdout.read()
 
-    thread = threading.Thread(target=_wait, name="nomad-turbo-ocr-wait")
-    thread.start()
+    def _stderr() -> None:
+        if proc.stderr is None:
+            return
+        try:
+            for raw in proc.stderr:
+                text = raw.strip()
+                if not text:
+                    continue
+                if on_status is None:
+                    log.info("ocr: %s", text[:300])
+                    continue
+                try:
+                    on_status(text)
+                except Exception:
+                    log.debug("ocr status failed", exc_info=True)
+        except ValueError:
+            return
+
+    out_thread = threading.Thread(target=_stdout, name="nomad-turbo-ocr-out", daemon=True)
+    err_thread = threading.Thread(target=_stderr, name="nomad-turbo-ocr-wait", daemon=True)
+    out_thread.start()
+    err_thread.start()
     stopped = False
     try:
-        while thread.is_alive():
+        while proc.poll() is None:
             if stop is not None and stop.is_set():
                 stopped = True
                 proc.kill()
-                thread.join(10)
-                raise RuntimeError("stopped")
-            thread.join(0.2)
+                break
+            time.sleep(0.2)
     finally:
         if proc.poll() is None:
             proc.kill()
-            thread.join(10)
+        out_thread.join(10)
+        err_thread.join(10)
         _remove_ours(OCR_NAME)
     if stopped:
         raise RuntimeError("stopped")
-    stdout, stderr = box.get("out", ("", ""))
-    if stderr.strip():
-        for line in stderr.splitlines()[-20:]:
-            log.info("ocr: %s", line[:300])
+    stdout = out_box["text"]
     text = visual_text(proc.returncode or 0, stdout)
     if text is None:
         log.warning("ocr failed for %s", host_path)

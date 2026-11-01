@@ -25,6 +25,8 @@ class CatalogRow:
     articles: int = 0
     total_articles: int | None = None
     chunks: int = 0
+    mtime: float | None = None
+    walk_index: int = 0
 
 
 def origin_for(source: str) -> str:

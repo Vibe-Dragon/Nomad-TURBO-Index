@@ -173,12 +173,16 @@ class HostReadingTest(unittest.TestCase):
 
     def test_the_host_window_place_round_trips_and_is_not_a_gpu_name(self):
         install = _install()
+        install.host_open = True
         install.host_x = 30
         install.host_y = 40
         install.host_width = 500
         install.host_height = 700
         again = Install.from_json(install.to_json())
+        self.assertTrue(again.host_open)
         self.assertEqual((again.host_x, again.host_y, again.host_width, again.host_height), (30, 40, 500, 700))
+        closed = Install.from_json(install.to_json().replace('"host_open": true', '"host_open": false'))
+        self.assertFalse(closed.host_open)
         data = json.loads(install.to_json())
         del data["host_width"]
         del data["host_x"]
@@ -186,8 +190,20 @@ class HostReadingTest(unittest.TestCase):
         self.assertEqual(restored.host_width, 0)
         self.assertIsNone(restored.host_x)
         source = inspect.getsource(load_install)
-        for key in ("host_x", "host_y", "host_width", "host_height"):
+        for key in ("host_open", "host_x", "host_y", "host_width", "host_height"):
             self.assertIn(f'"{key}"', source)
+        for key in ("window_x", "window_y", "window_width", "window_height", "window_max"):
+            self.assertIn(f'"{key}"', source)
+        install.window_x = 12
+        install.window_y = 24
+        install.window_width = 1300
+        install.window_height = 900
+        install.window_max = True
+        framed = Install.from_json(install.to_json())
+        self.assertEqual(
+            (framed.window_x, framed.window_y, framed.window_width, framed.window_height, framed.window_max),
+            (12, 24, 1300, 900, True),
+        )
         blob = inspect.getsource(assemble) + inspect.getsource(choose_gpu)
         self.assertNotIn("5060", blob)
         self.assertNotIn("RTX", blob)

@@ -1,7 +1,8 @@
-"""Older share dialog. The Index window slider is the control that ships.
+"""Older share dialog. The Index window's chunk field is the control that ships.
 
-Cancel leaves turbo off. This dialog stops at 100%. The window slider is
-what offers the 150% overclock. Neither one starts indexing by itself.
+Cancel leaves turbo off. This dialog stops at 100%. The window field is a
+chunk count and can go past the old percent top. Neither one starts indexing
+by itself.
 """
 
 from __future__ import annotations

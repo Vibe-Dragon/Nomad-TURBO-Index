@@ -127,6 +127,19 @@ class ArticleFeed:
         self._claim = claim
         return chosen
 
+    def call_article_size(self) -> int:
+        """Median chunk count of the articles in the open call. Zero when none are claimed."""
+        if not self._claim:
+            return 0
+        sizes: list[int] = []
+        for index in sorted({item for item, _input in self._claim}):
+            if 0 <= index < len(self._open):
+                sizes.append(len(self._open[index].inputs))
+        if not sizes:
+            return 0
+        sizes.sort()
+        return sizes[len(sizes) // 2]
+
     def split_rejected(self, index: int) -> tuple[str, str]:
         """Split one rejected input, or drop it when it cannot get smaller.
 

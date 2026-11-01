@@ -24,11 +24,10 @@ from nomad_turbo.engine import execute
 from nomad_turbo.prompt import display_available
 from nomad_turbo.runtime import gpu_rows
 from nomad_turbo.slots import (
-    MAX_BOOST_PERCENT,
-    embed_call_budget,
     host_memory_mib,
-    install_boost_percent,
+    install_embed_chunks,
     pick_gpu,
+    safe_call_chunks,
 )
 
 
@@ -98,25 +97,17 @@ def cmd_plan() -> int:
         has_gpu = True
     else:
         gpu_index, total, has_gpu = None, 0, False
-    percent = install_boost_percent(install)
     memory = host_memory_mib()
     host_total = memory[0] if memory else 0
     cpus = os.cpu_count() or 1
     gpu_total = total if has_gpu else None
-    width = embed_call_budget(
-        percent,
+    width = install_embed_chunks(
+        install,
         gpu_total_mib=gpu_total,
         host_total_mib=host_total,
         cpu_count=cpus,
     )
-    full = embed_call_budget(
-        100,
-        gpu_total_mib=gpu_total,
-        host_total_mib=host_total,
-        cpu_count=cpus,
-    )
-    over = embed_call_budget(
-        MAX_BOOST_PERCENT,
+    full = safe_call_chunks(
         gpu_total_mib=gpu_total,
         host_total_mib=host_total,
         cpu_count=cpus,
@@ -145,10 +136,9 @@ def cmd_plan() -> int:
     print(f"system ram {host_total} MiB, cpus {cpus}")
     where = "GPU" if has_gpu else "CPU"
     print(f"embed server: one llama-server on {where}")
-    print(f"hardware-derived chunks per call at {percent}%: {width}")
-    print(f"safe 100% call size from detected hardware: {full} chunks")
-    print(f"{MAX_BOOST_PERCENT}% overclock call size: {over} chunks")
-    print("The slider changes only that call size. The server stays up.")
+    print(f"next embed call: {width} chunks")
+    print(f"recommended call size from detected hardware: {full} chunks")
+    print("The chunk count changes only that call size. The server stays up.")
     if install.slots:
         print(f"config slots={install.slots} is ignored")
     print(f"files: {counts['zim']} zim, {counts['other']} other embeddable")
@@ -244,8 +234,18 @@ def cmd_start() -> int:
         print(f"window started, pid {proc.pid}")
         return 0
     install = load_install()
-    percent = install_boost_percent(install)
-    print(f"no display, starting at the saved {percent}% embed batch")
+    rows = gpu_rows()
+    chosen = pick_gpu(rows)
+    gpu_total = chosen[1] if chosen else None
+    memory = host_memory_mib()
+    host_total = memory[0] if memory else 0
+    chunks = install_embed_chunks(
+        install,
+        gpu_total_mib=gpu_total,
+        host_total_mib=host_total,
+        cpu_count=os.cpu_count() or 1,
+    )
+    print(f"no display, starting at {chunks} chunks per call")
     write_shortcut(True)
     log_file = _log_path().open("a")
     proc = subprocess.Popen(
@@ -256,7 +256,7 @@ def cmd_start() -> int:
         stdin=subprocess.DEVNULL,
     )
     _pid_path().write_text(str(proc.pid))
-    print(f"turbo started at {percent}% of the GPU, pid {proc.pid}")
+    print(f"turbo started at {chunks} chunks per call, pid {proc.pid}")
     return 0
 
 

@@ -46,8 +46,11 @@ from nomad_turbo.runtime import (
     visual_text,
 )
 from nomad_turbo.slots import (
+    SequencePace,
     dedicate_percent,
     embed_call_budget,
+    embed_sequences,
+    embed_server_shape,
     gpu_overhead_mib,
     host_floor_mib,
     host_slot_limit,
@@ -169,6 +172,55 @@ class DecisionsTest(unittest.TestCase):
 
 
 class SlotsTest(unittest.TestCase):
+    def test_a_second_sequence_keeps_a_full_context(self):
+        self.assertEqual(embed_server_shape(1), (1, 2048))
+        self.assertEqual(embed_server_shape(2), (2, 4096))
+        self.assertEqual(embed_server_shape(0), (1, 2048))
+        self.assertEqual(embed_sequences(False, 16000), 1)
+        self.assertEqual(embed_sequences(True, 255), 1)
+        self.assertEqual(embed_sequences(True, 256), 2)
+        self.assertEqual(embed_sequences(True, 16000), 2)
+
+    def test_long_calls_send_the_server_back_to_one_sequence(self):
+        pace = SequencePace()
+        for _ in range(6):
+            pace.note(1, 40, 8, 0.1)
+        self.assertEqual(pace.decision(1, True), (2, "up"))
+        self.assertEqual(pace.decision(1, False), (1, ""))
+        paced = SequencePace()
+        for _ in range(3):
+            paced.note(1, 400, 8, 1.0)
+            paced.note(2, 400, 8, 2.0)
+        self.assertEqual(paced.decision(2, True), (1, "slower"))
+        self.assertEqual(paced.decision(2, True), (1, ""))
+        missing = SequencePace()
+        missing.note(2, 400, 8, 1.0)
+        self.assertEqual(missing.decision(2, True), (2, ""))
+        once = SequencePace()
+        for _ in range(6):
+            once.note(1, 40, 8, 0.1)
+        self.assertEqual(once.decision(1, True), (2, "up"))
+        self.assertEqual(once.decision(1, True), (1, ""))
+
+    def test_an_older_session_still_records_the_embed_call(self):
+        from nomad_turbo.engine import _note_embed_call
+
+        class Older:
+            def note_embed_call(self, size, chunks, seconds, ok, kind="", article_size=0):
+                self.got = (size, chunks, seconds, ok, kind, article_size)
+
+        older = Older()
+        _note_embed_call(older, 61, 61, 0.2, True, "zim", 1000, 400)
+        self.assertEqual(older.got, (61, 61, 0.2, True, "zim", 1000))
+
+        class Current:
+            def note_embed_call(self, size, chunks, seconds, ok, kind="", article_size=0, tokens=0):
+                self.tokens = tokens
+
+        current = Current()
+        _note_embed_call(current, 61, 61, 0.2, True, "zim", 1000, 400)
+        self.assertEqual(current.tokens, 400)
+
     def test_reserve_scales_with_whatever_card_is_installed(self):
         small = plan_slots(
             total_mib=8192,

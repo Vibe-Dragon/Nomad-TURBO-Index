@@ -1,59 +1,101 @@
-"""Live embed-batch advice from finished calls, not from the card's spec sheet.
+"""Live embed-batch advice from finished calls.
 
-Auto raises the slider while full calls keep up, and steps down as soon as a
-larger call is slower than the nearest smaller size it still remembers, or the
-embed server fails one. A long stay at one size does not erase that neighbor.
-After a step down it waits through more calls before trying one step higher
-again, so it does not bounce. A step that is not faster does not keep going.
-If the pace of the work changes, that wait ends early. 150% is only the top
-of the slider. A call already in flight is left alone. One server stays up.
+The count is chunks per call. Auto may raise it past the old percent ceiling
+while a larger count is still faster on the same publication and the same
+article length. It steps down when a larger count is clearly slower on that
+work, when the embed server fails a call, or when free GPU memory is under
+the headroom stop. A brief slow patch that later calls do not repeat does not
+move the count. Article length does not move the count, and a pace measured
+on a different article length is not a verdict. Another publication's pace is
+not a verdict either. One server stays up. A call already in flight is left
+alone.
 """
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
+from pathlib import Path
 
-from nomad_turbo.slots import MAX_BOOST_PERCENT, clamp_boost_percent
+from nomad_turbo.slots import clamp_embed_chunks
 
-# Three full calls are enough to compare. One odd slow page is not.
+# One half of the confirmation window. Both halves have to agree.
 CALLS_BEFORE_MOVE = 3
-PERCENT_STEP = 5
-# A larger call this far below the previous pace is slower, not noise.
-# Ten percent is normal swing on short pages, so the step down waits for a fifth.
+# A larger call this far below the neighbor is slower, not noise.
 SLOW_RATIO = 0.80
-# After a slower-but-successful call, wait this many recorded embed calls
-# and this many seconds before probing one step higher. Both have to pass.
-# A failed call waits longer. Short pages finish the call count in a few seconds,
-# so the clock is what stops the bounce.
+# Both halves have to beat the smaller size by this much. A tie does not climb.
+# Neighboring sizes on one stretch often differ by less than this.
+FAST_RATIO = 1.05
+# After a failed call, wait this many recorded embed calls and this many
+# seconds before another climb. Both have to pass.
 RETRY_CALLS = 24
 RETRY_SECONDS = 90
 FAIL_RETRY_CALLS = 48
 FAIL_RETRY_SECONDS = 180
-# The wait ends early when the current pace is this far from the pace that
-# made the larger call look worse. The work has changed.
-PACE_SHIFT = 0.60
-# Spare video memory before Auto stops raising the call. This is a safety
-# stop from the live reading, not a batch size computed from the card.
+# Spare video memory before Auto stops raising the call.
 GPU_HEADROOM_MIB = 768
+
+_TRAILING_DATE = re.compile(r"(?:[._-](?:19|20)\d{2}(?:[._-]\d{2})?)+$")
+
+
+def chunk_step(count: int) -> int:
+    """How many chunks one Auto step moves. About a twentieth of the current count."""
+    return max(1, int(count) // 20)
+
+
+def article_band(article_size: int) -> int:
+    """Power-of-two band for article length. A clearly different length is the next band."""
+    size = max(0, int(article_size or 0))
+    if size <= 0:
+        return 0
+    band = 1
+    while band * 2 <= size:
+        band *= 2
+    return band
+
+
+def content_kind(source: str) -> str:
+    """Identity of the work being indexed. Not a table of batch sizes.
+
+    A trailing year or year-month is removed so two monthly files of the same
+    publication stay one kind. The name itself is kept.
+    """
+    name = Path(str(source or "")).name.lower()
+    suffix = Path(name).suffix
+    stem = name[: -len(suffix)] if suffix else name
+    stem = _TRAILING_DATE.sub("", stem).strip("._- ")
+    if suffix == ".zim":
+        return stem or "zim"
+    if not stem:
+        return suffix.lstrip(".") or "file"
+    return f"{stem}{suffix}"
 
 
 @dataclass(frozen=True)
 class EmbedSample:
-    """One embed call. ok is false when the server failed the call, not when one chunk was too long."""
+    """One embed call. `size` is the chunk count that was asked for.
 
-    percent: int
+    `chunks` is how many were actually sent, used for the pace. `ok` is false
+    when the server failed the call, not when one chunk was too long. `kind`
+    is the content identity. `article_size` is the article length for that call,
+    in chunks of that article.
+    """
+
+    size: int
     chunks: int
     seconds: float
     ok: bool
+    kind: str = ""
+    article_size: int = 0
 
 
 @dataclass(frozen=True)
 class TuneHold:
     """Auto will not climb past `above` until both the call count and the time have passed.
 
-    `pace` is chunks per second when the hold was set. Zero means there was no
-    pace to compare. `kind` is "down" after a slower call, or "settle" after a
-    probe that kept up, so the next step does not follow in the same breath.
+    `kind` is "down" after a failed call. `work_kind` limits the hold to that
+    publication. `work_band` is kept so an older hold still loads. A different
+    page length does not lift the hold.
     """
 
     above: int
@@ -61,14 +103,16 @@ class TuneHold:
     pace: float
     until_time: float = 0.0
     kind: str = "down"
+    work_kind: str = ""
+    work_band: int = -1
 
 
 @dataclass(frozen=True)
 class TuneAdvice:
-    """percent is where Auto should put the slider. move is false for a recommendation only."""
+    """`count` is the chunk count Auto should use. `move` is false for a note only."""
 
     text: str
-    percent: int
+    count: int
     move: bool
     hold: TuneHold | None
 
@@ -86,164 +130,231 @@ def _pace(samples: list[EmbedSample]) -> float | None:
     return chunks / seconds
 
 
-def _stint(samples: list[EmbedSample], percent: int) -> list[EmbedSample]:
-    """Calls at this percent since it was last selected. An older visit does not count."""
-    if not samples or samples[-1].percent != percent:
-        return []
-    found: list[EmbedSample] = []
-    for sample in reversed(samples):
-        if sample.percent != percent:
-            break
-        found.append(sample)
-    found.reverse()
-    return found[-6:]
+def _remember_paces(samples: list[EmbedSample], memory: dict) -> None:
+    """Store a pace only after a full timed stretch at one count for one publication.
 
-
-def _lower_pace(samples: list[EmbedSample], percent: int) -> tuple[int, float] | None:
-    """The nearest smaller setting that already has enough finished calls."""
-    percents = sorted({sample.percent for sample in samples if sample.percent < percent})
-    found: tuple[int, float] | None = None
-    for candidate in percents:
-        ok = [sample for sample in samples if sample.percent == candidate and sample.ok]
-        pace = _pace(ok[-CALLS_BEFORE_MOVE:])
-        if len(ok) >= CALLS_BEFORE_MOVE and pace is not None:
-            found = (candidate, pace)
-    return found
-
-
-def _same_work(pace: float, remembered: float) -> bool:
-    """True when two paces are close enough to be the same kind of page."""
-    if pace <= 0 or remembered <= 0:
-        return False
-    ratio = pace / remembered
-    return PACE_SHIFT <= ratio <= (1 / PACE_SHIFT)
-
-
-def _remember_paces(samples: list[EmbedSample], memory: dict[int, float]) -> None:
-    """Store the last full pace at each percent.
-
-    The recent-call list forgets a size once the slider sits elsewhere. This
-    map is what lets Auto step down from 150% an hour later. A new visit
-    replaces a pace only after three fresh calls, so one odd call does not.
+    The stretch is both halves of the confirmation window. A shorter visit does
+    not become a target. The key keeps the article-length band of that stretch,
+    so a long-page pace is not a neighbor for a short-page pace.
     """
-    run_percent: int | None = None
+    for key in list(memory):
+        if not (isinstance(key, tuple) and len(key) == 3):
+            memory.pop(key, None)
+    need = CALLS_BEFORE_MOVE * 2
+    run_key: tuple[str, int] | None = None
     run: list[EmbedSample] = []
 
     def finish() -> None:
-        ok = [sample for sample in run if sample.ok]
-        if run_percent is None or len(ok) < CALLS_BEFORE_MOVE:
+        if run_key is None:
             return
-        pace = _pace(ok[-CALLS_BEFORE_MOVE:])
-        if pace is not None:
-            memory[run_percent] = pace
+        ok = [sample for sample in run if sample.ok]
+        if len(ok) < need:
+            return
+        stretch = ok[-need:]
+        pace = _pace(stretch)
+        if pace is None:
+            return
+        memory[(run_key[0], _median_band(stretch), run_key[1])] = pace
 
     for sample in samples:
-        if sample.percent != run_percent:
+        key = (str(sample.kind), int(sample.size))
+        if key != run_key:
             finish()
-            run_percent = sample.percent
+            run_key = key
             run = []
         run.append(sample)
     finish()
 
 
-def _nearest_lower(memory: dict[int, float], percent: int) -> tuple[int, float] | None:
-    """The closest smaller size with a stored pace. Not the fastest one."""
-    nearest: int | None = None
-    found: float | None = None
-    for candidate, remembered in memory.items():
-        if candidate >= percent or remembered <= 0:
-            continue
-        if nearest is None or candidate > nearest:
-            nearest = candidate
-            found = remembered
-    if nearest is None or found is None:
+def _parsed_pace(key: object, remembered: object) -> tuple[str, int, int, float] | None:
+    """(kind, article band, chunk count, pace). A key without a band is ignored."""
+    if not isinstance(key, tuple) or len(key) != 3:
         return None
-    return nearest, found
+    if remembered is None or float(remembered) <= 0:
+        return None
+    return str(key[0]), int(key[1]), int(key[2]), float(remembered)
 
 
-def _measured_here(samples: list[EmbedSample], percent: int) -> bool:
-    """True when this advice still has three finished calls at that percent."""
-    ok = [sample for sample in samples if sample.percent == percent and sample.ok]
-    return len(ok) >= CALLS_BEFORE_MOVE
+def _nearest(memory: dict, kind: str, size: int, *, higher: bool, band: int | None):
+    """Closest same-publication size on one side. Not the fastest size ever seen.
 
-
-def _parent_pace(memory: dict[int, float], percent: int, pace: float) -> float | None:
-    """Pace of the nearest larger size measured on this same pace of work."""
-    nearest: int | None = None
-    found: float | None = None
-    for candidate, remembered in memory.items():
-        if candidate <= percent or not _same_work(pace, remembered):
+    `band` limits the match to that article length. None accepts any length,
+    which only answers whether some other length already has a smaller count.
+    """
+    found_size: int | None = None
+    found_pace: float | None = None
+    for key, remembered in memory.items():
+        parsed = _parsed_pace(key, remembered)
+        if parsed is None:
             continue
-        if nearest is None or candidate < nearest:
-            nearest = candidate
-            found = remembered
+        key_kind, key_band, candidate, pace = parsed
+        if key_kind != kind:
+            continue
+        if band is not None and key_band != band:
+            continue
+        if higher and candidate <= size:
+            continue
+        if not higher and candidate >= size:
+            continue
+        if found_size is None or (candidate < found_size if higher else candidate > found_size):
+            found_size = candidate
+            found_pace = pace
+    if found_size is None or found_pace is None:
+        return None
+    return found_size, found_pace
+
+
+def _halves(samples: list[EmbedSample]):
+    """Two groups of finished calls. None until both groups exist."""
+    ok = [sample for sample in samples if sample.ok]
+    need = CALLS_BEFORE_MOVE * 2
+    if len(ok) < need:
+        return None
+    recent = ok[-need:]
+    first = recent[:CALLS_BEFORE_MOVE]
+    second = recent[CALLS_BEFORE_MOVE:]
+    left = _pace(first)
+    right = _pace(second)
+    whole = _pace(recent)
+    if left is None or right is None or whole is None:
+        return None
+    return left, right, whole
+
+
+def _both_faster(halves, baseline: float) -> bool:
+    if baseline <= 0:
+        return False
+    left, right, _whole = halves
+    return left > baseline * FAST_RATIO and right > baseline * FAST_RATIO
+
+
+def _both_slower(halves, baseline: float) -> bool:
+    if baseline <= 0:
+        return False
+    left, right, _whole = halves
+    return left < baseline * SLOW_RATIO and right < baseline * SLOW_RATIO
+
+
+def _trailing(samples: list[EmbedSample], size: int) -> list[EmbedSample]:
+    found: list[EmbedSample] = []
+    for sample in reversed(samples):
+        if sample.size != size:
+            break
+        found.append(sample)
+    found.reverse()
     return found
 
 
-def _work_slowed(memory: dict[int, float], percent: int, pace: float) -> bool:
-    """True when every remembered smaller size belongs to a faster kind of page."""
-    lowers = [remembered for candidate, remembered in memory.items() if candidate < percent and remembered > 0]
-    if not lowers:
+def _current_work(samples: list[EmbedSample], kind: str, article_size: int) -> tuple[str, int]:
+    last = samples[-1] if samples else None
+    live_kind = kind if kind else (last.kind if last else "")
+    if article_size:
+        live_article = article_size
+    elif last is not None and (not kind or last.kind == live_kind):
+        live_article = last.article_size
+    else:
+        live_article = 0
+    return live_kind, article_band(live_article)
+
+
+def _median_band(samples: list[EmbedSample]) -> int:
+    """Band of the middle page length. One long page does not move it."""
+    sizes = sorted(sample.article_size for sample in samples if sample.article_size > 0)
+    if len(sizes) < CALLS_BEFORE_MOVE:
+        return 0
+    return article_band(sizes[len(sizes) // 2])
+
+
+def _kind_just_opened(samples: list[EmbedSample], kind: str) -> bool:
+    """True when this publication started after a different one in the recent calls."""
+    if not samples or not kind:
         return False
-    return all(pace / remembered < PACE_SHIFT for remembered in lowers)
+    index = len(samples) - 1
+    if samples[index].kind != kind:
+        return True
+    while index >= 0 and samples[index].kind == kind:
+        index -= 1
+    return index >= 0
 
 
-def _decline_target(
-    memory: dict[int, float],
-    samples: list[EmbedSample],
-    percent: int,
-    pace: float,
-) -> tuple[int, float] | None:
-    """The nearest smaller size, when this one is clearly slower than it.
-
-    A fast sample from early in a climb does not veto a later size. The size
-    just measured still counts when the drop is large, because that drop is
-    the batch, not a different kind of page. A step that did not beat the size
-    just above it does not keep going.
-    """
-    nearest = _nearest_lower(memory, percent)
-    if nearest is None:
-        return None
-    candidate, remembered = nearest
-    fresh = _measured_here(samples, candidate)
-    if not fresh and not _same_work(pace, remembered):
-        return None
-    parent = _parent_pace(memory, percent, pace)
-    if parent is not None and pace <= parent:
-        return None
-    if pace >= remembered * SLOW_RATIO:
-        return None
-    return candidate, remembered
-
-
-def _hold_open(hold: TuneHold | None, pace: float | None, call_count: int, now: float) -> bool:
-    """True while Auto should not climb past the hold."""
+def _hold_open(hold: TuneHold | None, call_count: int, now: float) -> bool:
     if hold is None:
         return False
-    if hold.kind == "down" and hold.pace > 0 and pace is not None and pace > 0:
-        ratio = pace / hold.pace
-        if ratio < PACE_SHIFT or ratio > (1 / PACE_SHIFT):
-            return False
     if call_count >= hold.until_calls and now >= hold.until_time:
         return False
     return True
 
 
-def _hold_text(hold: TuneHold) -> str:
-    if hold.kind == "settle":
-        return "Staying at this size. Auto will try one step higher after a short wait."
-    return "A larger call was slower. Auto will try one step higher after a short wait."
+def _hold_applies(hold: TuneHold | None, kind: str, band: int) -> bool:
+    """A hold follows the publication. A different page length does not lift it."""
+    del band
+    if hold is None:
+        return False
+    if hold.work_kind and kind and hold.work_kind != kind:
+        return False
+    return True
 
 
-def _step_down_hold(call_count: int, now: float, lower: int, pace: float, *, failed: bool) -> TuneHold:
+def _refuse_upward(
+    count: int,
+    nxt: int,
+    hold: TuneHold | None,
+    live_kind: str,
+    live_band: int,
+    call_count: int,
+    now: float,
+    gpu_free_mib: int | None,
+) -> TuneAdvice | None:
+    """Block a climb when card memory is low or an open hold still applies.
+
+    Stepping down is allowed. An open hold is kept. A climb that would pass
+    `hold.above` is refused even when the publication changed.
+    """
+    if nxt <= count:
+        return None
+    if gpu_free_mib is not None and int(gpu_free_mib) < GPU_HEADROOM_MIB:
+        return TuneAdvice(
+            "Card memory is nearly full. A larger batch may be refused.",
+            count,
+            False,
+            hold,
+        )
+    if not _hold_open(hold, call_count, now):
+        return None
+    applies = _hold_applies(hold, live_kind, live_band)
+    if not applies and nxt <= hold.above:
+        return None
+    if count > hold.above:
+        return TuneAdvice(
+            "A larger call was slower. Returning to the smaller batch.",
+            hold.above,
+            True,
+            hold,
+        )
+    return TuneAdvice(_hold_text(hold), count, False, hold)
+
+
+def _step_down_hold(call_count: int, now: float, lower: int, pace: float, *, failed: bool, kind: str, band: int) -> TuneHold:
     calls = FAIL_RETRY_CALLS if failed else RETRY_CALLS
     seconds = FAIL_RETRY_SECONDS if failed else RETRY_SECONDS
-    return TuneHold(lower, call_count + calls, pace if pace > 0 else 0.0, now + seconds, "down")
+    return TuneHold(
+        lower,
+        call_count + calls,
+        pace if pace > 0 else 0.0,
+        now + seconds,
+        "down",
+        kind,
+        band,
+    )
+
+
+def _hold_text(hold: TuneHold) -> str:
+    return "A larger call was slower. Auto will try a larger batch only after a short wait."
 
 
 def tune_advice(
     samples: list[EmbedSample],
-    percent: int,
+    count: int,
     *,
     auto: bool,
     running: bool,
@@ -252,141 +363,164 @@ def tune_advice(
     hold: TuneHold | None = None,
     call_count: int = 0,
     now: float = 0.0,
-    memory: dict[int, float] | None = None,
+    memory: dict | None = None,
+    kind: str = "",
+    article_size: int = 0,
 ) -> TuneAdvice:
-    """Recommend a batch, and move it only when auto is on and a change is earned.
+    """Recommend a chunk count. Move it only when auto is on and the calls earn it.
 
-    A step down is immediate once three full calls are about a fifth slower than
-    the nearest smaller size still remembered, or on one failed call. The recent
-    call list can forget a size. `memory` keeps that pace and is updated in place.
-    The next step up waits on the clock and the call count, unless the pace of
-    the work has changed a lot. A step down that is not faster does not keep
-    going. Manual use leaves the hold unchanged.
+    `memory` is updated in place. Keys are (content kind, article band, chunk count).
+    A pace from another publication is not a neighbor. A pace from another
+    article length is not a neighbor either.
     """
-    percent = clamp_boost_percent(percent)
+    count = clamp_embed_chunks(count)
     now = float(now)
     if hold is not None:
-        kind = hold.kind if hold.kind in {"down", "settle"} else "down"
         hold = TuneHold(
-            clamp_boost_percent(hold.above),
+            clamp_embed_chunks(hold.above),
             int(hold.until_calls),
             float(hold.pace),
             float(hold.until_time),
-            kind,
+            hold.kind if hold.kind in {"down", "settle"} else "down",
+            str(hold.work_kind),
+            int(hold.work_band),
         )
     if optimizing:
         return TuneAdvice(
             "Indexing is waiting on a segment. The batch size will not speed that up.",
-            percent,
+            count,
             False,
             hold,
         )
     if not running:
         return TuneAdvice(
             "A recommendation shows after indexing finishes a few embed calls.",
-            percent,
+            count,
             False,
             hold,
         )
     if memory is None:
         memory = {}
     _remember_paces(samples, memory)
-    stint = _stint(samples, percent)
-    pace = _pace([sample for sample in stint if sample.ok])
-    if auto and _hold_open(hold, pace, call_count, now) and hold is not None and percent > hold.above:
-        return TuneAdvice(
-            "A larger call was slower. Returning to the smaller batch.",
-            hold.above,
-            True,
-            hold,
-        )
-    if any(not sample.ok for sample in stint):
-        lower = clamp_boost_percent(percent - PERCENT_STEP)
+    live_kind, live_band = _current_work(samples, kind, article_size)
+    trailing = _trailing(samples, count)
+    # Pace is this publication at this count and this article length.
+    # Another publication at the same count is not this batch getting slower.
+    same = [sample for sample in trailing if sample.kind == live_kind]
+
+    if any(not sample.ok for sample in same):
+        lower = clamp_embed_chunks(count - chunk_step(count))
         text = "The embed server struggled with this call. A smaller batch is safer."
-        if auto and lower != percent:
-            text = "The embed server struggled with this call. Trying a smaller one."
-            previous = _lower_pace(samples, percent)
-            baseline = previous[1] if previous is not None else 0.0
+        if auto and lower != count:
             return TuneAdvice(
-                text,
+                "The embed server struggled with this call. Trying a smaller one.",
                 lower,
                 True,
-                _step_down_hold(call_count, now, lower, baseline, failed=True),
+                _step_down_hold(call_count, now, lower, 0.0, failed=True, kind=live_kind, band=live_band),
             )
-        return TuneAdvice(text, percent, False, hold)
-    ok = [sample for sample in stint if sample.ok][-CALLS_BEFORE_MOVE:]
-    if len(ok) < CALLS_BEFORE_MOVE or _pace(ok) is None:
-        seen = len([sample for sample in stint if sample.ok])
-        if auto and hold is not None and _hold_open(hold, None, call_count, now):
-            return TuneAdvice(_hold_text(hold), percent, False, hold)
+        return TuneAdvice(text, count, False, hold)
+
+    if _kind_just_opened(samples, live_kind):
+        seen = len([sample for sample in same if sample.ok])
+        if seen < CALLS_BEFORE_MOVE * 2:
+            return TuneAdvice(
+                "This content is different. The pace from the other work is not a verdict.",
+                count,
+                False,
+                hold,
+            )
+
+    halves = _halves(same)
+    if halves is None:
+        seen = len([sample for sample in same if sample.ok])
+        need = CALLS_BEFORE_MOVE * 2
+        if auto and _hold_applies(hold, live_kind, live_band) and _hold_open(hold, call_count, now):
+            return TuneAdvice(_hold_text(hold), count, False, hold)
         return TuneAdvice(
-            f"Watching finished calls ({min(seen, CALLS_BEFORE_MOVE)} of {CALLS_BEFORE_MOVE}) before recommending a change.",
-            percent,
+            f"Watching finished calls ({min(seen, need)} of {need}) before recommending a change.",
+            count,
             False,
             hold,
         )
-    pace = _pace(ok)
-    if pace is not None:
-        slowed = _decline_target(memory, samples, percent, pace)
-        if slowed is not None:
-            baseline, baseline_pace = slowed
-            lower = clamp_boost_percent(percent - PERCENT_STEP)
-            if not auto or lower == percent:
-                text = f"This batch is slower than {baseline}%. A smaller size is faster."
-                return TuneAdvice(text, percent, False, hold)
-            return TuneAdvice(
-                f"This batch is slower than {baseline}%. Trying a smaller one.",
-                lower,
-                True,
-                _step_down_hold(call_count, now, lower, baseline_pace, failed=False),
-            )
-        # One remeasure when the old smaller sizes are from a faster kind of
-        # page. A same-work size already above this one means that remeasure
-        # happened, so a change of page cannot walk the slider down.
-        if auto and _parent_pace(memory, percent, pace) is None and _work_slowed(memory, percent, pace):
-            lower = clamp_boost_percent(percent - PERCENT_STEP)
-            if lower != percent:
-                return TuneAdvice(
-                    "The pace of the work changed. Trying a smaller batch.",
-                    lower,
-                    True,
-                    _step_down_hold(call_count, now, lower, pace, failed=False),
-                )
+
+    ok_same = [sample for sample in same if sample.ok]
+    judge_band = _median_band(ok_same[-(CALLS_BEFORE_MOVE * 2) :])
+    lower = _nearest(memory, live_kind, count, higher=False, band=judge_band)
+    if lower is not None and _both_slower(halves, lower[1]):
+        step = chunk_step(count)
+        nxt = clamp_embed_chunks(count - step)
+        text = "This batch is slower than the smaller one on this work. Trying a smaller one."
+        if not auto or nxt == count:
+            note = "This batch is slower than the smaller one on this work. A smaller size is faster."
+            return TuneAdvice(note, count, False, hold)
+        return TuneAdvice(
+            text,
+            nxt,
+            True,
+            _step_down_hold(call_count, now, nxt, lower[1], failed=False, kind=live_kind, band=live_band),
+        )
+
     if gpu_free_mib is not None and gpu_free_mib < GPU_HEADROOM_MIB:
         return TuneAdvice(
             "Card memory is nearly full. A larger batch may be refused.",
-            percent,
+            count,
             False,
             hold,
         )
-    if auto and hold is not None and _hold_open(hold, pace, call_count, now):
-        return TuneAdvice(_hold_text(hold), percent, False, hold)
-    if percent >= MAX_BOOST_PERCENT:
-        return TuneAdvice(
-            "At 150%. Calls are still keeping up. The slider goes no higher.",
-            percent,
-            False,
-            None,
-        )
-    nxt = clamp_boost_percent(percent + PERCENT_STEP)
-    if auto:
-        again = hold is not None
-        text = "Trying a larger batch again." if again else "Chunks are still keeping up. Trying a larger batch."
-        # A first climb can keep stepping. A probe that just earned its step waits
-        # before the one after it, so a noisy stretch cannot walk the slider up.
-        settled = None
-        if again:
-            settled = TuneHold(
-                nxt,
-                call_count + RETRY_CALLS,
-                pace or 0.0,
-                now + RETRY_SECONDS,
-                "settle",
+    if auto and _hold_applies(hold, live_kind, live_band) and _hold_open(hold, call_count, now):
+        if count > hold.above:
+            return TuneAdvice(
+                "A larger call was slower. Returning to the smaller batch.",
+                hold.above,
+                True,
+                hold,
             )
-        return TuneAdvice(text, nxt, True, settled)
-    return TuneAdvice(
-        "Chunks are keeping up. You can try a higher setting.",
-        percent,
-        False,
-        hold,
-    )
+        return TuneAdvice(_hold_text(hold), count, False, hold)
+
+    if lower is None and _nearest(memory, live_kind, count, higher=False, band=None) is not None:
+        return TuneAdvice(
+            "Article length changed. Staying at this count.",
+            count,
+            False,
+            hold,
+        )
+
+    higher = _nearest(memory, live_kind, count, higher=True, band=judge_band)
+    _left, _right, pace = halves
+    higher_blocks = higher is not None and not (higher[1] > pace * FAST_RATIO)
+    faster_than_lower = lower is not None and _both_faster(halves, lower[1])
+    if higher_blocks or (lower is not None and not faster_than_lower):
+        if faster_than_lower and higher_blocks:
+            text = "This size is faster than the smaller one. A larger count was not, so Auto is staying here."
+        else:
+            text = "This size ties the one just tried. Staying here."
+        if not auto:
+            text = "This size ties the one just tried. You can leave it here."
+        return TuneAdvice(text, count, False, hold)
+
+    nxt = clamp_embed_chunks(count + chunk_step(count))
+    if auto:
+        if lower is None:
+            text = "Trying a larger batch."
+        else:
+            text = "This batch is still faster. Trying a larger one."
+        # A full run of different work can reach this climb. It must not step
+        # past an open hold or drop that hold on the way by.
+        refused = _refuse_upward(
+            count,
+            nxt,
+            hold,
+            live_kind,
+            live_band,
+            call_count,
+            now,
+            gpu_free_mib,
+        )
+        if refused is not None:
+            return refused
+        return TuneAdvice(text, nxt, True, hold)
+    if lower is None:
+        text = "You can try a higher count."
+    else:
+        text = "This batch is still faster. You can try a higher count."
+    return TuneAdvice(text, count, False, hold)

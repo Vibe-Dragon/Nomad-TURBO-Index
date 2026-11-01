@@ -30,7 +30,7 @@ def scan_library(install: Install) -> ScanResult:
             grouped.setdefault(source, []).append(data)
     details = ingest_details(install)
     rows: list[CatalogRow] = []
-    for host, kind, source in _sources(install):
+    for walk_index, (host, kind, source) in enumerate(_sources(install)):
         entries = grouped.get(source, [])
         checkpoint = _read_checkpoint(source) or {}
         offsets = [int(item.get("batchOffset") or 0) for item in entries]
@@ -49,8 +49,11 @@ def scan_library(install: Install) -> ScanResult:
             has_continuation=bool(entries),
         )
         chunks = max(int(checkpoint.get("chunks") or 0), int(ingest_chunks or 0))
+        mtime = None
         try:
-            size = host.stat().st_size
+            info = host.stat()
+            size = info.st_size
+            mtime = info.st_mtime
         except OSError:
             size = 0
         rows.append(
@@ -64,6 +67,8 @@ def scan_library(install: Install) -> ScanResult:
                 articles=0 if state == "indexed" else resume,
                 total_articles=total,
                 chunks=chunks,
+                mtime=mtime,
+                walk_index=walk_index,
             )
         )
     order = {"running": 0, "partial": 1, "pending": 2, "failed": 3, "deferred": 4, "indexed": 5}
