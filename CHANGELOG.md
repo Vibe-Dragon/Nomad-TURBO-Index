@@ -6,6 +6,7 @@
 
 - A PDF or a picture still keeps its text layer, and the page image is still read. Words the text layer does not have are still added. The file is still not handed to NOMAD. Pages are read together. One Tesseract worker runs for each hardware thread after two threads are left free. A worker finishes the page it is on and waits while other programs are using the CPU, then takes a thread back. The process runs at a lower priority. A PDF page is drawn once, at 200 dpi, from the page box. A long side past 4000 pixels is scaled in that same draw.
 - **Measure** samples a file that has not been started. A file that already has articles or chunks, is already partial, or already has a saved ETA keeps that ETA and is left alone. The pass can finish while those files are still unfinished. A file that is running with nothing stored is still a sample. **Then index** is unchanged.
+- A ZIM walk drops each directory entry it has passed. A file whose HTML articles are followed by millions of other files, such as map tiles, no longer keeps those entries until memory runs out. Garbage collection alone does not free the native entries. The walk returns to the event loop so their destructors run. Every HTML article is still read, and a long page is still indexed in full. The extractor turns on garbage collection for that walk, and its launch command asks for it as well.
 
 ### Minor
 

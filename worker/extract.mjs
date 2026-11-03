@@ -8,6 +8,8 @@
 import { createRequire } from "node:module";
 import { availableParallelism } from "node:os";
 import { pathToFileURL } from "node:url";
+import { setFlagsFromString } from "node:v8";
+import { runInNewContext } from "node:vm";
 import { isMainThread, parentPort, Worker } from "node:worker_threads";
 
 const require = createRequire("/app/package.json");
@@ -344,11 +346,58 @@ export function articleFromHtml(raw) {
   return { sections: collector.finish() };
 }
 
-function* entries(archive, afterPath) {
+// iterByPath visits every user entry. A map file keeps its HTML pages first
+// and then millions of tiles. Each step builds an Entry the V8 heap does not
+// account for, so the walk collects them on a fixed count. The entry in hand
+// stays live. Articles are not skipped, and a long page is still read in full.
+const COLLECT_EVERY = 2048;
+let resolvedGc = false;
+
+export function resolveEntryGc() {
+  if (resolvedGc !== false) return resolvedGc;
+  if (typeof globalThis.gc === "function") {
+    resolvedGc = globalThis.gc;
+    return resolvedGc;
+  }
+  try {
+    setFlagsFromString("--expose-gc");
+    const found = runInNewContext("gc");
+    resolvedGc = typeof found === "function" ? found : null;
+  } catch {
+    resolvedGc = null;
+  }
+  return resolvedGc;
+}
+
+export function collectEntries(visited, gc) {
+  const count = Number(visited) || 0;
+  if (count < COLLECT_EVERY || count % COLLECT_EVERY !== 0) return false;
+  const run = gc === undefined ? resolveEntryGc() : gc;
+  if (typeof run !== "function") return false;
+  run({ type: "major", execution: "sync" });
+  return true;
+}
+
+function eventTurn() {
+  return new Promise((resolve) => {
+    setImmediate(resolve);
+  });
+}
+
+async function* entries(archive, afterPath) {
   // findByPath in this libzim build returns only that entry, not the tail.
   // One forward walk reaches the checkpoint. The archive then stays open.
+  // gc() drops the JS wrapper only. The native entry is freed by a finalizer,
+  // and that finalizer runs on a later turn of this thread. A tight walk
+  // never takes that turn, so the await is what actually releases the memory.
   let skipping = Boolean(afterPath);
+  let visited = 0;
   for (const entry of archive.iterByPath()) {
+    visited += 1;
+    if (collectEntries(visited)) {
+      await eventTurn();
+      await eventTurn();
+    }
     if (skipping) {
       if (entry.path === afterPath) skipping = false;
       continue;
@@ -360,11 +409,11 @@ function* entries(archive, afterPath) {
   }
 }
 
-function* selectedArticles(archive, afterPath, skip) {
+async function* selectedArticles(archive, afterPath, skip) {
   let seen = 0;
   const resumeSkip = !afterPath && (Number(skip) || 0) > 0;
   const limitSkip = Number(skip) || 0;
-  for (const entry of entries(archive, afterPath)) {
+  for await (const entry of entries(archive, afterPath)) {
     if (!isArticle(entry)) continue;
     seen += 1;
     if (resumeSkip && seen <= limitSkip) continue;
@@ -372,12 +421,12 @@ function* selectedArticles(archive, afterPath, skip) {
   }
 }
 
-function prefetchArticles({ zimPath, afterPath, skip, budget, seq }) {
+async function prefetchArticles({ zimPath, afterPath, skip, budget, seq }) {
   const seqView = new Int32Array(seq);
   const archive = new Archive(zimPath);
   const state = { inflight: [], ahead: 0 };
   let articleSeq = 0;
-  for (const entry of selectedArticles(archive, afterPath || "", skip)) {
+  for await (const entry of selectedArticles(archive, afterPath || "", skip)) {
     if (Atomics.load(seqView, 1) === 1) return;
     articleSeq += 1;
     while (true) {
@@ -587,6 +636,39 @@ async function selfTest() {
   if (lookaheadBudget(536870912) !== 268435456) {
     throw new Error("lookahead budget changed the library-sized cap");
   }
+  const gcCalls = [];
+  const fakeGc = () => {
+    gcCalls.push(gcCalls.length + 1);
+  };
+  if (collectEntries(0, fakeGc) || collectEntries(2047, fakeGc) || collectEntries(2049, fakeGc)) {
+    throw new Error("entry collection ran off its count");
+  }
+  if (gcCalls.length !== 0) throw new Error("gc ran before 2048 entries");
+  if (!collectEntries(2048, fakeGc) || gcCalls.length !== 1) {
+    throw new Error("gc did not run at 2048 entries");
+  }
+  if (!collectEntries(4096, fakeGc) || gcCalls.length !== 2) {
+    throw new Error("gc did not run at the next 2048 entries");
+  }
+  if (collectEntries(2048, null)) throw new Error("entry collection ran without gc");
+  const enabled = resolveEntryGc();
+  if (typeof enabled !== "function") throw new Error("entry gc could not be enabled");
+  enabled();
+  let turned = false;
+  setImmediate(() => {
+    turned = true;
+  });
+  const walked = [];
+  const fakeArchive = {
+    iterByPath() {
+      return Array.from({ length: 2048 }, (_, index) => ({ path: `p${index}` }));
+    },
+  };
+  for await (const entry of entries(fakeArchive, "")) walked.push(entry.path);
+  if (walked.length !== 2048 || walked[2047] !== "p2047") {
+    throw new Error(`entry walk count ${walked.length}`);
+  }
+  if (!turned) throw new Error("entry walk never returned to the event loop");
   if (!lookaheadShouldWait(1, 0) || !lookaheadShouldWait(100, 100) || lookaheadShouldWait(40, 100)) {
     throw new Error("lookahead wait condition is wrong");
   }
@@ -688,7 +770,7 @@ async function main() {
   }
 
   try {
-    for (const entry of selectedArticles(archive, afterPath, skip)) {
+    for await (const entry of selectedArticles(archive, afterPath, skip)) {
       articleSeq += 1;
       index += 1;
       let raw = "";
@@ -758,11 +840,9 @@ if (!isMainThread) {
     if (msg && msg.prefetch) {
       if (prefetching) return;
       prefetching = true;
-      try {
-        prefetchArticles(msg);
-      } catch (error) {
+      prefetchArticles(msg).catch((error) => {
         console.error(`cluster lookahead stopped: ${error && error.message ? error.message : error}`);
-      }
+      });
       return;
     }
     if (msg.abort) {

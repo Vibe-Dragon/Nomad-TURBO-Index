@@ -17,7 +17,7 @@ from nomad_turbo.catalog import CatalogRow
 from nomad_turbo.discover import Install
 from nomad_turbo.file_stats import FileStats, detail_text, format_downloaded, library_location
 from nomad_turbo.progress import ProgressBook, format_bytes, format_eta
-from nomad_turbo.runtime import ZIM_DATE_NAME, read_zim_date, zim_date_command
+from nomad_turbo.runtime import ZIM_DATE_NAME, read_zim_date, start_extract, zim_date_command
 from nomad_turbo.schedule import (
     COL_ART_MIN,
     COL_ARTICLES,
@@ -466,6 +466,30 @@ class OrderTest(unittest.TestCase):
         self.assertGreater(meta_at, 0)
         self.assertGreater(workers_at, meta_at)
         self.assertIn("return", text[meta_at:workers_at])
+
+    def test_extract_releases_passed_entries_and_asks_for_gc(self):
+        text = (ROOT / "worker" / "extract.mjs").read_text(encoding="utf-8")
+        walk = text.split("function* entries(", 1)[1].split("function* selectedArticles(", 1)[0]
+        self.assertIn("collectEntries(visited)", walk)
+        self.assertNotIn("articleCount", walk)
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Path(tmp)
+            zim = storage / "zim" / "maps.zim"
+            zim.parent.mkdir()
+            zim.write_bytes(b"not a real zim")
+            install = _install(str(storage))
+            with mock.patch("nomad_turbo.runtime._remove_ours") as removed, mock.patch(
+                "nomad_turbo.runtime.subprocess.Popen",
+                return_value=mock.Mock(),
+            ) as popen:
+                start_extract(install, str(zim), 0, "tiles/0/0/0.pbf", 3)
+            removed.assert_called_once_with("nomad-turbo-extract")
+            argv = popen.call_args.args[0]
+            script = argv.index("/app/nomad-turbo-extract.mjs")
+            self.assertEqual(argv[script - 1], "--expose-gc")
+            self.assertEqual(argv[script + 1], "--zim")
+            self.assertNotIn("--max-old-space-size", argv)
+            self.assertIn("--after-path", argv)
 
     def test_the_engine_learns_one_zim_date_without_starting_extract(self):
         with tempfile.TemporaryDirectory() as tmp:

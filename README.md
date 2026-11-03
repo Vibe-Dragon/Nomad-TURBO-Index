@@ -95,12 +95,15 @@ Stock NOMAD stores how many articles it has finished. The next batch opens the Z
 
 Turbo stores the path of the last article it checkpointed. One reader opens the ZIM and walks forward until it reaches that path. Articles it passes are not parsed. The file stays open, and later embed calls continue with the next article. They do not go back to the start and count up to the saved number. While that walk is going, a second reader loads upcoming clusters into the cache libzim already chose, up to half of that cache. It does not raise the cache. If that prefetch stops, the article thread keeps going.
 
+That walk passes every file in the user part of the ZIM, not only the HTML articles. Each file it has passed is released on a turn of the event loop, so a map file made mostly of tiles cannot keep those files in memory. Releasing them does not skip an article, and a long page is still indexed in full.
+
 This build of libzim can look up one path, and that lookup returns only that entry, not the rest of the file. The reader cannot jump to the saved article and then iterate the tail. It walks forward once, when the reader opens the file, and then stays there. A checkpoint that has no path still uses the article count.
 
 ```javascript
 function* entries(archive, afterPath) {
   // findByPath in this libzim build returns only that entry, not the tail.
   // One forward walk reaches the checkpoint. The archive then stays open.
+  // Passed entries are released on a fixed count, including files that are not articles.
   let skipping = Boolean(afterPath);
   for (const entry of archive.iterByPath()) {
     if (skipping) {

@@ -554,6 +554,7 @@ def start_extract(install: Install, host_zim: str, skip: int, after_path: str | 
         "--entrypoint",
         "node",
         install.admin_image,
+        "--expose-gc",
         "/app/nomad-turbo-extract.mjs",
         "--zim",
         host_to_container(install, host_zim),
