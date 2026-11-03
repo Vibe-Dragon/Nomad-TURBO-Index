@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import queue
+import stat
 import threading
 import time
 import uuid
@@ -58,9 +59,11 @@ from nomad_turbo.schedule import (
     OrderFile,
     apply_sample_batch,
     engine_switch_reason,
+    file_needs_measure,
     file_type_label,
     interrupt_outcome,
     measure_ending,
+    measure_leave_reason,
     open_index_now,
     release_measure,
     pick_next,
@@ -157,10 +160,19 @@ def _write_drops(items: dict[str, float]) -> None:
     path.write_text(json.dumps(items))
 
 
-def _note_downloads(install: Install) -> tuple[bool, float | None]:
-    """True while a .tmp or .part file exists, then seconds since the last one vanished."""
-    global _last_download_at
-    pending = _downloads_pending(install)
+def _note_downloads(install: Install, known: bool | None = None) -> tuple[bool, float | None]:
+    """True while a .tmp or .part file exists, then seconds since the last one vanished.
+
+    `known` is the answer from a walk that already happened. Passing it does
+    not walk the folders again.
+    """
+    global _last_download_at, _downloads_seen
+    if known is None:
+        pending = _downloads_pending(install)
+    else:
+        pending = bool(known)
+        if _library_live is None or not _library_live.current():
+            _downloads_seen = pending
     now = time.monotonic()
     with _io_lock:
         if pending:
@@ -179,8 +191,8 @@ def _io_pressure() -> tuple[float, float]:
     return _rules().parse_io_pressure(text)
 
 
-def _library_hold(install: Install) -> str:
-    pending, age = _note_downloads(install)
+def _library_hold(install: Install, downloads_pending: bool | None = None) -> str:
+    pending, age = _note_downloads(install, downloads_pending)
     some, full = _io_pressure()
     return _rules().write_hold(
         downloads_pending=pending,
@@ -300,6 +312,7 @@ def _wait_to_write(
     stop: threading.Event,
     session: Session | None,
     interval: float = 5.0,
+    downloads: bool | None = None,
 ) -> bool:
     """Hold Qdrant writes during a download or while a segment cannot be rewritten.
 
@@ -307,11 +320,15 @@ def _wait_to_write(
     stalled disk waits five seconds, then the write goes ahead so indexing
     does not stop for the whole run. A segment that is past the vector cap,
     or free space under twice that segment, keeps waiting. Points stay.
+    `downloads` is the flag from the walk between files. The first check uses
+    it. A check after a wait looks again.
     """
+    known = downloads
     while not stop.is_set():
         # Segment and space are hard holds. A disk stall must not skip them.
         segment = _segment_hold(install)
-        library = _library_hold(install)
+        library = _library_hold(install, known)
+        known = None
         reason = segment or library
         if not reason:
             if _hold_announced:
@@ -363,13 +380,18 @@ def _request_drop(install: Install, session: Session | None, source: str) -> Non
     _remember_drop(source)
 
 
-def _flush_drops(install: Install, session: Session | None, stop: threading.Event) -> None:
+def _flush_drops(
+    install: Install,
+    session: Session | None,
+    stop: threading.Event,
+    downloads: bool | None = None,
+) -> None:
     with _drops_lock:
         pending = list(_read_drops().items())
     for source, since in pending:
         if stop.is_set():
             return
-        reason = _library_hold(install)
+        reason = _library_hold(install, downloads)
         if _rules().drop_should_wait(reason, time.time() - since):
             return
         log.info("clearing knowledge-base entries for %s", source)
@@ -537,11 +559,17 @@ _library_live: _LiveFile | None = None
 _downloads_seen = False
 
 
-def _sync_library(install: Install, session: Session | None, live: _LiveFile) -> None:
+def _sync_library(
+    install: Install,
+    session: Session | None,
+    live: _LiveFile,
+    snap: LibrarySnap | None = None,
+) -> None:
     """Show files that just arrived, and clear entries for files NOMAD removed.
 
     The folders are walked when nothing is indexing. During a file, only
-    that file's own path is checked, which is not a folder walk.
+    that file's own path is checked, which is not a folder walk. A snapshot
+    from the pause between files is reused, so this does not walk again.
     """
     current = live.current()
     if current:
@@ -551,23 +579,21 @@ def _sync_library(install: Install, session: Session | None, live: _LiveFile) ->
                 log.info("%s disappeared while it was indexing. Its entries will be cleared.", current)
                 live.retire.set()
         return
+    if snap is None:
+        snap = _walk_library(install)
     book = session.get_book() if session else None
     present = getattr(book, "ensure_present", None)
-    for host, kind, source in _sources(install, include_fresh=True):
+    for item in snap.files:
         if not callable(present):
             continue
-        try:
-            size = host.stat().st_size
-        except OSError:
-            size = 0
         if present(
-            source,
-            name=host.name,
-            origin=origin_for(source),
-            kind=kind,
-            size_bytes=size,
+            item.source,
+            name=item.host.name,
+            origin=origin_for(item.source),
+            kind=item.kind,
+            size_bytes=item.size,
         ):
-            log.info("new file in the queue: %s", host.name)
+            log.info("new file in the queue: %s", item.host.name)
     listed = getattr(book, "listed", None)
     if not callable(listed):
         return
@@ -745,26 +771,93 @@ def _status(**fields: object) -> None:
     path.write_text(json.dumps(current))
 
 
-def _sources(install: Install, *, include_fresh: bool = False) -> list[tuple[Path, str, str]]:
+@dataclass(frozen=True)
+class LibraryFile:
+    host: Path
+    kind: str
+    source: str
+    mtime: float
+    size: int
+
+
+@dataclass(frozen=True)
+class LibrarySnap:
+    """Embeddable files and the download flag from one pass over the library."""
+
+    files: tuple[LibraryFile, ...]
+    downloads: bool
+
+
+def _walk_library(install: Install) -> LibrarySnap:
+    """One pass over zim and kb_uploads.
+
+    Each embeddable file is measured once. A name ending in .tmp or .part is a
+    download still arriving, including when that name is not embeddable.
+    """
     root = Path(install.storage_host)
-    found: list[tuple[Path, str, str]] = []
+    found: list[LibraryFile] = []
+    downloads = False
     for folder in ("zim", "kb_uploads"):
         base = root / folder
         if not base.is_dir():
             continue
         for path in base.rglob("*"):
-            if not path.is_file():
-                continue
-            kind = file_is_embeddable(path.name)
+            name = path.name
+            if name.endswith(".tmp") or name.endswith(".part"):
+                downloads = True
+            kind = file_is_embeddable(name)
             if not kind:
                 continue
             try:
-                if not include_fresh and time.time() - path.stat().st_mtime < 10:
-                    continue
+                info = path.stat()
             except OSError:
                 continue
-            found.append((path, kind, host_to_container(install, str(path))))
-    return found
+            if not stat.S_ISREG(info.st_mode):
+                continue
+            found.append(
+                LibraryFile(
+                    host=path,
+                    kind=kind,
+                    source=host_to_container(install, str(path)),
+                    mtime=info.st_mtime,
+                    size=info.st_size,
+                )
+            )
+    return LibrarySnap(tuple(found), downloads)
+
+
+def _indexable(snap: LibrarySnap, *, include_fresh: bool = False) -> tuple[LibraryFile, ...]:
+    """Files the queue may open. One touched in the last 10 seconds stays out."""
+    if include_fresh:
+        return snap.files
+    now = time.time()
+    return tuple(item for item in snap.files if now - item.mtime >= 10)
+
+
+def _sources(
+    install: Install,
+    *,
+    include_fresh: bool = False,
+    snap: LibrarySnap | None = None,
+) -> list[tuple[Path, str, str]]:
+    if snap is None:
+        snap = _walk_library(install)
+    return [(item.host, item.kind, item.source) for item in _indexable(snap, include_fresh=include_fresh)]
+
+
+def _look_between_files(install: Install, session: Session | None, live: _LiveFile) -> LibrarySnap | None:
+    """Walk once while no file is open, and publish that picture.
+
+    The queue, the new-file list, and the download check read the snapshot.
+    An open file returns None and does not walk.
+    """
+    if live.current() is not None:
+        return None
+    snap = _walk_library(install)
+    global _downloads_seen
+    _downloads_seen = snap.downloads
+    _sync_library(install, session, live, snap)
+    return snap
 
 
 def _library_host(install: Install, source: str) -> Path | None:
@@ -782,7 +875,7 @@ def _downloads_pending(install: Install) -> bool:
     """True when a download is still being written into the library.
 
     While a file is indexing this returns the last answer and does not walk
-    the folders. The next gap between files looks again.
+    the folders. The pause between files uses the shared walk instead.
     """
     global _downloads_seen
     live = _library_live
@@ -804,7 +897,12 @@ def _downloads_pending(install: Install) -> bool:
     return found
 
 
-def _work_list(install: Install, jobs: list[dict], finished: set[str]) -> list[FileWork]:
+def _work_list(
+    install: Install,
+    jobs: list[dict],
+    finished: set[str],
+    snap: LibrarySnap | None = None,
+) -> list[FileWork]:
     grouped: dict[str, list[tuple[str, int, dict]]] = {}
     for job in jobs:
         data = job.get("data") or {}
@@ -813,8 +911,11 @@ def _work_list(install: Install, jobs: list[dict], finished: set[str]) -> list[F
             continue
         grouped.setdefault(source, []).append((str(job["id"]), int(data.get("batchOffset") or 0), data))
     states = ingest_states(install)
+    if snap is None:
+        snap = _walk_library(install)
     work: list[FileWork] = []
-    for host, kind, source in _sources(install):
+    for item in _indexable(snap):
+        host, kind, source = item.host, item.kind, item.source
         if source in finished:
             continue
         entries = grouped.get(source, [])
@@ -834,10 +935,7 @@ def _work_list(install: Install, jobs: list[dict], finished: set[str]) -> list[F
             if data.get("totalArticles"):
                 total = int(data["totalArticles"])
             chunks = max(chunks, int(data.get("chunksSoFar") or 0))
-        try:
-            mtime = host.stat().st_mtime
-        except OSError:
-            mtime = None
+        mtime = item.mtime
         work.append(
             FileWork(
                 host=host,
@@ -1614,8 +1712,54 @@ def _note_sample(session, work: FileWork) -> None:
         keep(work.source)
 
 
-def _queue_batch(install: Install, session, jobs: list[dict], finished: set[str], failed: set[str]) -> list[FileWork]:
-    """Unfinished files in library-walk order. Index now and priority can retry a failure."""
+def _measure_defer(works: list[FileWork], session) -> set[str]:
+    """Files this Measure pass should not sample.
+
+    Already sampled this pass, plus anything that already has progress.
+    The book and the checkpoint are both read. The larger counts win, so a
+    stale row cannot send Measure back over a file that has already started.
+    """
+    defer = set(session.sampled()) if hasattr(session, "sampled") else set()
+    book = session.get_book() if hasattr(session, "get_book") else None
+    by_source: dict = {}
+    if book is not None and hasattr(book, "snapshot"):
+        try:
+            snap = book.snapshot()
+        except Exception:
+            snap = None
+        if snap is not None:
+            by_source = {item.source: item for item in getattr(snap, "files", ())}
+    for work in works:
+        item = by_source.get(work.source)
+        articles = int(work.articles or 0)
+        chunks = int(work.chunks or 0)
+        state = ""
+        eta = None
+        if item is not None:
+            articles = max(articles, int(getattr(item, "articles", 0) or 0))
+            chunks = max(chunks, int(getattr(item, "chunks", 0) or 0))
+            state = getattr(item, "state", "") or ""
+            saved = getattr(item, "eta_seconds", None)
+            if saved is not None and state != "running":
+                eta = saved
+        if not file_needs_measure(articles, chunks, state=state, eta_seconds=eta):
+            defer.add(work.source)
+    return defer
+
+
+def _queue_batch(
+    install: Install,
+    session,
+    jobs: list[dict],
+    finished: set[str],
+    failed: set[str],
+    snap: LibrarySnap | None = None,
+) -> list[FileWork]:
+    """Unfinished files in library-walk order. Index now and priority can retry a failure.
+
+    A snapshot from the pause between files is the file list. Omitting it
+    walks once.
+    """
     if session is not None:
         now = session.index_now() if hasattr(session, "index_now") else None
         priorities = session.priorities() if hasattr(session, "priorities") else set()
@@ -1623,7 +1767,7 @@ def _queue_batch(install: Install, session, jobs: list[dict], finished: set[str]
             failed.discard(source)
         if now:
             failed.discard(now)
-    return [item for item in _work_list(install, jobs, finished) if item.source not in failed]
+    return [item for item in _work_list(install, jobs, finished, snap) if item.source not in failed]
 
 
 def article_stay_reason(session, source: str, sample_started, now: float, armed_epoch: int = 0):
@@ -1633,6 +1777,47 @@ def article_stay_reason(session, source: str, sample_started, now: float, armed_
     order change stays. This does not snapshot the library.
     """
     return engine_switch_reason(session, source, sample_started, now, armed_epoch)
+
+
+def _switch_check(session, work: FileWork, sample_started, armed: int):
+    """The between-article check for the file now in progress.
+
+    Measure on a file that already has articles or chunks leaves at the next
+    boundary and does not replace its ETA. A file with nothing stored yet is
+    sampled for the usual five minutes, and the articles that sample stores
+    do not end it early.
+    """
+    held = {"progress": None}
+
+    def switch_check(started=sample_started, source=work.source, epoch=armed, file=work):
+        # A PDF re-arms this clock after OCR, so the sample starts then.
+        measuring_now = False
+        asked_now = None
+        if session is not None:
+            ask = getattr(session, "measuring", None)
+            measuring_now = bool(callable(ask) and ask())
+            if measuring_now:
+                asked_now = open_index_now(session)
+        reason, held["progress"] = measure_leave_reason(
+            sample_started=started,
+            measuring=measuring_now,
+            articles=int(file.articles or 0),
+            chunks=int(file.chunks or 0),
+            index_now=asked_now,
+            had_progress=held["progress"],
+        )
+        if reason:
+            return reason
+        moment = started
+        if measuring_now:
+            clock = getattr(session, "measure_clock", None)
+            if callable(clock):
+                live = clock()
+                if live is not None:
+                    moment = live
+        return article_stay_reason(session, source, moment, time.monotonic(), epoch)
+
+    return switch_check
 
 
 def _next_work(install: Install, pool, session, batch: list[FileWork], stop: threading.Event):
@@ -1651,7 +1836,7 @@ def _next_work(install: Install, pool, session, batch: list[FileWork], stop: thr
     if session is not None and hasattr(session, "index_now") and session.index_now() and index_now is None:
         session.clear_index_now()
     measuring = bool(session is not None and hasattr(session, "measuring") and session.measuring())
-    defer = session.sampled() if measuring else set()
+    defer = _measure_defer(batch, session) if measuring else set()
     picked = pick_next(
         rows,
         choice=choice,
@@ -1765,13 +1950,13 @@ def execute(
         idle_note = ""
         try:
             while not stop.is_set():
-                # The watch waits out its timer. Apply adds and removals
-                # before the next file is chosen, not during the current one.
-                if live.current() is None:
-                    try:
-                        _sync_library(install, session, live)
-                    except Exception:
-                        log.exception("library scan failed")
+                # One walk while no file is open. New files, the queue, and
+                # the download check all read it. An open file does not walk.
+                snap = None
+                try:
+                    snap = _look_between_files(install, session, live)
+                except Exception:
+                    log.exception("library scan failed")
                 pending = _queue_has_work(session, finished, failed)
                 if pending is False:
                     batch = []
@@ -1780,14 +1965,17 @@ def execute(
                         jobs = list_jobs(install)
                     except Exception:
                         log.exception("could not refresh the embed queue")
-                    batch = _queue_batch(install, session, jobs, finished, failed)
+                    batch = _queue_batch(install, session, jobs, finished, failed, snap)
                 if not batch:
                     if session is not None and hasattr(session, "measuring") and session.measuring() and pending is False:
                         action = finish_measure_pass(session, stop)
                         if action == "stop" or stop.is_set():
                             break
                     keep = _wants_control(session, install)
-                    downloads = _downloads_pending(install)
+                    if snap is not None:
+                        downloads = snap.downloads
+                    else:
+                        downloads = _downloads_pending(install)
                     settling = pending is True
                     if hand_back_when_idle(keep_control=keep, downloads_pending=downloads or settling):
                         note = _rules().idle_handoff_note(previous)
@@ -1814,9 +2002,19 @@ def execute(
                     if action == "stop" or stop.is_set():
                         break
                     continue
-                if stop.is_set() or not _wait_to_write(install, stop, session):
+                if stop.is_set() or not _wait_to_write(
+                    install,
+                    stop,
+                    session,
+                    downloads=None if snap is None else snap.downloads,
+                ):
                     break
-                _flush_drops(install, session, stop)
+                _flush_drops(
+                    install,
+                    session,
+                    stop,
+                    downloads=None if snap is None else snap.downloads,
+                )
                 touched.append(work)
                 if not work.host.exists():
                     _request_drop(install, session, work.source)
@@ -1824,17 +2022,7 @@ def execute(
                     work.touched = False
                     continue
 
-                def switch_check(started=sample_started, source=work.source, epoch=armed):
-                    # A PDF re-arms this clock after OCR, so the sample starts then.
-                    moment = started
-                    if session is not None:
-                        measuring = getattr(session, "measuring", None)
-                        clock = getattr(session, "measure_clock", None)
-                        if callable(measuring) and measuring() and callable(clock):
-                            live = clock()
-                            if live is not None:
-                                moment = live
-                    return article_stay_reason(session, source, moment, time.monotonic(), epoch)
+                switch_check = _switch_check(session, work, sample_started, armed)
 
                 live.begin(work.source)
                 try:
@@ -1851,6 +2039,12 @@ def execute(
                         outcome = settle_file_stop(install, session, work, text)
                         if text == "measure":
                             _note_sample(session, work)
+                        elif text == "measure-skip":
+                            log.info(
+                                "leaving %s at article %s. It already has progress, so Measure will not sample it.",
+                                work.source,
+                                work.articles,
+                            )
                         if outcome == "indexed":
                             finished.add(work.source)
                             _forget_source_jobs(install, work.source)

@@ -233,8 +233,10 @@ class Session:
     def start_measure(self, *, from_idle: bool, then_index: bool = False) -> None:
         """Begin a measure pass and start the 300s clock for the file already running.
 
-        `then_index` keeps indexing after the samples when this pass started idle.
-        A pass started during a run already keeps indexing.
+        A file that already has articles or chunks is left at the next article
+        boundary instead of being held for the sample. `then_index` keeps
+        indexing after the samples when this pass started idle. A pass started
+        during a run already keeps indexing.
         """
         with self._lock:
             self._measuring = True

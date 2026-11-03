@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.1.7
+
+### Moderate
+
+- A PDF or a picture still keeps its text layer, and the page image is still read. Words the text layer does not have are still added. The file is still not handed to NOMAD. Pages are read together. One Tesseract worker runs for each hardware thread after two threads are left free. A worker finishes the page it is on and waits while other programs are using the CPU, then takes a thread back. The process runs at a lower priority. A PDF page is drawn once, at 200 dpi, from the page box. A long side past 4000 pixels is scaled in that same draw.
+- **Measure** samples a file that has not been started. A file that already has articles or chunks, is already partial, or already has a saved ETA keeps that ETA and is left alone. The pass can finish while those files are still unfinished. A file that is running with nothing stored is still a sample. **Then index** is unchanged.
+
+### Minor
+
+- The library is walked once between files. That walk is the queue, the file list, and the download check. A file touched in the last 10 seconds stays out of the queue. While a file is open the folders are not walked again.
+
 ## 1.1.6
 
 ### Moderate

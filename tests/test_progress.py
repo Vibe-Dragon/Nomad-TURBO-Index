@@ -1169,9 +1169,13 @@ class AboutAndLayoutTest(unittest.TestCase):
         self.assertIn("Project NOMAD 1.35.1", changelog)
         self.assertIn("shared rows", changelog)
         notes = changelog.split(f"## {__version__}", 1)[1].split("\n## ", 1)[0]
-        self.assertIn("exact", notes)
-        self.assertIn("PUT", notes)
-        self.assertIn("move_before", notes)
+        self.assertIn("has not been started", notes)
+        self.assertIn("200 dpi", notes)
+        self.assertIn("not handed to NOMAD", notes)
+        released_116 = changelog.split("## 1.1.6", 1)[1].split("\n## ", 1)[0]
+        self.assertIn("exact", released_116)
+        self.assertIn("PUT", released_116)
+        self.assertIn("move_before", released_116)
         released_115 = changelog.split("## 1.1.5", 1)[1].split("\n## ", 1)[0]
         self.assertIn("Then index", released_115)
         self.assertIn("Follow", released_115)
@@ -1182,6 +1186,7 @@ class AboutAndLayoutTest(unittest.TestCase):
         previous_notes = changelog.split("## 1.1.4", 1)[1].split("\n## ", 1)[0]
         self.assertIn("Auto", previous_notes)
         self.assertIn("finished embed calls", previous_notes)
+        self.assertLess(changelog.index("## 1.1.7"), changelog.index("## 1.1.6"))
         self.assertLess(changelog.index("## 1.1.6"), changelog.index("## 1.1.5"))
         self.assertLess(changelog.index("## 1.1.5"), changelog.index("## 1.1.4"))
         released = changelog.split("## 1.1.0", 1)[1].split("\n## ", 1)[0]

@@ -51,8 +51,10 @@ TIPS: dict[str, str] = {
         "A folder that only holds those files is hidden too."
     ),
     "measure": (
-        "Index each unfinished file for about five minutes, priority files first, "
-        "then go on to the next. Reading a PDF or picture with OCR happens first and "
+        "Index each file that has not been started for about five minutes, "
+        "priority files first, then go on to the next. "
+        "A file that already has progress keeps its ETA and is left alone. "
+        "Reading a PDF or picture with OCR happens first and "
         "does not count as those five minutes. "
         "Each sample starts at the recommended batch when Auto is on, "
         "or stays on the batch you set when Auto is off. "

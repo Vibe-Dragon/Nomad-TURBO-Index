@@ -76,7 +76,8 @@ ORDER_CHOICES: tuple[tuple[str, str], ...] = (
 ORDER_IDS = frozenset(choice for choice, _label in ORDER_CHOICES)
 
 # Reasons that checkpoint the open file and keep its points.
-SWITCH_REASONS = frozenset({"now", "priority", "measure", "switch"})
+# Only "measure" stores a new measured ETA. "measure-skip" leaves the old one.
+SWITCH_REASONS = frozenset({"now", "priority", "measure", "measure-skip", "switch"})
 
 
 def file_type_label(name: str) -> str:
@@ -565,7 +566,8 @@ def pick_next(
     Index now wins until that file finishes. Prioritized unfinished files
     come next, in the selected order, and a prioritized file already running
     is not dropped for a different one. Changing the order does not leave
-    the file already in progress. `defer` is the set Measure has already sampled.
+    the file already in progress. `defer` is files to pass over. Measure puts
+    files it has already sampled there, and files that already have progress.
     """
     skipped = set(skip or ())
     deferred = set(defer or ())
@@ -610,6 +612,64 @@ def row_menu_labels(*, priority: bool) -> tuple[str, str, str]:
 def sample_expired(started: float, now: float, *, limit: float = MEASURE_SECONDS) -> bool:
     """True once a measure sample has had its 300 seconds."""
     return float(now) - float(started) >= float(limit)
+
+
+def file_needs_measure(
+    articles: int,
+    chunks: int,
+    *,
+    state: str = "",
+    eta_seconds: int | float | None = None,
+) -> bool:
+    """True when Measure should spend five minutes on this file.
+
+    A file that already has stored articles or chunks, or is already partial,
+    has progress and is left alone. A saved ETA on a file that is not the one
+    currently running counts too. A live ETA on the file in progress does not:
+    that file may still have nothing stored. Indexed and deferred files are
+    not samples. A failed file with nothing stored still is.
+    """
+    if state in ("indexed", "deferred", "partial"):
+        return False
+    if int(articles or 0) > 0 or int(chunks or 0) > 0:
+        return False
+    if eta_seconds is not None and state != "running":
+        return False
+    return True
+
+
+def measure_leave_reason(
+    *,
+    sample_started: float | None,
+    measuring: bool,
+    articles: int,
+    chunks: int,
+    index_now: str | None,
+    had_progress: bool | None,
+) -> tuple[str | None, bool | None]:
+    """Whether to leave a file that was already running when Measure was clicked.
+
+    `measure-skip` means articles or chunks were already stored, so the ETA
+    already on that file is kept. None means the normal sample clock applies.
+    A visit that started as a sample is never skipped here: articles stored
+    during those five minutes are the sample. `had_progress` latches the first
+    look, so the first article of an untouched file does not end its sample.
+    Index now is decided by the normal switch.
+    """
+    progressed = int(articles or 0) > 0 or int(chunks or 0) > 0
+    if sample_started is not None:
+        return None, had_progress
+    if not measuring:
+        return None, progressed
+    if index_now:
+        if progressed:
+            return None, True
+        return None, had_progress
+    if had_progress is None:
+        had_progress = progressed
+    if had_progress:
+        return "measure-skip", True
+    return None, False
 
 
 def open_index_now(session, files: list[OrderFile] | None = None) -> str | None:
@@ -728,11 +788,13 @@ def apply_sample_batch(session, *, auto: bool, recommended: int) -> int:
 
 
 def measure_ending(*, from_idle: bool, pass_complete: bool, then_index: bool = False) -> str:
-    """What to do when Measure has visited every unfinished file.
+    """What to do when every file that needed a sample has been visited.
 
     `stop` ends the run the way Stop does. `resume` keeps indexing.
     Empty means the pass is not finished.
     Then index keeps indexing even when the pass started while idle.
+    Files that already had progress are not samples. The pass can end
+    while those files are still unfinished.
     """
     if not pass_complete:
         return ""

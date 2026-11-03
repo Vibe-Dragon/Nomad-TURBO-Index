@@ -17,10 +17,11 @@ class ScanResult:
 
 
 def scan_library(install: Install) -> ScanResult:
-    from nomad_turbo.engine import _downloads_pending, _read_checkpoint, _sources
+    from nomad_turbo.engine import _indexable, _read_checkpoint, _walk_library
     from nomad_turbo.runtime import active_embeds, list_jobs
     from nomad_turbo.store import ingest_details
 
+    snap = _walk_library(install)
     jobs = list_jobs(install)
     grouped: dict[str, list[dict]] = {}
     for job in jobs:
@@ -30,15 +31,16 @@ def scan_library(install: Install) -> ScanResult:
             grouped.setdefault(source, []).append(data)
     details = ingest_details(install)
     rows: list[CatalogRow] = []
-    for walk_index, (host, kind, source) in enumerate(_sources(install)):
+    for walk_index, item in enumerate(_indexable(snap)):
+        host, kind, source = item.host, item.kind, item.source
         entries = grouped.get(source, [])
         checkpoint = _read_checkpoint(source) or {}
-        offsets = [int(item.get("batchOffset") or 0) for item in entries]
+        offsets = [int(entry.get("batchOffset") or 0) for entry in entries]
         resume = choose_resume(offsets, checkpoint.get("articles"))
         total = None
-        for item in entries:
-            if item.get("totalArticles"):
-                total = int(item["totalArticles"])
+        for entry in entries:
+            if entry.get("totalArticles"):
+                total = int(entry["totalArticles"])
         if checkpoint.get("total_articles"):
             total = int(checkpoint["total_articles"])
         ingest_state, ingest_chunks = details.get(source, (None, 0))
@@ -49,13 +51,8 @@ def scan_library(install: Install) -> ScanResult:
             has_continuation=bool(entries),
         )
         chunks = max(int(checkpoint.get("chunks") or 0), int(ingest_chunks or 0))
-        mtime = None
-        try:
-            info = host.stat()
-            size = info.st_size
-            mtime = info.st_mtime
-        except OSError:
-            size = 0
+        size = item.size
+        mtime = item.mtime
         rows.append(
             CatalogRow(
                 source=source,
@@ -77,4 +74,4 @@ def scan_library(install: Install) -> ScanResult:
         active = active_embeds(install)
     except Exception:
         active = 0
-    return ScanResult(rows, active, _downloads_pending(install))
+    return ScanResult(rows, active, snap.downloads)

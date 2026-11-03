@@ -41,6 +41,7 @@ from nomad_turbo.schedule import (
     apply_sample_batch,
     engine_switch_reason,
     file_eta_view,
+    file_needs_measure,
     file_type_label,
     files_for_list_order,
     folder_store_row,
@@ -50,6 +51,7 @@ from nomad_turbo.schedule import (
     library_tree,
     list_display_order,
     measure_ending,
+    measure_leave_reason,
     measure_start_chunks,
     release_measure,
     ordered_sources,
@@ -1357,6 +1359,326 @@ class MeasureTest(unittest.TestCase):
                 self.assertEqual(action, "stop")
                 self.assertTrue(idle_stop.is_set())
 
+    def test_measure_skips_files_that_already_have_progress(self):
+        self.assertFalse(file_needs_measure(10, 0, state="partial"))
+        self.assertFalse(file_needs_measure(0, 4, state="pending"))
+        self.assertFalse(file_needs_measure(0, 0, state="partial"))
+        self.assertFalse(file_needs_measure(0, 0, state="indexed"))
+        self.assertFalse(file_needs_measure(0, 0, state="deferred"))
+        self.assertFalse(file_needs_measure(0, 0, state="pending", eta_seconds=120))
+        self.assertFalse(file_needs_measure(0, 0, state="failed", eta_seconds=15))
+        self.assertTrue(file_needs_measure(0, 0, state="pending"))
+        self.assertTrue(file_needs_measure(0, 0, state="failed"))
+        self.assertTrue(file_needs_measure(0, 0, state="running", eta_seconds=40))
+        self.assertFalse(file_needs_measure(3, 0, state="running", eta_seconds=40))
+        self.assertTrue(file_needs_measure(0, 0))
+
+        reason, held = measure_leave_reason(
+            sample_started=None,
+            measuring=False,
+            articles=0,
+            chunks=0,
+            index_now=None,
+            had_progress=None,
+        )
+        self.assertIsNone(reason)
+        self.assertFalse(held)
+        reason, held = measure_leave_reason(
+            sample_started=None,
+            measuring=True,
+            articles=1,
+            chunks=0,
+            index_now=None,
+            had_progress=held,
+        )
+        self.assertIsNone(reason)
+        self.assertFalse(held)
+        reason, held = measure_leave_reason(
+            sample_started=None,
+            measuring=False,
+            articles=12,
+            chunks=0,
+            index_now=None,
+            had_progress=None,
+        )
+        self.assertIsNone(reason)
+        self.assertTrue(held)
+        reason, held = measure_leave_reason(
+            sample_started=None,
+            measuring=True,
+            articles=13,
+            chunks=1,
+            index_now=None,
+            had_progress=held,
+        )
+        self.assertEqual(reason, "measure-skip")
+        self.assertTrue(held)
+        reason, held = measure_leave_reason(
+            sample_started=None,
+            measuring=True,
+            articles=4,
+            chunks=0,
+            index_now=None,
+            had_progress=None,
+        )
+        self.assertEqual(reason, "measure-skip")
+        reason, held = measure_leave_reason(
+            sample_started=10.0,
+            measuring=True,
+            articles=8,
+            chunks=2,
+            index_now=None,
+            had_progress=None,
+        )
+        self.assertIsNone(reason)
+        self.assertIsNone(held)
+        reason, held = measure_leave_reason(
+            sample_started=None,
+            measuring=True,
+            articles=8,
+            chunks=0,
+            index_now="a.pdf",
+            had_progress=True,
+        )
+        self.assertIsNone(reason)
+        self.assertTrue(held)
+        reason, held = measure_leave_reason(
+            sample_started=None,
+            measuring=False,
+            articles=0,
+            chunks=2,
+            index_now=None,
+            had_progress=None,
+        )
+        self.assertTrue(held)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Path(tmp)
+            names = {
+                "partial.pdf": 1000,
+                "saved.pdf": 800,
+                "chunks.pdf": 400,
+                "failed.pdf": 100,
+                "fresh.pdf": 10,
+            }
+            folder = storage / "kb_uploads"
+            folder.mkdir()
+            hosts = {}
+            for name, size in names.items():
+                path = folder / name
+                path.write_bytes(b"x" * size)
+                hosts[name] = path
+            sources = {name: f"/app/storage/kb_uploads/{name}" for name in names}
+            works = [
+                engine.FileWork(
+                    host=hosts["fresh.pdf"],
+                    kind="pdf",
+                    source=sources["fresh.pdf"],
+                    mtime=hosts["fresh.pdf"].stat().st_mtime,
+                ),
+                engine.FileWork(
+                    host=hosts["failed.pdf"],
+                    kind="pdf",
+                    source=sources["failed.pdf"],
+                    mtime=hosts["failed.pdf"].stat().st_mtime,
+                ),
+                engine.FileWork(
+                    host=hosts["chunks.pdf"],
+                    kind="pdf",
+                    source=sources["chunks.pdf"],
+                    chunks=5,
+                    mtime=hosts["chunks.pdf"].stat().st_mtime,
+                ),
+                engine.FileWork(
+                    host=hosts["saved.pdf"],
+                    kind="pdf",
+                    source=sources["saved.pdf"],
+                    mtime=hosts["saved.pdf"].stat().st_mtime,
+                ),
+                engine.FileWork(
+                    host=hosts["partial.pdf"],
+                    kind="pdf",
+                    source=sources["partial.pdf"],
+                    articles=40,
+                    chunks=8,
+                    total_articles=80,
+                    mtime=hosts["partial.pdf"].stat().st_mtime,
+                ),
+            ]
+            session = Session(64)
+            session.set_order("size_desc")
+            session.set_tune_auto(False)
+            session.set_chunks(64)
+            book = ProgressBook(
+                [
+                    CatalogRow(sources["fresh.pdf"], "fresh.pdf", "upload", "pdf", 10, "pending"),
+                    CatalogRow(sources["failed.pdf"], "failed.pdf", "upload", "pdf", 100, "failed"),
+                    CatalogRow(sources["chunks.pdf"], "chunks.pdf", "upload", "pdf", 400, "pending"),
+                    CatalogRow(sources["saved.pdf"], "saved.pdf", "upload", "pdf", 800, "pending", 0, 50),
+                    CatalogRow(
+                        sources["partial.pdf"],
+                        "partial.pdf",
+                        "upload",
+                        "pdf",
+                        1000,
+                        "partial",
+                        40,
+                        80,
+                        8,
+                    ),
+                ]
+            )
+            saved = book._rows[sources["saved.pdf"]]
+            saved.measured_rate = 1.0
+            session.bind_book(book)
+            session.set_priority(sources["partial.pdf"], True)
+            pool = SimpleNamespace(
+                use_gpu=True,
+                total_mib=16384,
+                host_total_mib=32000,
+                cpu_count=8,
+                urls=["http://127.0.0.1:9/embed"],
+            )
+            stop = threading.Event()
+            noted = []
+
+            def keep(source):
+                noted.append(source)
+
+            book.keep_measured_rate = keep
+            with (
+                mock.patch.dict(os.environ, {"NOMAD_TURBO_STATE": str(Path(tmp) / "state")}),
+                mock.patch.object(engine, "read_zim_date", side_effect=AssertionError("date read")),
+                mock.patch.object(engine, "set_policy", side_effect=AssertionError("policy")),
+            ):
+                session.start_measure(from_idle=False)
+                work, started, _epoch, action = engine._next_work(install := _install(str(storage)), pool, session, works, stop)
+                self.assertEqual(work.source, sources["failed.pdf"])
+                self.assertIsNotNone(started)
+                self.assertEqual(action, "")
+                self.assertNotIn(sources["partial.pdf"], session.sampled())
+                session.request_index_now(sources["partial.pdf"])
+                chosen, started, _epoch, action = engine._next_work(install, pool, session, works, stop)
+                self.assertEqual(chosen.source, sources["partial.pdf"])
+                self.assertIsNone(started)
+                session.clear_index_now()
+                session.note_sampled(sources["failed.pdf"])
+                work, started, _epoch, action = engine._next_work(install, pool, session, works, stop)
+                self.assertEqual(work.source, sources["fresh.pdf"])
+                self.assertIsNotNone(started)
+                session.note_sampled(sources["fresh.pdf"])
+                empty, _started, _epoch, action = engine._next_work(install, pool, session, works, stop)
+                self.assertIsNone(empty)
+                self.assertEqual(action, "resume")
+                self.assertFalse(stop.is_set())
+                self.assertNotIn(sources["partial.pdf"], session.sampled())
+                self.assertNotIn(sources["saved.pdf"], session.sampled())
+                self.assertNotIn(sources["chunks.pdf"], session.sampled())
+                self.assertEqual(noted, [])
+
+        source = "/app/storage/kb_uploads/current.pdf"
+        session = Session(8)
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "state"
+            state.mkdir()
+            install = _install(tmp)
+            started_clean = engine.FileWork(host=Path(tmp) / "current.pdf", kind="pdf", source=source)
+            progressed = engine.FileWork(
+                host=Path(tmp) / "current.pdf",
+                kind="pdf",
+                source=source,
+                articles=6,
+                chunks=2,
+            )
+            clock = {"now": 0.0}
+
+            def pull_factory(articles):
+                def pull(_timeout):
+                    if not articles:
+                        return None
+                    return articles.pop(0)
+
+                return pull
+
+            def fake_embed(_url, _model, texts):
+                clock["now"] = session.measure_clock() + 10
+                return [[0.0] * install.dimension for _text in texts]
+
+            class _Pool:
+                urls = ["http://127.0.0.1:9/embed"]
+
+                def batch_width(self, _chunks: int) -> int:
+                    return 1
+
+            pages = [
+                {
+                    "index": 1,
+                    "path": "/A/One",
+                    "title": "One",
+                    "text": "hello world",
+                    "sections": [{"heading": "", "text": "hello world", "level": 2}],
+                },
+                engine._EXTRACT_DONE,
+            ]
+            with mock.patch.dict(os.environ, {"NOMAD_TURBO_STATE": str(state)}):
+                with (
+                    mock.patch.object(engine, "embed", fake_embed),
+                    mock.patch.object(engine, "upsert", lambda *_args, **_kwargs: None),
+                    mock.patch.object(engine, "_wait_to_write", lambda *_args, **_kwargs: True),
+                    mock.patch.object(engine, "delete_source_points", side_effect=AssertionError("deleted points")),
+                    mock.patch.object(engine, "set_policy", side_effect=AssertionError("policy")),
+                    mock.patch.object(engine.time, "monotonic", lambda: clock["now"]),
+                ):
+                    session.start_measure(from_idle=False)
+                    clock["now"] = session.measure_clock()
+                    check = engine._switch_check(session, progressed, None, 0)
+                    with self.assertRaises(RuntimeError) as caught:
+                        engine._consume_articles(
+                            install,
+                            _Pool(),
+                            progressed,
+                            threading.Event(),
+                            session,
+                            set(),
+                            pull_factory(pages),
+                            None,
+                            check,
+                        )
+                    self.assertEqual(str(caught.exception), "measure-skip")
+                    self.assertEqual(progressed.articles, 6)
+                    fresh_pages = [
+                        {
+                            "index": 1,
+                            "path": "/A/One",
+                            "title": "One",
+                            "text": "hello world",
+                            "sections": [{"heading": "", "text": "hello world", "level": 2}],
+                        },
+                        engine._EXTRACT_DONE,
+                    ]
+                    session.start_measure(from_idle=False)
+                    clock["now"] = session.measure_clock()
+
+                    def embed_until_done(_url, _model, texts):
+                        clock["now"] = session.measure_clock() + 300
+                        return [[0.0] * install.dimension for _text in texts]
+
+                    with mock.patch.object(engine, "embed", embed_until_done):
+                        check = engine._switch_check(session, started_clean, None, 0)
+                        with self.assertRaises(RuntimeError) as caught:
+                            engine._consume_articles(
+                                install,
+                                _Pool(),
+                                started_clean,
+                                threading.Event(),
+                                session,
+                                set(),
+                                pull_factory(fresh_pages),
+                                None,
+                                check,
+                            )
+                    self.assertEqual(str(caught.exception), "measure")
+
     def test_eta_view_uses_a_measured_rate_when_the_file_is_not_running(self):
         text, seconds = file_eta_view(
             state="partial",
@@ -1868,6 +2190,74 @@ class LibraryWatchTest(unittest.TestCase):
         finally:
             engine._library_live = previous_live
             engine._downloads_seen = previous_seen
+
+    def test_the_pause_between_files_walks_the_library_once(self):
+        directory = tempfile.TemporaryDirectory(prefix="nomad-turbo-once-")
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        (root / "zim").mkdir()
+        (root / "kb_uploads").mkdir()
+        old_host = root / "zim" / "old.zim"
+        act_host = root / "kb_uploads" / "act.md"
+        fresh_host = root / "kb_uploads" / "fresh.md"
+        old_host.write_bytes(b"zim")
+        act_host.write_text("act", encoding="utf-8")
+        fresh_host.write_text("fresh", encoding="utf-8")
+        old = _stamp(2010)
+        os.utime(old_host, (old, old))
+        os.utime(act_host, (old, old))
+        (root / "zim" / "incoming.zim.part").write_bytes(b"partial")
+        install = _install(str(root))
+        old_source = engine.host_to_container(install, str(old_host))
+        act_source = engine.host_to_container(install, str(act_host))
+        fresh_source = engine.host_to_container(install, str(fresh_host))
+        session = Session(8)
+        session.bind_book(ProgressBook([]))
+        live = engine._LiveFile()
+        state = root / "state"
+        state.mkdir()
+        previous_live = engine._library_live
+        previous_seen = engine._downloads_seen
+        previous_at = engine._last_download_at
+        walks = {"n": 0}
+        real_rglob = Path.rglob
+
+        def counting(self, pattern):
+            walks["n"] += 1
+            return real_rglob(self, pattern)
+
+        try:
+            with (
+                mock.patch.dict(os.environ, {"NOMAD_TURBO_STATE": str(state)}),
+                mock.patch.object(Path, "rglob", counting),
+                mock.patch.object(engine, "ingest_states", return_value={}),
+            ):
+                engine._library_live = None
+                engine._last_download_at = None
+                snap = engine._look_between_files(install, session, live)
+                self.assertEqual(walks["n"], 2)
+                self.assertIsNotNone(snap)
+                self.assertTrue(snap.downloads)
+                walks["n"] = 0
+                batch = engine._queue_batch(install, session, [], set(), set(), snap)
+                hold = engine._library_hold(install, snap.downloads)
+                self.assertEqual(walks["n"], 0)
+                self.assertEqual(hold, "download")
+                sources = [item.source for item in batch]
+                self.assertIn(old_source, sources)
+                self.assertIn(act_source, sources)
+                self.assertNotIn(fresh_source, sources)
+                self.assertEqual(dict(session.get_book().listed())[fresh_source], "pending")
+
+                live.begin(old_source)
+                engine._library_live = live
+                walks["n"] = 0
+                self.assertIsNone(engine._look_between_files(install, session, live))
+                self.assertEqual(walks["n"], 0)
+        finally:
+            engine._library_live = previous_live
+            engine._downloads_seen = previous_seen
+            engine._last_download_at = previous_at
 
 
 class StayDecisionTest(unittest.TestCase):

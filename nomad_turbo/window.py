@@ -2199,8 +2199,9 @@ class _Window:
         self.refresh_rows()
 
     def on_measure(self, *_args, then_index: bool = False) -> None:
-        """Sample each unfinished file. Started idle, the pass stops the way Stop does.
+        """Sample each file that has not been started. Started idle, the pass stops the way Stop does.
 
+        A file that already has progress keeps its ETA and is left alone.
         A pass started during a run keeps indexing. Then index is a separate
         half: it does not start this pass.
         """
@@ -2214,7 +2215,7 @@ class _Window:
         )
         if running:
             self.session.start_measure(from_idle=False, then_index=False)
-            self.session.set_note("Measuring each unfinished file for about five minutes.")
+            self.session.set_note("Measuring files that have not been started, about five minutes each.")
             return
         if not self.rows_ready or not self.qdrant_ready or self._work_alive():
             return
