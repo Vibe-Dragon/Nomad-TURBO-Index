@@ -294,6 +294,14 @@ def index_store_row(item, *, priority: bool) -> tuple:
     eta_seconds = getattr(item, "eta_seconds", None)
     from nomad_turbo.progress import UNKNOWN_ETA_SECONDS
 
+    shown_chunks = int(item.chunks)
+    chunk_label = str(getattr(item, "chunks_text", "") or "")
+    if chunk_label and chunk_label != EM_DASH:
+        try:
+            shown_chunks = int(chunk_label.replace(",", ""))
+        except ValueError:
+            pass
+
     return (
         item.source,
         priority_mark(priority),
@@ -311,7 +319,7 @@ def index_store_row(item, *, priority: bool) -> tuple:
         int(item.size_bytes),
         int(item.articles),
         int(round(art or 0)),
-        int(item.chunks),
+        shown_chunks,
         int(round(chk or 0)),
         UNKNOWN_ETA_SECONDS if eta_seconds is None else int(eta_seconds),
     )

@@ -11,6 +11,26 @@ import { pathToFileURL } from "node:url";
 import { setFlagsFromString } from "node:v8";
 import { runInNewContext } from "node:vm";
 import { isMainThread, parentPort, Worker } from "node:worker_threads";
+import {
+  appendPath,
+  boilerplate,
+  classifyEntry,
+  skipByPath,
+  clearAhead,
+  clearGo,
+  clearOcrQueue,
+  writeOcrExport,
+  loadPrints,
+  matchesPrint,
+  readAhead,
+  readList,
+  removeAhead,
+  resetList,
+  svgText,
+  waitForGo,
+  writeAhead,
+  zipFiles,
+} from "./zim-extra.mjs";
 
 const require = createRequire("/app/package.json");
 const libzim = require("@openzim/libzim");
@@ -330,7 +350,10 @@ function createCollector() {
           rich += 1;
         }
       }
-      if (rich < 2) {
+      // One real section keeps its heading, so that name is on every chunk.
+      // A page with none is still one block. A short or chrome heading does
+      // not count, and References and the other chrome names stay dropped.
+      if (rich < 1) {
         const text = squash(all);
         return text ? [{ heading: "", text, level: 2 }] : [];
       }
@@ -581,6 +604,17 @@ async function selfTest() {
   if (filteredBlob.includes(cites) || !filteredBlob.includes(body) || !filteredBlob.includes("Intro meat") || !filteredBlob.includes(alpha)) {
     throw new Error(`chrome filter failed: ${filteredBlob.slice(0, 240)}`);
   }
+  const lone = articleFromHtml(
+    `<html><body><p>Intro meat.</p><h2>Ingredients</h2><p>${alpha}</p><table><tr><td>Lamb</td><td>2 lb</td></tr></table></body></html>`,
+  );
+  const loneBlob = lone.sections.map((section) => `${section.heading} ${section.text}`).join("\n");
+  if (!lone.sections.some((section) => section.heading === "Ingredients") || !loneBlob.includes("Lamb | 2 lb") || !loneBlob.includes("Intro meat")) {
+    throw new Error(`one section was flattened: ${loneBlob.slice(0, 240)}`);
+  }
+  const brief = articleFromHtml("<html><body><p>Intro meat.</p><h2>Hi</h2><p>short</p></body></html>");
+  if (brief.sections.length !== 1 || brief.sections[0].heading !== "") {
+    throw new Error(`a short heading was kept: ${JSON.stringify(brief.sections)}`);
+  }
   const pad = "x".repeat(600 * 1024);
   const huge = articleFromHtml(`<html><body><h2>Start</h2><p>${pad}</p><h2>End</h2><p>TAIL_MARKER ${beta}</p></body></html>`);
   const hugeBlob = huge.sections.map((section) => `${section.heading} ${section.text}`).join("\n");
@@ -697,6 +731,218 @@ async function selfTest() {
   console.error("self-test ok");
 }
 
+function spillPaths(spillId) {
+  const root = "/turbo-state/spill";
+  return {
+    text: `${root}/${spillId}-text.jsonl`,
+    ocr: `${root}/${spillId}-ocr.jsonl`,
+    prints: `${root}/${spillId}.prints`,
+    go: `${root}/${spillId}.go`,
+  };
+}
+
+function entryBytes(entry) {
+  return bytesOf(entry.item);
+}
+
+function textSections(kind, path, bytes) {
+  if (kind === "svg" || path.toLowerCase().endsWith(".svg")) {
+    const text = svgText(bytes.toString("utf8"));
+    return text ? [{ heading: "", text, level: 2 }] : [];
+  }
+  if (path.toLowerCase().endsWith(".epub") || kind === "epub") {
+    const sections = [];
+    for (const file of zipFiles(bytes)) {
+      if (!/\.(html|xhtml|htm)$/i.test(file.name)) continue;
+      const parsed = articleFromHtml(file.data.toString("utf8"));
+      sections.push(...(parsed.sections || []));
+    }
+    return sections;
+  }
+  if (path.toLowerCase().endsWith(".docx") || kind === "docx") {
+    const xml = zipFiles(bytes).find((file) => file.name === "word/document.xml");
+    if (!xml) return [];
+    const text = xml.data.toString("utf8").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+    return text ? [{ heading: "", text, level: 2 }] : [];
+  }
+  const text = bytes.toString("utf8");
+  if (boilerplate(path, text)) return [];
+  return text.trim() ? [{ heading: "", text, level: 2 }] : [];
+}
+
+async function emitArticle(emit, article) {
+  await emit(`${JSON.stringify(article)}\n`);
+}
+
+async function readLaterEntry(archive, path) {
+  const entry = archive.getEntryByPath(path);
+  return {
+    entry,
+    title: (entry && (entry.title || entry.path)) || path,
+    bytes: entryBytes(entry),
+    mime: (entry && entry.item && entry.item.mimetype) || "",
+  };
+}
+
+function pruneSpillList(listPath, keep) {
+  const known = readList(listPath);
+  const kept = known.filter((entryPath) => classifyEntry("", entryPath, 1024 * 1024) === keep);
+  if (kept.length === known.length) return;
+  resetList(listPath);
+  for (const entryPath of kept) appendPath(listPath, entryPath);
+  const dropped = known.length - kept.length;
+  const name = keep === "ocr" ? "pictures" : "plain text files";
+  console.error(`left ${dropped} ${name} out of this ZIM`);
+}
+
+function passStart(list, resumePath, passName) {
+  if (!resumePath) return 0;
+  const at = list.indexOf(resumePath);
+  if (at >= 0) return at + 1;
+  console.error(`resume path is not in the ${passName} list, reading from the start`);
+  return 0;
+}
+
+async function runTextPass(archive, list, resumePath, index, emit) {
+  const start = passStart(list, resumePath, "text");
+  await emitArticle(emit, { type: "pass", pass: "text", total: list.length, done: start });
+  await emitArticle(emit, { type: "phase", phase: "text" });
+  for (const path of list.slice(start)) {
+    index += 1;
+    let sections = [];
+    let problem = "";
+    let title = path;
+    try {
+      const got = await readLaterEntry(archive, path);
+      title = got.title;
+      const kind = got.mime.includes("epub") ? "epub" : got.mime.includes("wordprocessingml") ? "docx" : "";
+      sections = textSections(kind, path, got.bytes);
+      if (!sections.length) problem = "empty";
+    } catch (error) {
+      problem = "read";
+      console.error(`skip read ${path}: ${error.message || error}`);
+    }
+    const article = { type: "article", index, path, title, sections };
+    if (problem) article.skip = problem;
+    await emitArticle(emit, article);
+  }
+  return index;
+}
+
+async function cachedOcrArticle(spillId, path, ahead) {
+  if (!spillId) return null;
+  let ready = readAhead(spillId, path);
+  if (ready) return ready;
+  if (ahead && ahead.current === path && ahead.done.has(path)) {
+    await ahead.done.get(path);
+    ready = readAhead(spillId, path);
+    if (ready) return ready;
+  }
+  // This file is not ready and not the one being read. Stop starting more,
+  // and let this pass read the rest. The file already open still finishes.
+  if (ahead && ahead.enabled) ahead.closed = true;
+  return null;
+}
+
+function emitCachedOcr(cached, index, path) {
+  const title = cached.title || path;
+  if (cached.skip) {
+    return { type: "article", index, path, title, sections: [], skip: cached.skip };
+  }
+  if (cached.kind === "image") {
+    return {
+      type: "article", index, path, title, kind: "image", ocr: cached.ocr || "", sections: [],
+    };
+  }
+  return {
+    type: "article",
+    index,
+    path,
+    title,
+    kind: "pdf",
+    pages: cached.pages || [],
+    sections: [],
+  };
+}
+
+async function runOcrPass(archive, list, resumePath, index, emit, quality, prints, spillId, ahead) {
+  const ocr = await import("/app/nomad-turbo-ocr.mjs");
+  const profile = ocr.qualityProfile(quality);
+  const start = passStart(list, resumePath, "ocr");
+  await emitArticle(emit, { type: "pass", pass: "ocr", total: list.length, done: start });
+  for (const path of list.slice(start)) {
+    index += 1;
+    const cached = await cachedOcrArticle(spillId, path, ahead);
+    if (cached && (cached.skip || cached.kind === "pdf" || cached.kind === "image")) {
+      const title = cached.title || path;
+      const plain = cached.kind === "image"
+        ? ""
+        : (cached.pages || []).map((page) => page.layer || page.text || "").join("\n");
+      if (cached.skip === "duplicate" || (cached.kind !== "image" && matchesPrint(plain, prints))) {
+        await emitArticle(emit, { type: "phase", phase: "text" });
+        await emitArticle(emit, {
+          type: "article", index, path, title, sections: [], skip: "duplicate",
+        });
+        removeAhead(spillId, path);
+        continue;
+      }
+      if (!cached.skip) {
+        const drew = cached.kind === "image" || (cached.pages || []).some((page) => page.drawn);
+        await emitArticle(emit, { type: "phase", phase: drew ? "ocr" : "text" });
+      }
+      await emitArticle(emit, emitCachedOcr(cached, index, path));
+      removeAhead(spillId, path);
+      if (ahead && ahead.done) ahead.done.delete(path);
+      continue;
+    }
+    let title = path;
+    try {
+      const got = await readLaterEntry(archive, path);
+      title = got.title;
+      const kind = classifyEntry(got.mime, path, got.bytes.length);
+      if (kind !== "ocr") {
+        await emitArticle(emit, { type: "article", index, path, title, sections: [], skip: "empty" });
+        continue;
+      }
+      const isPdf = got.mime.includes("pdf") || path.toLowerCase().endsWith(".pdf");
+      if (isPdf) {
+        const layer = await ocr.pdfLayer(got.bytes);
+        const plain = (layer.pages || []).map((page) => page.text || "").join("\n");
+        if (matchesPrint(plain, prints)) {
+          await emitArticle(emit, { type: "phase", phase: "text" });
+          await emitArticle(emit, {
+            type: "article", index, path, title, sections: [], skip: "duplicate",
+          });
+          continue;
+        }
+        const willDraw = profile.drawFilled
+          || (layer.pages || []).some((page) => !String(page.text || "").trim());
+        await emitArticle(emit, { type: "phase", phase: willDraw ? "ocr" : "text" });
+        const parts = await ocr.readPdf(got.bytes, profile);
+        await emitArticle(emit, {
+          type: "article",
+          index,
+          path,
+          title,
+          kind: "pdf",
+          pages: parts.pages || [],
+          sections: [],
+        });
+        continue;
+      }
+      await emitArticle(emit, { type: "phase", phase: "ocr" });
+      const seen = await ocr.readImage(got.bytes, profile);
+      await emitArticle(emit, {
+        type: "article", index, path, title, kind: "image", ocr: seen, sections: [],
+      });
+    } catch (error) {
+      console.error(`skip read ${path}: ${error.message || error}`);
+      await emitArticle(emit, { type: "article", index, path, title, sections: [], skip: "read" });
+    }
+  }
+  return index;
+}
+
 async function main() {
   if (process.argv.includes("--self-test")) {
     await selfTest();
@@ -741,6 +987,140 @@ async function main() {
   const flight = [];
   let emitted = 0;
   let articleSeq = 0;
+  const wantedPass = arg("--pass", "html") || "html";
+  const spillId = arg("--spill-id");
+  const resumeLater = arg("--resume-path");
+  const quality = arg("--quality", "medium") || "medium";
+  const lists = spillId ? spillPaths(spillId) : null;
+  const queueOutside = process.argv.includes("--ocr-queue") && Boolean(lists) && wantedPass === "html";
+  if (lists && wantedPass === "html" && !afterPath) {
+    resetList(lists.text);
+    resetList(lists.ocr);
+    clearAhead(spillId);
+    if (queueOutside) clearOcrQueue(spillId);
+  }
+  if (lists) {
+    pruneSpillList(lists.text, "text");
+    pruneSpillList(lists.ocr, "ocr");
+  }
+  // libzim is not reentrant. This read uses a second archive, one file at a
+  // time, on this thread, and only between turns of the walk. Results go to
+  // disk. The walk's archive is left alone.
+  const ahead = {
+    enabled: process.argv.includes("--ocr-ahead") && !queueOutside && Boolean(lists) && wantedPass === "html",
+    closed: false,
+    chain: Promise.resolve(),
+    archive: null,
+    current: "",
+    done: new Map(),
+    ocr: null,
+  };
+  let seenHtml = 0;
+  let ocrCount = 0;
+  const resumeSkip = !afterPath && skip > 0;
+
+  async function enqueueZimPdf(entry, entryPath) {
+    // The walk's archive is free on this turn. Copy the PDF out and let the
+    // OCR queue read it. This walk keeps emitting pages.
+    try {
+      let bytes;
+      let title = entryPath;
+      if (entry) {
+        bytes = entryBytes(entry);
+        title = entry.title || entryPath;
+      } else {
+        const got = await readLaterEntry(archive, entryPath);
+        bytes = got.bytes;
+        title = got.title || entryPath;
+        got.entry = null;
+      }
+      if (!bytes || !bytes.length) {
+        console.error(`ocr enqueue skip ${entryPath}: empty`);
+        return;
+      }
+      const file = writeOcrExport(spillId, entryPath, bytes);
+      await emitArticle(emit, {
+        type: "ocr-enqueue",
+        path: entryPath,
+        file,
+        title,
+        kind: "pdf",
+      });
+    } catch (error) {
+      console.error(`ocr enqueue skip ${entryPath}: ${error && error.message ? error.message : error}`);
+    }
+  }
+
+  function queueOcrAhead(entryPath) {
+    if (!ahead.enabled || !entryPath || ahead.closed) return;
+    let resolveDone = () => {};
+    const finished = new Promise((resolve) => {
+      resolveDone = resolve;
+    });
+    ahead.done.set(entryPath, finished);
+    ahead.chain = ahead.chain.then(async () => {
+      if (ahead.closed) return;
+      ahead.current = entryPath;
+      try {
+        await readZimEntryAhead(entryPath);
+      } catch (error) {
+        console.error(`ocr ahead skip ${entryPath}: ${error && error.message ? error.message : error}`);
+      } finally {
+        if (ahead.current === entryPath) ahead.current = "";
+        resolveDone();
+      }
+    });
+  }
+
+  async function readZimEntryAhead(entryPath) {
+    if (readAhead(spillId, entryPath)) return;
+    if (!ahead.archive) {
+      try {
+        ahead.archive = new Archive(zimPath);
+      } catch (error) {
+        ahead.closed = true;
+        console.error(`ocr ahead skip ${entryPath}: ${error && error.message ? error.message : error}`);
+        return;
+      }
+    }
+    let got;
+    try {
+      got = await readLaterEntry(ahead.archive, entryPath);
+    } catch (error) {
+      console.error(`ocr ahead skip ${entryPath}: ${error && error.message ? error.message : error}`);
+      return;
+    }
+    const title = got.title || entryPath;
+    const bytes = got.bytes;
+    const mime = got.mime;
+    got.entry = null;
+    const kind = classifyEntry(mime, entryPath, bytes.length);
+    if (kind !== "ocr") {
+      writeAhead(spillId, entryPath, { skip: "empty", title });
+      return;
+    }
+    const isPdf = mime.includes("pdf") || entryPath.toLowerCase().endsWith(".pdf");
+    try {
+      if (!ahead.ocr) ahead.ocr = import("/app/nomad-turbo-ocr.mjs");
+      const ocr = await ahead.ocr;
+      const profile = ocr.qualityProfile(quality);
+      if (isPdf) {
+        const layer = await ocr.pdfLayer(bytes);
+        const plain = (layer.pages || []).map((page) => page.text || "").join("\n");
+        if (matchesPrint(plain, loadPrints(lists.prints))) {
+          writeAhead(spillId, entryPath, { skip: "duplicate", title });
+          return;
+        }
+        const parts = await ocr.readPdf(bytes, profile);
+        writeAhead(spillId, entryPath, { kind: "pdf", title, pages: parts.pages || [] });
+        return;
+      }
+      const seen = await ocr.readImage(bytes, profile);
+      writeAhead(spillId, entryPath, { kind: "image", title, ocr: seen || "" });
+    } catch (error) {
+      console.error(`ocr ahead skip ${entryPath}: ${error && error.message ? error.message : error}`);
+    }
+  }
 
   async function flushOne() {
     const job = flight.shift();
@@ -770,7 +1150,55 @@ async function main() {
   }
 
   try {
-    for await (const entry of selectedArticles(archive, afterPath, skip)) {
+    if (wantedPass === "html") {
+      await emitArticle(emit, { type: "phase", phase: "html" });
+      if (lists) {
+        const known = readList(lists.ocr);
+        ocrCount = known.length;
+        if (ocrCount) {
+          await emitArticle(emit, { type: "ocr-tally", total: ocrCount });
+        }
+        if (queueOutside) {
+          for (const entryPath of known) {
+            await enqueueZimPdf(null, entryPath);
+          }
+        } else if (ahead.enabled) {
+          for (const entryPath of known) {
+            if (!readAhead(spillId, entryPath)) queueOcrAhead(entryPath);
+          }
+        }
+      }
+    }
+    for await (const entry of (wantedPass === "html" ? entries(archive, afterPath) : [])) {
+      let earlyPath = "";
+      let earlyMime = "";
+      let earlySize = 0;
+      let earlyRedirect = false;
+      try {
+        earlyPath = entry.path || "";
+        if (skipByPath(earlyPath)) continue;
+        earlyRedirect = Boolean(entry.isRedirect);
+        earlyMime = (entry.item && entry.item.mimetype) || "";
+        earlySize = itemSize(entry.item);
+      } catch {
+        continue;
+      }
+      const earlyKind = earlyRedirect ? "skip" : classifyEntry(earlyMime, earlyPath, earlySize);
+      if (earlyKind === "text" && lists) {
+        appendPath(lists.text, earlyPath);
+        continue;
+      }
+      if (earlyKind === "ocr" && lists) {
+        appendPath(lists.ocr, earlyPath);
+        ocrCount += 1;
+        await emitArticle(emit, { type: "ocr-tally", total: ocrCount });
+        if (queueOutside) await enqueueZimPdf(entry, earlyPath);
+        else if (ahead.enabled) queueOcrAhead(earlyPath);
+        continue;
+      }
+      if (earlyKind !== "html") continue;
+      seenHtml += 1;
+      if (resumeSkip && seenHtml <= skip) continue;
       articleSeq += 1;
       index += 1;
       let raw = "";
@@ -821,8 +1249,62 @@ async function main() {
       if (limit && emitted >= limit) break;
     }
     while (flight.length && !(limit && emitted >= limit)) await flushOne();
+    if (lists && !limit) {
+      if (wantedPass === "html") {
+        await emitArticle(emit, {
+          type: "ocr-tally",
+          total: readList(lists.ocr).length,
+          complete: true,
+        });
+      }
+      const resumeText = wantedPass === "text" ? resumeLater : "";
+      const resumeOcr = wantedPass === "ocr" ? resumeLater : "";
+      if (wantedPass === "html" || wantedPass === "text") {
+        const textRows = readList(lists.text);
+        if (textRows.length) {
+          index = await runTextPass(archive, textRows, resumeText, index, emit);
+        }
+      }
+      if (wantedPass !== "done" && queueOutside) {
+        const queued = readList(lists.ocr).length;
+        if (queued) {
+          console.error(
+            `${queued} PDF${queued === 1 ? "" : "s"} from this ZIM went to the front of the OCR queue`,
+          );
+        }
+      } else if (wantedPass !== "done") {
+        const ocrRows = readList(lists.ocr);
+        if (ocrRows.length) {
+          clearGo(lists.go);
+          await emitArticle(emit, { type: "hold", pass: "ocr" });
+          await waitForGo(lists.go);
+          index = await runOcrPass(
+            archive,
+            ocrRows,
+            resumeOcr,
+            index,
+            emit,
+            quality,
+            loadPrints(lists.prints),
+            spillId,
+            ahead,
+          );
+        }
+      }
+    }
+    ahead.closed = true;
+    await ahead.chain;
     await emit(JSON.stringify({ type: "done", articles: index }) + "\n");
+  } catch (error) {
+    ahead.closed = true;
+    throw error;
   } finally {
+    ahead.closed = true;
+    try {
+      await ahead.chain;
+    } catch (error) {
+      console.error(`ocr ahead skip: ${error && error.message ? error.message : error}`);
+    }
     stopLookahead(lookahead);
     const closing = workers.map((worker) => worker.terminate());
     if (lookahead) closing.push(lookahead.worker.terminate());

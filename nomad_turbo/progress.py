@@ -10,7 +10,19 @@ from collections import deque
 from dataclasses import dataclass
 
 from nomad_turbo.catalog import CatalogRow, origin_for, row_color, status_word
-from nomad_turbo.schedule import file_eta_view, file_type_label, pace_text
+from nomad_turbo.schedule import (
+    COL_ARTICLES,
+    COL_ARTICLES_SORT,
+    COL_ART_MIN,
+    COL_ART_MIN_SORT,
+    COL_ETA,
+    COL_ETA_SORT,
+    COL_PROGRESS,
+    COL_STATUS,
+    file_eta_view,
+    file_type_label,
+    pace_text,
+)
 
 
 def format_eta(seconds: float | None) -> str:
@@ -322,6 +334,23 @@ def embed_server_text(running: int) -> str:
     return f"{count} {noun}"
 
 
+def ocr_worker_text(shown: int | None, total: int | None = None) -> str:
+    """The line under the embed-server count. Idle until a reader reports workers."""
+    if shown is None:
+        return "OCR workers: idle"
+    if total:
+        return f"{int(shown)} of {int(total)} OCR workers"
+    noun = "OCR worker" if int(shown) == 1 else "OCR workers"
+    return f"{int(shown)} {noun}"
+
+
+def server_status_text(running: int, workers: tuple[int, int] | None) -> str:
+    """Embed servers, then the OCR workers currently reading."""
+    if not workers:
+        return f"{embed_server_text(running)}\n{ocr_worker_text(None)}"
+    return f"{embed_server_text(running)}\n{ocr_worker_text(workers[0], workers[1])}"
+
+
 def usage_text(*, chunks: int, server_up: bool, slots_ignored: bool = False, set_percent: int | None = None) -> str:
     """The chunk count sizes the next embed call. One server stays up.
 
@@ -358,13 +387,31 @@ class RateTracker:
         return (end_value - start_value) / elapsed
 
 
-def _fraction(state: str, articles: int, total: int | None) -> float:
+def _fraction(
+    state: str,
+    articles: int,
+    total: int | None,
+    flight_done: int = 0,
+    flight_total: int = 0,
+) -> float:
+    """Share of the file that is done.
+
+    Articles are the whole steps. While one article is still embedding, its
+    chunks fill the step that has not been stored yet.
+    """
     if state == "indexed":
         return 1.0
     if state == "deferred":
         return 0.0
+    partial = 0.0
+    open_article = state == "running" and flight_total > 0 and (not total or articles < int(total))
+    if open_article:
+        partial = min(1.0, max(0.0, flight_done / flight_total))
     if total and total > 0:
-        return min(1.0, max(0.0, articles / total))
+        credit = partial if articles < int(total) else 0.0
+        return min(1.0, max(0.0, (articles + credit) / int(total)))
+    if open_article:
+        return partial
     return 0.0
 
 
@@ -440,6 +487,18 @@ class _Row:
         self.rate = RateTracker()
         self.chunk_rate = RateTracker()
         self.measured_rate: float | None = None
+        # Chunks of the article being embedded. They are not stored yet.
+        self.flight_done = 0
+        self.flight_total = 0
+        self.flight_rate = RateTracker()
+        # The file row's own pass. These do not move the library article rate.
+        self.label = ""
+        self.pass_done = 0
+        self.pass_total: int | None = None
+
+
+# A caller that omits a pass field leaves the row's previous value alone.
+_KEEP = object()
 
 
 class ProgressBook:
@@ -457,10 +516,11 @@ class ProgressBook:
         self._stats = None
         self._structure_epoch = 0
         self._running = None
+        self._running_sources: list[str] = []
         self._reset_totals()
         for source in self._order:
             self._install_contrib(self._rows[source])
-        self._running = self._find_running()
+        self._remember_running()
 
     @property
     def structure_epoch(self) -> int:
@@ -484,7 +544,13 @@ class ProgressBook:
         if row.state == "deferred":
             return (chunks, done_files, 0, 0.0, 0, 0, 0, 0)
         weight = max(int(row.size_bytes), 1)
-        done_bytes = weight * _fraction(row.state, row.articles, row.total)
+        done_bytes = weight * _fraction(
+            row.state,
+            row.articles,
+            row.total,
+            row.flight_done,
+            row.flight_total,
+        )
         unknown = 1 if row.state != "indexed" and not row.total else 0
         if row.state == "indexed":
             return (chunks, done_files, weight, done_bytes, unknown, 0, 0, 0)
@@ -517,12 +583,11 @@ class ProgressBook:
         row._contrib = parts
         self._apply_parts(parts, 1)
 
-    def _find_running(self) -> _Row | None:
-        for source in self._order:
-            row = self._rows[source]
-            if row.state == "running":
-                return row
-        return None
+    def _remember_running(self) -> None:
+        """Every file in progress. The tick paints these and does not walk the rest."""
+        sources = [source for source in self._order if self._rows[source].state == "running"]
+        self._running_sources = sources
+        self._running = self._rows[sources[0]] if sources else None
 
     def note_article(self, kind: str) -> None:
         """Count one page that was not stored. A bad page is also skipped."""
@@ -542,6 +607,9 @@ class ProgressBook:
         chunks: int,
         state: str,
         now: float | None = None,
+        label=_KEEP,
+        pass_done=_KEEP,
+        pass_total=_KEEP,
     ) -> None:
         moment = time.monotonic() if now is None else now
         with self._lock:
@@ -573,21 +641,51 @@ class ProgressBook:
             self._chunk_rate.push(moment, self._chunk_advanced)
             row.chunks = incoming_chunks
             row.chunk_rate.push(moment, row.chunks)
+            # A stored update replaces the in-flight count. The two are not added.
+            row.flight_done = 0
+            row.flight_total = 0
             row.state = state
             if state == "indexed":
                 if not row.total:
                     row.total = max(row.articles, 1)
                 row.articles = max(row.articles, row.total or row.articles)
             row.rate.push(moment, row.articles)
+            if label is not _KEEP:
+                row.label = str(label or "")
+            if pass_done is not _KEEP:
+                row.pass_done = max(0, int(pass_done or 0))
+            if pass_total is not _KEEP:
+                row.pass_total = int(pass_total) if pass_total else None
             self._install_contrib(row)
             self._bytes.push(moment, self._done_bytes)
             if created or previous_state != row.state:
                 self._structure_epoch += 1
                 if created or previous_state == "running" or row.state == "running":
-                    self._running = self._find_running()
+                    self._remember_running()
             remembered = self._progress_fact(row)
         if remembered is not None:
             self._write_progress(remembered)
+
+    def note_flight(self, source: str, done: int, total: int, now: float | None = None) -> None:
+        """Chunks of the open article that have vectors. Nothing is stored yet.
+
+        A one-article file would otherwise sit at zero until that article is
+        upserted. Checkpoints and saved chunk counts stay on stored articles.
+        """
+        moment = time.monotonic() if now is None else now
+        with self._lock:
+            row = self._rows.get(source)
+            if row is None or row.state != "running":
+                return
+            total_chunks = max(0, int(total or 0))
+            if total_chunks <= 0:
+                return
+            done_chunks = min(total_chunks, max(0, int(done or 0)))
+            row.flight_done = done_chunks
+            row.flight_total = total_chunks
+            row.flight_rate.push(moment, done_chunks)
+            self._install_contrib(row)
+            self._bytes.push(moment, self._done_bytes)
 
     def ensure_present(
         self,
@@ -630,12 +728,12 @@ class ProgressBook:
             row = self._rows.get(source)
             if row is None:
                 return
-            was_running = self._running is row
+            was_running = row.state == "running"
             self._clear_contrib(row)
             del self._rows[source]
             self._order = [item for item in self._order if item != source]
             if was_running:
-                self._running = self._find_running()
+                self._remember_running()
             self._structure_epoch += 1
             stats = self._stats
         if stats is not None and stats.forget(source):
@@ -662,6 +760,9 @@ class ProgressBook:
                 row.chunks = 0
                 row.rate = RateTracker()
                 row.chunk_rate = RateTracker()
+                row.flight_done = 0
+                row.flight_total = 0
+                row.flight_rate = RateTracker()
                 row.measured_rate = None
             self._bytes = RateTracker()
             self._advanced = 0.0
@@ -671,6 +772,7 @@ class ProgressBook:
             self.skipped = 0
             self.bad = 0
             self._running = None
+            self._running_sources = []
             self._reset_totals()
             for row in self._rows.values():
                 row._contrib = None
@@ -818,8 +920,11 @@ class ProgressBook:
         if full:
             for source in self._order:
                 files.append(_file_snap(self._rows[source], moment))
-        elif self._running is not None:
-            files.append(_file_snap(self._running, moment))
+        else:
+            for source in self._running_sources:
+                row = self._rows.get(source)
+                if row is not None and row.state == "running":
+                    files.append(_file_snap(row, moment))
         included = self._included_size
         done_bytes = self._done_bytes
         unknown = self._unknown
@@ -857,54 +962,101 @@ class ProgressBook:
         )
 
 
-def _eta_seconds(row: _Row) -> int | None:
-    """Seconds left for one file. Indexed files report 0 and the sum skips them."""
+def _open_article(row: _Row) -> bool:
+    """True while the current article has chunks that are not stored yet."""
+    return row.state == "running" and row.flight_total > 0 and (not row.total or row.articles < row.total)
+
+
+def _flight_eta_seconds(row: _Row) -> int | None:
+    """Seconds left in the open article, from its chunk pace."""
+    if not _open_article(row):
+        return None
+    rate = row.flight_rate.per_second()
+    if not rate:
+        return None
+    remaining = max(0, row.flight_total - row.flight_done)
+    return int(remaining / rate)
+
+
+def _row_eta(row: _Row) -> tuple[str, int | None]:
+    """ETA text and seconds. An open article with no article pace uses chunks.
+
+    A text or OCR pass has its own count. The article total belongs to the
+    HTML walk, so it is not what this pass has left.
+    """
     running = row.state == "running"
-    _text, seconds = file_eta_view(
+    if running and row.pass_total:
+        remaining = max(0, int(row.pass_total) - int(row.pass_done))
+        if remaining == 0:
+            return format_eta(0), 0
+        rate = row.rate.per_second()
+        if rate:
+            seconds = int(remaining / rate)
+            return format_eta(seconds), seconds
+        return "measuring", None
+    eta, seconds = file_eta_view(
         state=row.state,
         articles=row.articles,
         total=row.total,
         live_rate=row.rate.per_second() if running else None,
         measured_rate=row.measured_rate,
     )
+    if seconds is None and running:
+        flight = _flight_eta_seconds(row)
+        if flight is not None:
+            return format_eta(flight), flight
+    return eta, seconds
+
+
+def _eta_seconds(row: _Row) -> int | None:
+    """Seconds left for one file. Indexed files report 0 and the sum skips them."""
+    _text, seconds = _row_eta(row)
     return seconds
 
 
 def _file_snap(row: _Row, _moment: float) -> FileSnap:
     """One list row. The caller holds the book lock."""
-    fraction = _fraction(row.state, row.articles, row.total)
+    fraction = _fraction(row.state, row.articles, row.total, row.flight_done, row.flight_total)
+    if row.state == "running" and row.pass_total:
+        fraction = min(1.0, max(0.0, row.pass_done / int(row.pass_total)))
     art_rate = row.rate.per_second()
     chk_rate = row.chunk_rate.per_second()
     running = row.state == "running"
+    if _open_article(row):
+        live_chunks = row.flight_rate.per_second()
+        if live_chunks:
+            chk_rate = live_chunks
     if row.state == "indexed":
         count = "indexed"
+    elif row.state == "running" and row.pass_total:
+        count = f"{row.pass_done:,} / {row.pass_total:,}"
     elif row.total:
         count = f"{row.articles:,} / {row.total:,}"
     elif row.articles:
         count = f"{row.articles:,}"
     else:
         count = "—"
-    eta, eta_seconds = file_eta_view(
-        state=row.state,
-        articles=row.articles,
-        total=row.total,
-        live_rate=art_rate if running else None,
-        measured_rate=row.measured_rate,
-    )
+    eta, eta_seconds = _row_eta(row)
     art_minute = (art_rate * 60) if running and art_rate else None
     chk_live = chk_rate if running and chk_rate else None
+    if _open_article(row):
+        chunks_text = f"{row.flight_done:,}"
+    elif row.chunks:
+        chunks_text = f"{row.chunks:,}"
+    else:
+        chunks_text = "—"
     return FileSnap(
         source=row.source,
         name=row.name,
         origin=row.origin,
-        status=status_word(row.state),
+        status=row.label if row.state == "running" and row.label else status_word(row.state),
         percent=int(round(fraction * 100)),
         count=count,
         eta=eta,
         color=row_color(row.origin, row.state),
         state=row.state,
         chunks=row.chunks,
-        chunks_text=f"{row.chunks:,}" if row.chunks else "—",
+        chunks_text=chunks_text,
         size_bytes=row.size_bytes,
         size_text=format_bytes(row.size_bytes),
         articles=row.articles,
@@ -947,6 +1099,7 @@ UNKNOWN_ETA_SECONDS = 10**9
 
 _OCR_LINE = re.compile(r"ocr page (\d+) of (\d+)\b")
 _OCR_NOTE = re.compile(r"Page (\d+) of (\d+)")
+_OCR_WORKERS = re.compile(r"ocr workers (\d+) of (\d+)")
 
 
 def ocr_page(line: str) -> tuple[int, int] | None:
@@ -984,6 +1137,135 @@ def ocr_list_cells(activity: str) -> tuple[str, int] | None:
     return "OCR", int(round(fraction * 100))
 
 
+def ocr_note_matches(activity: str, name: str) -> bool:
+    """True when this status sentence is the OCR read of this file.
+
+    A second file can be indexing at the same time. Its row keeps its own
+    article and chunk cells.
+    """
+    text = activity or ""
+    if not name or "with OCR" not in text:
+        return False
+    return text.startswith(f"Reading {name} with OCR")
+
+
+def ocr_eta_seconds(page: int, total: int, pages_per_minute: float | None) -> int | None:
+    """Seconds left in this read, from the page rate. None until a rate exists."""
+    if not pages_per_minute or pages_per_minute <= 0 or total <= 0:
+        return None
+    remaining = max(0, int(total) - int(page))
+    return int(remaining / (float(pages_per_minute) / 60.0))
+
+
+def ocr_pages(activity: str) -> tuple[int, int] | None:
+    """Pages read and pages in the file. None until a page has been reported."""
+    if "with OCR" not in (activity or ""):
+        return None
+    match = _OCR_NOTE.search(activity or "")
+    if match is None:
+        return None
+    page, total = int(match.group(1)), int(match.group(2))
+    if total <= 0:
+        return None
+    return page, total
+
+
+def ocr_workers(line: str) -> tuple[int, int] | None:
+    """Active workers and the pool size. None when the line is not a worker count."""
+    match = _OCR_WORKERS.search(line or "")
+    if match is None:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
+def remember_ocr_workers(session, line: str) -> None:
+    """Keep the latest worker count for the line under the embed servers."""
+    found = ocr_workers(line)
+    if found is None or session is None:
+        return
+    setter = getattr(session, "set_ocr_workers", None)
+    if callable(setter):
+        setter(found[0], found[1])
+
+
+def ocr_status_level(line: str) -> int:
+    """A finished page and the worker count are debug. Failures stay info."""
+    if ocr_page(line) or ocr_workers(line):
+        return logging.DEBUG
+    return logging.INFO
+
+
+class OcrPace:
+    """Pages per minute while one file is being read.
+
+    The same page at the same moment is not sampled twice. A different file,
+    or leaving OCR, starts the pace over.
+    """
+
+    def __init__(self) -> None:
+        self._rate = RateTracker()
+        self._page: int | None = None
+        self._head = ""
+
+    def reset(self) -> None:
+        self._rate = RateTracker()
+        self._page = None
+        self._head = ""
+
+    def observe(self, activity: str, now: float | None = None) -> float | None:
+        """Pages per minute, or None when there is not yet a pace."""
+        if "with OCR" not in (activity or ""):
+            self.reset()
+            return None
+        head = (activity or "").split(" Page ", 1)[0]
+        if head != self._head:
+            self._rate = RateTracker()
+            self._page = None
+            self._head = head
+        pages = ocr_pages(activity)
+        if pages is None:
+            return None
+        page = pages[0]
+        moment = time.monotonic() if now is None else now
+        last = self._rate.samples[-1][0] if self._rate.samples else None
+        if self._page != page or last != moment:
+            self._rate.push(moment, page)
+            self._page = page
+        per = self._rate.per_second()
+        if not per:
+            return None
+        return per * 60.0
+
+
+def overlay_ocr_columns(values: tuple, activity: str, pages_per_minute: float | None) -> tuple:
+    """Status, progress, articles, art/min, and ETA while OCR is reading this row.
+
+    Articles becomes pages done and pages in the file. art/min becomes pages
+    per minute. ETA is the pages still to read at that rate. It stays
+    measuring until a page rate exists. The column titles stay as they are.
+    """
+    cells = ocr_list_cells(activity)
+    if cells is None:
+        return values
+    status, percent = cells
+    out = list(values)
+    out[COL_STATUS] = status
+    out[COL_PROGRESS] = percent
+    pages = ocr_pages(activity)
+    if pages is not None:
+        page, total = pages
+        out[COL_ARTICLES] = f"{page:,} / {total:,}"
+        out[COL_ARTICLES_SORT] = page
+        if pages_per_minute:
+            out[COL_ART_MIN] = pace_text(True, pages_per_minute)
+            out[COL_ART_MIN_SORT] = int(round(pages_per_minute))
+        seconds = ocr_eta_seconds(page, total, pages_per_minute)
+        if seconds is not None:
+            out[COL_ETA] = format_eta(seconds)
+            out[COL_ETA_SORT] = seconds
+    return tuple(out)
+
+
 def format_current_file(snap: BoardSnap | None, activity: str = "") -> tuple[str, float, str]:
     """Title, bar fraction, and bar text for the file that is indexing."""
     item = None if snap is None else next((row for row in snap.files if row.state == "running"), None)
@@ -994,7 +1276,9 @@ def format_current_file(snap: BoardSnap | None, activity: str = "") -> tuple[str
         bar, fraction = shown
         return item.name, fraction, bar
     bits = [f"{item.percent}%", f"{item.count} articles"]
-    if item.chunks:
+    if item.chunks_text and item.chunks_text != "—":
+        bits.append(f"{item.chunks_text} chunks")
+    elif item.chunks:
         bits.append(f"{item.chunks:,} chunks")
     if item.size_text and item.size_text != "—":
         bits.append(item.size_text)

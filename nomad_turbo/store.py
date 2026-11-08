@@ -285,9 +285,30 @@ def collection_action(info_error: str | None, names: list[str] | None, name: str
     return "raise"
 
 
-def _collection_names(base: str) -> list[str] | None:
+def collection_copy_state(install: Install) -> str:
+    """present, missing, or unknown. A timeout is unknown and must not clear logs."""
+    base = install.qdrant_url.rstrip("/")
+    name = install.collection
+    info_error = None
     try:
-        listing = _request(f"{base}/collections", timeout=20)
+        _request(f"{base}/collections/{name}", timeout=3)
+    except StoreError as exc:
+        info_error = str(exc)
+    if info_error is None:
+        return "present"
+    if "404" in info_error:
+        return "missing"
+    names = _collection_names(base, timeout=3)
+    if names is not None:
+        return "present" if name in names else "missing"
+    if _health_ok(base) and ("timed out" in info_error or "unreachable" in info_error):
+        return "unknown"
+    return "unknown"
+
+
+def _collection_names(base: str, timeout: int = 20) -> list[str] | None:
+    try:
+        listing = _request(f"{base}/collections", timeout=timeout)
     except StoreError:
         return None
     result = listing.get("result")
@@ -403,19 +424,26 @@ POINT_BATCH = 128
 def upsert(install: Install, points: list[dict]) -> None:
     if not points:
         return
-    url = f"{install.qdrant_url.rstrip('/')}/collections/{install.collection}/points?wait=true"
-    with _write_lock:
-        for start in range(0, len(points), POINT_BATCH):
-            batch = points[start : start + POINT_BATCH]
-            for attempt in range(3):
-                try:
-                    _request(url, {"points": batch}, timeout=120, method="PUT")
-                    break
-                except StoreError as exc:
-                    if not store_write_again(str(exc), attempt):
-                        raise
-                    log.warning("qdrant write timed out. Trying that batch again. %s", exc)
-                    time.sleep(2)
+    from nomad_turbo.ocr_budget import note_qdrant_fault, note_upsert
+
+    note_upsert(True)
+    try:
+        url = f"{install.qdrant_url.rstrip('/')}/collections/{install.collection}/points?wait=true"
+        with _write_lock:
+            for start in range(0, len(points), POINT_BATCH):
+                batch = points[start : start + POINT_BATCH]
+                for attempt in range(3):
+                    try:
+                        _request(url, {"points": batch}, timeout=120, method="PUT")
+                        break
+                    except StoreError as exc:
+                        note_qdrant_fault(str(exc))
+                        if not store_write_again(str(exc), attempt):
+                            raise
+                        log.warning("qdrant write timed out. Trying that batch again. %s", exc)
+                        time.sleep(2)
+    finally:
+        note_upsert(False)
 
 
 def count_source(install: Install, source: str) -> int | None:

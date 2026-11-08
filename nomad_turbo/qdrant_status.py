@@ -23,6 +23,7 @@ class QdrantView:
     vectors: int | None = None
     collection_status: str = ""
     optimizer_error: str = ""
+    collection_missing: bool = False
 
 
 def activity_from_text(text: str) -> str:
@@ -116,8 +117,17 @@ def indexing_problem_line(previous: str, indexing: bool, problem: str) -> tuple[
 
 
 def changes_allowed(ready: bool) -> bool:
-    """Indexing, delete, and repair wait until the collection answered."""
+    """Indexing and repair wait until the collection answered."""
     return bool(ready)
+
+
+def delete_allowed(ready: bool, collection_missing: bool = False) -> bool:
+    """Delete stays available when the collection is already gone.
+
+    A collection that is busy writing still blocks the button. A timeout
+    is not treated as gone.
+    """
+    return bool(ready) or bool(collection_missing)
 
 
 def read_vector_count(raw: bytes) -> int | None:
@@ -192,18 +202,26 @@ def describe_qdrant(
     previous_vectors: int | None = None,
     collection_status: str = "",
     optimizer_error: str = "",
+    collection_missing: bool = False,
 ) -> QdrantView:
     """One block of text for the window. ready is true only when changes can be sent."""
     state = status or "missing"
     hold_detail = ""
+    gone = bool(collection_missing) and not collection_ok
     if not running:
         headline = f"Qdrant is {state}. Not ready for changes."
         ready = False
+        gone = False
     elif not health_ok:
         headline = "Qdrant is running and has not passed the health check. Not ready for changes."
         ready = False
+        gone = False
     elif not ready_ok:
         headline = "Qdrant is running. The ready check has not passed. Not ready for changes."
+        ready = False
+        gone = False
+    elif gone:
+        headline = "The knowledge index is not there. Delete index can finish clearing it."
         ready = False
     elif not collection_ok:
         headline = "Qdrant is still writing. Do not restart it or delete the index."
@@ -212,6 +230,7 @@ def describe_qdrant(
     else:
         headline = "Qdrant is ready for changes."
         ready = True
+        gone = False
     parts = [f"Container {state}."]
     if uptime:
         parts.append(f"Up {uptime}.")
@@ -219,6 +238,8 @@ def describe_qdrant(
     parts.append("Ready check passed." if ready_ok else "Ready check has not passed.")
     if collection_ok:
         parts.append(f"Collection {collection} answered.")
+    elif gone:
+        parts.append(f"Collection {collection} is not there.")
     elif health_ok and ready_ok:
         parts.append(f"Collection {collection} did not answer. A restart would replay this write.")
     else:
@@ -242,6 +263,7 @@ def describe_qdrant(
         vectors=vectors,
         collection_status=color,
         optimizer_error=optimizer_error,
+        collection_missing=gone,
     )
 
 
@@ -315,19 +337,21 @@ def find_qdrant_container() -> str:
     return ""
 
 
-def _collection_info(url: str, timeout: float = 3) -> tuple[bool, str, str]:
-    """(answered, status color, optimizer error). A timeout is not an error state.
+def _collection_info(url: str, timeout: float = 3) -> tuple[bool, str, str, bool]:
+    """(answered, status color, optimizer error, missing).
 
-    Repair reloads store.py, so the StoreError raised here may be a new class.
-    Catching Exception still treats that timeout as "did not answer".
+    A 404 means the collection is gone. A timeout is not a missing collection
+    and is not an error state. Repair reloads store.py, so the StoreError
+    raised here may be a new class. Catching Exception still treats that
+    timeout as "did not answer".
     """
     try:
         body = _request(url, timeout=timeout)
-    except Exception:
-        return False, "", ""
+    except Exception as exc:
+        return False, "", "", "404" in str(exc)
     result = body.get("result") if isinstance(body, dict) else None
     if not isinstance(result, dict):
-        return True, "", ""
+        return True, "", "", False
     status = str(result.get("status") or "")
     opt = result.get("optimizer_status")
     error = ""
@@ -335,12 +359,12 @@ def _collection_info(url: str, timeout: float = 3) -> tuple[bool, str, str]:
         error = str(opt.get("error") or "")
     elif isinstance(opt, str) and opt.lower() not in ("", "ok"):
         error = opt
-    return True, status, error
+    return True, status, error, False
 
 
 def _collection_answered(url: str, timeout: float = 3) -> bool:
     """False when the collection is missing or too busy to answer. Never raises."""
-    answered, _status, _error = _collection_info(url, timeout=timeout)
+    answered, _status, _error, _missing = _collection_info(url, timeout=timeout)
     return answered
 
 
@@ -370,12 +394,15 @@ def probe_qdrant(
     ready_ok = _plain_ok(f"{base}/readyz") if health_ok else False
     collection_status = ""
     optimizer_error = ""
+    collection_missing = False
     if ready_ok:
-        collection_ok, collection_status, optimizer_error = _collection_info(f"{base}/collections/{collection}")
+        collection_ok, collection_status, optimizer_error, collection_missing = _collection_info(
+            f"{base}/collections/{collection}"
+        )
     else:
         collection_ok = False
     vectors = None
-    if storage and running and health_ok and ready_ok and not collection_ok:
+    if storage and running and health_ok and ready_ok and not collection_ok and not collection_missing:
         vectors = open_segment_vectors(storage, collection)
     return describe_qdrant(
         running=running,
@@ -390,4 +417,5 @@ def probe_qdrant(
         previous_vectors=previous_vectors,
         collection_status=collection_status,
         optimizer_error=optimizer_error,
+        collection_missing=collection_missing,
     )

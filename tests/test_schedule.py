@@ -1025,6 +1025,53 @@ class SafeSwitchTest(unittest.TestCase):
             self.assertEqual(calls["embed"], 2)
             self.assertIsNone(session.index_now())
 
+    def test_index_now_on_a_file_the_queue_will_not_open_stays_put(self):
+        """A stale partial row must not abort the file that is already running.
+
+        The window can still say partial after the knowledge base finished the
+        file. That file is not in the work list. Index now is cleared and the
+        current file keeps going. A file touched in the last 10 seconds stays
+        requested so the next walk can open it.
+        """
+        done_source = "/app/storage/zim/done.zim"
+        current_source = "/app/storage/zim/current.zim"
+        fresh_source = "/app/storage/zim/fresh.zim"
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Path(tmp)
+            zim = storage / "zim"
+            zim.mkdir()
+            done = zim / "done.zim"
+            done.write_bytes(b"zim")
+            os.utime(done, (1_000_000_000, 1_000_000_000))
+            current_path = zim / "current.zim"
+            current_path.write_bytes(b"zim")
+            fresh = zim / "fresh.zim"
+            fresh.write_bytes(b"zim")
+            install = _install(str(storage))
+            book = ProgressBook(
+                [
+                    CatalogRow(done_source, "done.zim", "zim", "zim", 10, "partial", articles=300, total_articles=810),
+                    CatalogRow(current_source, "current.zim", "zim", "zim", 10, "running", articles=12, total_articles=100),
+                    CatalogRow(fresh_source, "fresh.zim", "zim", "zim", 10, "pending"),
+                ]
+            )
+            session = Session(8)
+            session.bind_book(book)
+            current = engine.FileWork(host=current_path, kind="zim", source=current_source, articles=12, chunks=4)
+            batch = [current]
+            session.request_index_now(done_source)
+            check = engine._switch_check(install, session, current, None, 0, batch)
+            self.assertIsNone(check())
+            self.assertIsNone(session.index_now())
+            chosen, *_rest = engine._next_work(install, None, session, batch, threading.Event())
+            self.assertEqual(chosen.source, current_source)
+
+            session.request_index_now(fresh_source)
+            self.assertEqual(session.index_now(), fresh_source)
+            engine._release_finished_index_now(install, session, batch)
+            self.assertEqual(session.index_now(), fresh_source)
+            self.assertEqual(engine.article_stay_reason(session, current_source, None, 0, 0), "now")
+
     def test_a_failed_file_named_by_index_now_or_priority_is_still_work(self):
         done_src = "/app/storage/zim/done.zim"
         bad_src = "/app/storage/zim/bad.zim"
@@ -1655,7 +1702,7 @@ class MeasureTest(unittest.TestCase):
                 ):
                     session.start_measure(from_idle=False)
                     clock["now"] = session.measure_clock()
-                    check = engine._switch_check(session, progressed, None, 0)
+                    check = engine._switch_check(install, session, progressed, None, 0, [progressed])
                     with self.assertRaises(RuntimeError) as caught:
                         engine._consume_articles(
                             install,
@@ -1688,7 +1735,7 @@ class MeasureTest(unittest.TestCase):
                         return [[0.0] * install.dimension for _text in texts]
 
                     with mock.patch.object(engine, "embed", embed_until_done):
-                        check = engine._switch_check(session, started_clean, None, 0)
+                        check = engine._switch_check(install, session, started_clean, None, 0, [started_clean])
                         with self.assertRaises(RuntimeError) as caught:
                             engine._consume_articles(
                                 install,
@@ -2000,6 +2047,18 @@ class IndexPageControlsTest(unittest.TestCase):
             app.session.set_priority("big.zim", True)
             app.session.set_priority("small.zim", True)
             app.session.set_priority("done.zim", True)
+            app.refresh_rows()
+            self.assertEqual([app.now_store[i][0] for i in range(len(app.now_store))], ["now.pdf"])
+            both = app.session.get_book()
+            both.update("mid.pdf", articles=0, total=None, chunks=0, state="running", now=1)
+            app.session.set_ocr_activity("Reading mid.pdf with OCR. Page 4 of 10.")
+            app.refresh_rows()
+            self.assertEqual([app.now_store[i][0] for i in range(len(app.now_store))], ["now.pdf", "mid.pdf"])
+            self.assertEqual(app.now_store[1][COL_STATUS], "OCR")
+            self.assertEqual(app.now_store[1][COL_ARTICLES], "4 / 10")
+            self.assertNotEqual(app.now_store[0][COL_STATUS], "OCR")
+            both.update("mid.pdf", articles=0, total=None, chunks=0, state="pending", now=2)
+            app.session.clear_ocr_activity("mid.pdf")
             app.refresh_rows()
             self.assertEqual([app.now_store[i][0] for i in range(len(app.now_store))], ["now.pdf"])
             self.assertEqual(_tree_keys(app.store), [
@@ -2590,3 +2649,32 @@ class FileStatsTest(unittest.TestCase):
         stats.load()
         self.assertIsNone(stats.get("missing"))
         self.assertEqual(library_location("/mnt/nomad/storage", "/app/storage", "notes.pdf"), "notes.pdf")
+
+    def test_priority_goes_away_when_a_file_finishes_or_the_index_is_deleted(self):
+        directory = tempfile.TemporaryDirectory(prefix="nomad-turbo-priority-")
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name) / "file-stats.json"
+        done = "/app/storage/kb_uploads/done.md"
+        kept = "/app/storage/zim/later.zim"
+        stats = FileStats(path)
+        stats.note_library(done, name="done.md", file_type="text", state="running")
+        stats.note_library(kept, name="later.zim", file_type="zim", state="pending")
+        stats.set_priority(done, True)
+        stats.set_priority(kept, True)
+        session = Session(4)
+        session.bind_file_stats(stats)
+        session.set_priority(done, True)
+        session.set_priority(kept, True)
+
+        engine._drop_priority(session, done)
+        self.assertNotIn(done, session.priorities())
+        self.assertFalse(stats.get(done).priority)
+        self.assertIn(kept, session.priorities())
+        self.assertTrue(stats.get(kept).priority)
+
+        engine._clear_saved_priorities(session)
+        self.assertEqual(session.priorities(), set())
+        self.assertEqual(stats.priorities(), set())
+        loaded = FileStats(path)
+        loaded.load()
+        self.assertEqual(loaded.priorities(), set())

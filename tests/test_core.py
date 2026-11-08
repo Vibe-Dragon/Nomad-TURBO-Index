@@ -11,8 +11,10 @@ from pathlib import Path
 
 from nomad_turbo.chunking import (
     DOCUMENT_PREFIX,
+    MAX_SAFE_TOKENS,
     SAFE_CONTEXT_TOKENS,
     embed_input,
+    estimate_tokens,
     fit_embed_inputs,
     split_chunks,
     token_upper_bound,
@@ -37,7 +39,7 @@ from nomad_turbo.icons import icon_bytes, write_icons
 from nomad_turbo.prompt import ask_gpu_share
 from nomad_turbo.store import active_from_cell, collection_action
 from nomad_turbo.discover import Install
-from nomad_turbo.packing import ArticleFeed, PreparedArticle, prepare_article
+from nomad_turbo.packing import ArticleFeed, PreparedArticle, embedding_context, prepare_article
 from nomad_turbo.runtime import (
     ChunkRejected,
     RuntimeError_,
@@ -442,6 +444,72 @@ class ChunkTest(unittest.TestCase):
             payloads.append(payload)
         self.assertEqual("".join(payloads), text)
 
+    def test_a_long_prefix_splits_instead_of_dropping_the_tail(self):
+        text = " ".join(f"w{i}" for i in range(800))
+        prefix = DOCUMENT_PREFIX + ("Long title " * 20) + "\n"
+        pairs = fit_embed_inputs(text, prefix)
+        self.assertGreater(len(pairs), 1)
+        covered = 0
+        for prefixed, payload in pairs:
+            self.assertTrue(prefixed.startswith(prefix))
+            self.assertTrue(prefixed.endswith(payload))
+            self.assertLessEqual(estimate_tokens(prefixed), MAX_SAFE_TOKENS)
+            found = text.find(payload, max(0, covered - 400))
+            self.assertGreaterEqual(found, 0)
+            covered = found + len(payload)
+        self.assertEqual(covered, len(text))
+
+    def test_the_heading_line_names_the_section_once(self):
+        self.assertEqual(embedding_context("Couscous", "Ingredients"), "Couscous > Ingredients\n")
+        self.assertEqual(embedding_context("notes.txt", ""), "notes.txt\n")
+        self.assertEqual(embedding_context("notes.txt", "notes.txt"), "notes.txt\n")
+        self.assertEqual(embedding_context("  Couscous\n", " Ingredients "), "Couscous > Ingredients\n")
+        self.assertEqual(embedding_context("", ""), "")
+        long = embedding_context("word " * 200, "Ingredients")
+        self.assertLessEqual(len(long.strip()), 400)
+        self.assertTrue(long.endswith("\n"))
+
+    def test_a_picture_and_a_note_use_the_file_name_once(self):
+        note = prepare_article(
+            {"title": "notes.txt", "path": "notes.txt", "sections": [{"heading": "", "text": "rice 4 bags", "level": 2}]},
+            "/app/storage/kb_uploads/notes.txt",
+            {},
+            "doc",
+        )
+        self.assertEqual(note.inputs, ["search_document: notes.txt\nrice 4 bags"])
+        self.assertEqual(note.sections[0].payloads, ["rice 4 bags"])
+        picture = prepare_article(
+            {"title": "diagram.png", "path": "diagram.png", "kind": "image", "sections": [{"heading": "", "text": "mitosis spindle", "level": 2}]},
+            "/app/storage/kb_uploads/diagram.png",
+            {},
+            "doc",
+        )
+        self.assertEqual(picture.inputs, ["search_document: diagram.png\nmitosis spindle"])
+        self.assertEqual(picture.sections[0].payloads, ["mitosis spindle"])
+
+    def test_a_rejected_chunk_keeps_its_heading(self):
+        prepared = prepare_article(
+            {
+                "title": "Couscous",
+                "path": "A",
+                "sections": [{"heading": "Ingredients", "text": "lamb " * 80, "level": 2}],
+            },
+            "/app/storage/zim/a.zim",
+            {},
+            "doc",
+        )
+        feed = ArticleFeed()
+        feed.add(prepared)
+        feed.next_inputs(8)
+        kind, path = feed.split_rejected(0)
+        self.assertEqual((kind, path), ("split", "A"))
+        self.assertGreaterEqual(len(prepared.inputs), 2)
+        for model_input in prepared.inputs:
+            self.assertTrue(model_input.startswith("search_document: Couscous > Ingredients\n"))
+        for payload in prepared.sections[0].payloads:
+            self.assertNotIn("Couscous", payload)
+            self.assertNotIn("search_document:", payload)
+
 
 class CollectionTest(unittest.TestCase):
     def test_a_timeout_on_a_live_qdrant_keeps_the_collection(self):
@@ -630,9 +698,16 @@ class SpeedTest(unittest.TestCase):
             "doc-1",
         )
         self.assertEqual(prepared.section_for_input, [0, 1])
-        self.assertTrue(all(text.startswith("search_document: ") for text in prepared.inputs))
+        self.assertEqual(
+            prepared.inputs,
+            [
+                "search_document: Title > H\nbody",
+                "search_document: Title > I\nmore",
+            ],
+        )
+        self.assertEqual(prepared.sections[0].payloads, ["body"])
+        self.assertEqual(prepared.sections[1].payloads, ["more"])
         self.assertNotIn("search_document:", prepared.sections[0].payloads[0])
-        self.assertEqual(prepared.sections[0].payloads[0], "body")
         self.assertEqual(prepared.sections[0].meta["source"], "/app/storage/zim/a.zim")
         self.assertEqual(prepared.sections[0].meta["section_title"], "H")
         self.assertEqual(prepared.sections[1].meta["section_level"], 3)
@@ -709,8 +784,49 @@ class SpeedTest(unittest.TestCase):
         self.assertEqual(done[0][1], [[1.0], [2.0]])
         self.assertEqual(feed.pending(), 1)
         self.assertEqual(feed.next_inputs(8), ["b2"])
+        self.assertEqual(feed.vector_progress(), (1, 2))
         done = feed.push_vectors([[4.0]])
         self.assertEqual([item.article["path"] for item, _vectors in done], ["b"])
+        self.assertEqual(feed.pending(), 0)
+        self.assertEqual(feed.vector_progress(), (2, 2))
+
+    def test_chunk_progress_is_published_for_a_pdf_and_not_a_zim(self):
+        from nomad_turbo.engine import _publish_flight
+
+        class _Book:
+            def __init__(self) -> None:
+                self.notes = []
+
+            def note_flight(self, source, done, total, now=None) -> None:
+                self.notes.append((source, done, total))
+
+        class _Session:
+            def __init__(self, book) -> None:
+                self._book = book
+
+            def get_book(self):
+                return self._book
+
+        class _Work:
+            def __init__(self, kind, source) -> None:
+                self.kind = kind
+                self.source = source
+
+        feed = ArticleFeed()
+        feed.add(
+            PreparedArticle(
+                article={"index": 1, "path": "a"},
+                sections=[],
+                inputs=["a1", "a2"],
+                section_for_input=[0, 0],
+            )
+        )
+        book = _Book()
+        session = _Session(book)
+        _publish_flight(session, _Work("zim", "a.zim"), feed)
+        self.assertEqual(book.notes, [])
+        _publish_flight(session, _Work("pdf", "a.pdf"), feed)
+        self.assertEqual(book.notes, [("a.pdf", 0, 2)])
 
     def test_upsert_sends_128_points_at_a_time(self):
         install = Install(

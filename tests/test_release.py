@@ -52,6 +52,11 @@ PAGE_TIPS = (
     "order",
     "measure",
     "then_index",
+    "ocr_quality",
+    "settings_index",
+    "settings_ocr",
+    "settings_engine",
+    "settings_install",
     "hide_finished",
     "index_now",
     "priority",
@@ -359,6 +364,9 @@ class HandoffNoteTest(unittest.TestCase):
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         self.assertIn("stop_status_note", window)
         self.assertIn("finished_status_note", window)
+        run = window.split("def _run", 1)[1].split("\n    def ", 1)[0]
+        self.assertLess(run.index("import nomad_turbo.decisions as decisions"), run.index("stop_status_note"))
+        self.assertLess(run.index("import nomad_turbo.schedule as schedule"), run.index("schedule.release_measure"))
         self.assertNotIn("Unfinished files were handed back to NOMAD.", window)
         self.assertNotIn("Indexing was handed back to NOMAD.", window)
         self.assertIn('policy_path = engine.state_dir() / "policy"', window)

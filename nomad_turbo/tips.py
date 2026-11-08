@@ -20,6 +20,8 @@ TIPS: dict[str, str] = {
         "kb_uploads and zim are folders: click the arrow to open or close one. "
         "A closed folder does not list its files until it is opened. "
         "The file being indexed stays in the row above the list. "
+        "When a second file is being read at the same time, it stays in that row too. "
+        "Finished reads wait in memory, and on disk after that text passes about a quarter of system memory. "
         "Hover a row for its full path. "
         "A red asterisk to the left of the name means that file is prioritized. "
         "A green triangle on a folder-tree row means that file is the one indexing."
@@ -28,15 +30,62 @@ TIPS: dict[str, str] = {
         "The file type: zim, pdf, docx, epub, txt, md, rtf, or an image extension such as jpg or png. "
         "A folder row says folder."
     ),
-    "col_status": "Waiting, indexing, OCR, indexed, partial, failed, or needs NOMAD.",
-    "col_progress": "How far this file is through its articles.",
-    "col_articles": "Articles stored so far, and the total when it is known.",
-    "col_art_min": "Articles per minute for the file being indexed. Other rows stay blank.",
-    "col_chunks": "Embedded pieces stored for this file. A long page is many chunks.",
+    "col_status": "Waiting, HTML, text, OCR, OCR text, indexing, indexed, partial, failed, or needs NOMAD.",
+    "col_progress": (
+        "How far this file is through its articles. "
+        "A ZIM fills this once for HTML, again for other text, and again for OCR. "
+        "Green is HTML, blue is other text, orange is recognizing a page, and purple is storing that text. "
+        "A file that is one article moves by the chunks of that article while they are embedding."
+    ),
+    "settings_index": (
+        "Where indexing runs. CPU, or an NVIDIA card. "
+        "The card is used the next time you start. "
+        "AMD and Intel cards are not used for indexing."
+    ),
+    "settings_ocr": (
+        "Where OCR runs. CPU, or a card. "
+        "The program picks the reader for that card. "
+        "GPU stays off until the GPU reader is installed from this page. "
+        "The choice is saved and applies to the next file. "
+        "A different device can read pages while indexing is running."
+    ),
+    "settings_install": (
+        "Downloads PyTorch and EasyOCR into this user's home folder. "
+        "It is a few gigabytes and needs a network connection. "
+        "GPU OCR turns on when the download finishes and a small check on the card succeeds. "
+        "The English models download the first time a page is read."
+    ),
+    "settings_engine": (
+        "Which reader is in use, and whether OCR waits for indexing or runs beside it. "
+        "CPU OCR gives cores back while Qdrant is writing or optimizing."
+    ),
+    "ocr_quality": (
+        "How hard a PDF page or a picture is read. "
+        "Low is 200 dpi and skips a page that already has text. "
+        "Medium is 300 dpi and reads every page. "
+        "High is 400 dpi for small print. "
+        "The choice is saved and applies to the next file."
+    ),
+    "col_articles": (
+        "Articles stored so far, and the total when it is known. "
+        "During a ZIM's text or OCR pass, this is how far that pass is. "
+        "While OCR is reading a file, this is pages read and pages in the file."
+    ),
+    "col_art_min": (
+        "Articles per minute for the file being indexed. "
+        "While OCR is reading, this is pages per minute. "
+        "Other rows stay blank."
+    ),
+    "col_chunks": (
+        "Embedded pieces stored for this file. A long page is many chunks. "
+        "While that article is still embedding, this counts chunks embedded so far."
+    ),
     "col_chk_s": "Chunks per second for the file being indexed. This pace stays steadier than articles per minute.",
     "col_size": "Size of the file on disk.",
     "col_eta": (
         "Time left for this file. The file being indexed uses its recent article rate. "
+        "A file that is one article uses its chunk pace while that article is embedding. "
+        "While OCR is reading, this is the time left at the recent page rate. "
         "After Measure, a file with a known article count keeps the ETA from its sample."
     ),
     "order": (
@@ -80,7 +129,8 @@ TIPS: dict[str, str] = {
         "Index this file before files that are not marked. "
         "Marked files follow the selected order. "
         "A red asterisk sits to the left of the name. "
-        "The mark is remembered after Turbo is closed."
+        "The mark is remembered after Turbo is closed. "
+        "It is removed when that file finishes embedding, and when the index is deleted."
     ),
     "details": (
         "Saved facts for this file: size, location, dates, article and chunk counts, "
@@ -125,6 +175,7 @@ TIPS: dict[str, str] = {
     ),
     "usage": (
         "How many embed servers are running. Turbo keeps one. "
+        "The line under that is how many OCR workers are reading. "
         "The chunk count for the next call is in the field beside Recommended."
     ),
     "keep": (
@@ -141,8 +192,8 @@ TIPS: dict[str, str] = {
     ),
     "rescan": "Read the library again and refresh this list. This does not pause NOMAD or start indexing.",
     "export": (
-        "Save the current session log, or the previous session if one is saved. "
-        "The file includes lines the log buttons are hiding. Older sessions are not kept."
+        "Save the log files for this knowledge index as one zip. "
+        "Each day is its own file. The zip includes lines the log buttons are hiding."
     ),
     "log_help": (
         "Open a window that explains the log lines Turbo writes on purpose. "

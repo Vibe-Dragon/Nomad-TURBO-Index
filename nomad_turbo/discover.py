@@ -78,6 +78,11 @@ class Install:
     window_width: int = 0
     window_height: int = 0
     window_max: bool = False
+    # How hard a PDF page or a picture is drawn. low, medium, or high.
+    ocr_quality: str = "medium"
+    # auto, cpu, or a card id such as nvidia:<uuid>. The OCR engine is not stored.
+    index_device: str = "auto"
+    ocr_device: str = "auto"
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2)
@@ -278,6 +283,9 @@ def load_install() -> Install:
         "window_width",
         "window_height",
         "window_max",
+        "ocr_quality",
+        "index_device",
+        "ocr_device",
     ):
         setattr(found, key, getattr(saved, key))
     return found

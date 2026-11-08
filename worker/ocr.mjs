@@ -1,23 +1,28 @@
 // Read one uploaded PDF or image with the OCR libraries in the NOMAD image.
 // This does not call NOMAD's embedder. Turbo chunks the text and embeds it.
 //
-// Every PDF page keeps its text layer and is also rendered and read. A page
-// of real text is not pasted twice: OCR is added when it has words the text
-// layer does not. Pages are read together, one Tesseract worker for each
+// Every PDF page keeps its text layer. Low draws only a page with no text.
+// Medium and High draw every page. OCR words the text layer already covers
+// are not stored again. Pages are read together, one Tesseract worker for each
 // hardware thread after two threads are left free. A worker finishes the page
 // it is on and waits while other programs are using the CPU, then takes a
 // thread back when that work is gone. The process also runs at a lower
 // priority, so a short request is served during a page.
+// A budget file can lower that cap while Qdrant is writing. The file is
+// missing when nothing else asked for the cores. NOMAD_TURBO_OCR_SOCKET, when
+// set, sends the drawn page to the GPU reader. Two failures use Tesseract.
 // pdf2pic draws a page at 768x512 unless it is told the size, so the reader
 // used to ask GraphicsMagick for that size and then draw the page. That read
 // every page twice. The size now comes from the PDF page box, and GraphicsMagick
-// draws each page once at 200 dpi. A long side past 4000 pixels is scaled down
-// in that same draw. sharp then does NOMAD's preprocess.
-// A picture follows processImageFile: grayscale, normalize, sharpen, fit
-// inside 2000 pixels, then English LSTM. The traineddata file is the same
+// draws each page once from the page box. Low is 200 dpi with a 4000 px cap and
+// skips a page that already has text. Medium is 300 dpi and 8000 px. High is
+// 400 dpi and 12000 px. Only Low still shrinks the width to 2000. sharp then
+// does grayscale, normalize, and sharpen.
+// A picture uses the same quality. The traineddata file is the same
 // one tesseract.js loads for that call. Do not download another at run time.
 import { createRequire } from "node:module";
 import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { connect } from "node:net";
 import { availableParallelism, setPriority, tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -28,10 +33,16 @@ const gm = require("gm");
 const { PDFParse } = require("pdf-parse");
 const { createWorker, OEM } = require("tesseract.js");
 
-// NOMAD renders a PDF page at this density. The long side stops here so one
-// page cannot fill memory. Both are applied in the one GraphicsMagick draw.
-const RASTER_DPI = 200;
-const RASTER_CAP = 4000;
+// Medium is the everyday draw. Low skips a page that already has text.
+// High keeps tiny labels. The long side stops so one page cannot fill memory.
+export function qualityProfile(name) {
+  const key = String(name || "medium").toLowerCase();
+  if (key === "low") return { name: "low", dpi: 200, cap: 4000, shrink: true, drawFilled: false };
+  if (key === "high") return { name: "high", dpi: 400, cap: 12000, shrink: false, drawFilled: true };
+  return { name: "medium", dpi: 300, cap: 8000, shrink: false, drawFilled: true };
+}
+
+let activeProfile = qualityProfile("medium");
 
 // Linux USER_HZ. /proc tick counters use this, not the wall clock.
 const CPU_HZ = 100;
@@ -51,6 +62,136 @@ export function ocrSlots(logicalCpus, otherCores) {
   const others = Number(otherCores);
   const busy = Number.isFinite(others) && others > 0 ? Math.round(others) : 0;
   return Math.max(0, cpus - Math.max(reserve, busy));
+}
+
+// The budget file is a ceiling. A missing file leaves the host sample alone.
+// An empty file is not zero: the writer may be between updates.
+export function clampSlots(slots, budgetText) {
+  const current = Math.max(0, Math.floor(Number(slots) || 0));
+  if (budgetText == null) {
+    return current;
+  }
+  const text = String(budgetText).trim();
+  if (!text) {
+    return current;
+  }
+  const budget = Number(text);
+  if (!Number.isFinite(budget)) {
+    return current;
+  }
+  return Math.max(0, Math.min(current, Math.floor(budget)));
+}
+
+function readBudget() {
+  const path = process.env.NOMAD_TURBO_OCR_BUDGET || "";
+  if (!path) {
+    return null;
+  }
+  try {
+    return readFileSync(path, "utf8");
+  } catch {
+    return null;
+  }
+}
+
+function recognizeSocket(socketPath, buffer) {
+  return new Promise((resolve, reject) => {
+    const client = connect(socketPath);
+    let header = Buffer.alloc(0);
+    let need = null;
+    let settled = false;
+    const finish = (err, text) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      client.destroy();
+      if (err) {
+        reject(err instanceof Error ? err : new Error(String(err)));
+      } else {
+        resolve(text || "");
+      }
+    };
+    client.setTimeout(120000, () => finish(new Error("gpu ocr timed out")));
+    client.on("error", (err) => finish(err));
+    client.on("data", (data) => {
+      header = Buffer.concat([header, data]);
+      if (need === null) {
+        if (header.length < 4) {
+          return;
+        }
+        need = header.readUInt32BE(0);
+        header = header.subarray(4);
+      }
+      if (need > 8 * 1024 * 1024) {
+        finish(new Error("gpu ocr reply is too large"));
+        return;
+      }
+      if (header.length < need) {
+        return;
+      }
+      try {
+        const parsed = JSON.parse(header.subarray(0, need).toString("utf8"));
+        if (parsed.error) {
+          finish(new Error(parsed.error));
+        } else {
+          finish(null, parsed.text || "");
+        }
+      } catch (err) {
+        finish(err);
+      }
+    });
+    client.on("connect", () => {
+      const head = Buffer.alloc(4);
+      head.writeUInt32BE(buffer.length);
+      client.write(Buffer.concat([head, buffer]));
+    });
+  });
+}
+
+let pictureNoted = false;
+
+function readerNote() {
+  const reader = process.env.NOMAD_TURBO_OCR_READER || "";
+  const device = process.env.NOMAD_TURBO_OCR_DEVICE || "";
+  if (reader && device) {
+    return `${reader} on ${device}`;
+  }
+  if (process.env.NOMAD_TURBO_OCR_SOCKET) {
+    return "the GPU reader";
+  }
+  return "Tesseract on the CPU";
+}
+
+function poolLine(shown, cpus, other) {
+  const host = other >= 0.5 ? `, other cpu ${other.toFixed(1)}` : "";
+  if (process.env.NOMAD_TURBO_OCR_SOCKET) {
+    return `ocr draws ${shown} pages at a time${host}. ${readerNote()} reads one page at a time`;
+  }
+  return `ocr workers ${shown} of ${cpus} threads${host}. ${readerNote()}`;
+}
+
+// GPU first, when a socket is configured. Two failures stay on Tesseract.
+async function recognizePrepared(buffer, shrink, runner, pool) {
+  const prepared = await preprocess(buffer, shrink);
+  const socket = process.env.NOMAD_TURBO_OCR_SOCKET || "";
+  if (socket && pool.gpuFailures < 2) {
+    try {
+      return await recognizeSocket(socket, prepared);
+    } catch (err) {
+      pool.gpuFailures += 1;
+      console.error(`gpu ocr failed: ${err && err.message ? err.message : err}`);
+    }
+  }
+  if (!pool.workers) {
+    pool.workers = await startWorkers(Math.max(1, pool.ceiling));
+    if (socket) {
+      console.error("ocr using Tesseract on the CPU");
+    }
+  }
+  const worker = pool.workers[runner % pool.workers.length];
+  const result = await worker.recognize(prepared);
+  return (result.data && result.data.text) || "";
 }
 
 // user + nice + system + irq + softirq. Idle and iowait are not a program
@@ -288,13 +429,10 @@ export function mergePage(layer, ocr) {
   return `${written}\n${seen}`;
 }
 
-async function preprocess(buffer) {
-  return sharp(buffer)
-    .grayscale()
-    .normalize()
-    .sharpen()
-    .resize({ width: 2000, fit: "inside" })
-    .toBuffer();
+async function preprocess(buffer, shrink) {
+  let image = sharp(buffer).grayscale().normalize().sharpen();
+  if (shrink) image = image.resize({ width: 2000, fit: "inside" });
+  return image.toBuffer();
 }
 
 async function startWorker(index) {
@@ -326,11 +464,11 @@ async function startWorkers(count) {
 }
 
 async function stopWorkers(workers) {
-  await Promise.all(workers.filter(Boolean).map((worker) => worker.terminate().catch(() => {})));
+  await Promise.all((workers || []).filter(Boolean).map((worker) => worker.terminate().catch(() => {})));
 }
 
-async function ocrBuffer(worker, buffer) {
-  const prepared = await preprocess(buffer);
+async function ocrBuffer(worker, buffer, shrink) {
+  const prepared = await preprocess(buffer, shrink);
   const result = await worker.recognize(prepared);
   return (result.data && result.data.text) || "";
 }
@@ -385,21 +523,24 @@ function gmIdentify(target, format) {
   });
 }
 
-function capPixels(width, height) {
+function capPixels(width, height, cap) {
   const w = Math.max(1, Math.round(Number(width) || 1));
   const h = Math.max(1, Math.round(Number(height) || 1));
-  const scale = Math.min(1, RASTER_CAP / w, RASTER_CAP / h);
+  const limit = Math.max(1, Number(cap) || activeProfile.cap);
+  const scale = Math.min(1, limit / w, limit / h);
   return {
     width: Math.max(1, Math.round(w * scale)),
     height: Math.max(1, Math.round(h * scale)),
   };
 }
 
-// Points at 200 dpi, then the long-side cap. The draw uses this size directly.
-export function rasterPixels(pointsW, pointsH) {
+// Points at the quality's dpi, then the long-side cap. The draw uses this size directly.
+export function rasterPixels(pointsW, pointsH, profile = activeProfile) {
+  const dpi = profile.dpi;
   return capPixels(
-    (Number(pointsW) || 612) * RASTER_DPI / 72,
-    (Number(pointsH) || 792) * RASTER_DPI / 72,
+    (Number(pointsW) || 612) * dpi / 72,
+    (Number(pointsH) || 792) * dpi / 72,
+    profile.cap,
   );
 }
 
@@ -409,7 +550,7 @@ export function rasterPixels(pointsW, pointsH) {
 function renderPage(pdfPath, page, pixels) {
   return new Promise((resolve, reject) => {
     const chunks = [];
-    let command = gm(`${pdfPath}[${page - 1}]`).density(RASTER_DPI, RASTER_DPI).units("PixelsPerInch");
+    let command = gm(`${pdfPath}[${page - 1}]`).density(activeProfile.dpi, activeProfile.dpi).units("PixelsPerInch");
     if (pixels) {
       command = command.resize(pixels.width, pixels.height, "!");
     }
@@ -437,11 +578,23 @@ function renderPage(pdfPath, page, pixels) {
   });
 }
 
-async function readPdf(buffer) {
+export async function pdfLayer(buffer) {
+  const doc = await pdfDocument(buffer);
+  const pages = [];
+  const total = Math.max(doc.total, ...doc.byNum.keys(), 0);
+  for (let page = 1; page <= total; page += 1) {
+    pages.push({ page, text: doc.byNum.get(page) || "" });
+  }
+  return { total, pages };
+}
+
+export async function readPdf(buffer, profile = activeProfile) {
+  activeProfile = profile;
   const doc = await pdfDocument(buffer);
   const byNum = doc.byNum;
   const layerChars = [...byNum.values()].reduce((sum, text) => sum + text.length, 0);
-  console.error(`pdf text layer ${layerChars} chars, reading every page`);
+  const filled = profile.drawFilled ? "every page" : "pages with no text layer";
+  console.error(`pdf text layer ${layerChars} chars, quality ${profile.name}, reading ${filled}`);
   const dir = mkdtempSync(join(tmpdir(), "nomad-turbo-pdf-"));
   const pdfPath = join(dir, "input.pdf");
   try {
@@ -456,16 +609,27 @@ async function readPdf(buffer) {
     if (!pageNumbers.length) {
       throw new Error("pdf had no pages");
     }
+    const pendingDraw = pageNumbers.filter((page) => profile.drawFilled || !(byNum.get(page) || "").trim());
+    if (!pendingDraw.length) {
+      return {
+        pages: pageNumbers.map((page) => ({ page, layer: byNum.get(page) || "", ocr: "", drawn: false })),
+        drew: false,
+      };
+    }
     const cpus = Math.max(1, availableParallelism() || 1);
     const ceiling = Math.max(1, Math.min(pageNumbers.length, ocrSlots(cpus, 0)));
-    console.error(`ocr workers ${ceiling} of ${cpus} threads`);
-    const workers = await startWorkers(ceiling);
+    const pool = { workers: null, ceiling, gpuFailures: 0 };
+    if (!process.env.NOMAD_TURBO_OCR_SOCKET) {
+      pool.workers = await startWorkers(ceiling);
+    }
+    console.error(poolLine(clampSlots(ceiling, readBudget()), cpus, -1));
     let slots = ceiling;
     let notify = () => {};
     let shown = ceiling;
     let pending = null;
     let pendingHits = 0;
     const stopWatch = watchHostCpu(cpus, ceiling, (next, other) => {
+      next = clampSlots(next, readBudget());
       if (next === shown) {
         pending = null;
         pendingHits = 0;
@@ -487,61 +651,99 @@ async function readPdf(buffer) {
       pendingHits = 0;
       shown = next;
       slots = next;
-      const host = other >= 0.5 ? `, other cpu ${other.toFixed(1)}` : "";
-      console.error(`ocr workers ${next} of ${cpus} threads${host}`);
+      console.error(poolLine(next, cpus, other));
       notify();
     });
     try {
       let done = 0;
       const rows = await runPool({
         jobs: pageNumbers.length,
-        runners: workers.length,
-        getSlots: () => slots,
+        runners: pool.ceiling,
+        getSlots: () => clampSlots(slots, readBudget()),
         wake: (fn) => {
           notify = fn;
         },
         work: async (index, runner) => {
           const page = pageNumbers[index];
+          const layer = byNum.get(page) || "";
+          if (!profile.drawFilled && layer.trim()) {
+            done += 1;
+            console.error(`ocr page ${done} of ${pageNumbers.length} text`);
+            return { page, layer, ocr: "", drawn: false };
+          }
           const box = doc.sizes.get(page);
           // The page box is in points. Drawing at that pixel size is the only
-          // GraphicsMagick read. A page with no box is drawn at 200 dpi and
-          // scaled down afterwards, still once.
-          const pixels = box ? rasterPixels(box.width, box.height) : null;
+          // GraphicsMagick read. A page with no box is drawn at the quality's
+          // dpi and scaled down afterwards, still once.
+          const pixels = box ? rasterPixels(box.width, box.height, profile) : null;
           let rendered = await renderPage(pdfPath, page, pixels);
           let meta = await sharp(rendered).metadata();
           let width = meta && meta.width ? meta.width : 0;
           let height = meta && meta.height ? meta.height : 0;
-          if (!pixels && (width > RASTER_CAP || height > RASTER_CAP)) {
-            const fitted = capPixels(width, height);
+          if (!pixels && (width > profile.cap || height > profile.cap)) {
+            const fitted = capPixels(width, height, profile.cap);
             rendered = await sharp(rendered)
               .resize({ width: fitted.width, height: fitted.height, fit: "fill" })
               .toBuffer();
             width = fitted.width;
             height = fitted.height;
           }
-          const merged = mergePage(byNum.get(page) || "", await ocrBuffer(workers[runner], rendered));
+          let seen = "";
+          try {
+            seen = await recognizePrepared(rendered, profile.shrink, runner, pool);
+          } catch (err) {
+            console.error(`ocr page failed ${page}: ${err && err.message ? err.message : err}`);
+          }
           done += 1;
           console.error(`ocr page ${done} of ${pageNumbers.length} ${width}x${height}`);
-          return merged;
+          return { page, layer, ocr: seen, drawn: true };
         },
       });
-      return rows.filter(Boolean).join("\n\n");
+      const pages = rows.filter(Boolean);
+      return { pages, drew: pages.some((page) => page.drawn) };
     } finally {
       stopWatch();
-      await stopWorkers(workers);
+      await stopWorkers(pool.workers);
     }
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 }
 
-async function readImage(buffer) {
-  const worker = await startWorker(0);
-  try {
-    return await ocrBuffer(worker, buffer);
-  } finally {
-    await worker.terminate();
+export async function readImage(buffer, profile = activeProfile) {
+  activeProfile = profile;
+  const pool = { workers: null, ceiling: 1, gpuFailures: 0 };
+  let told = false;
+  while (clampSlots(1, readBudget()) < 1) {
+    if (!told) {
+      console.error("ocr waiting while Qdrant is busy");
+      told = true;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
   }
+  if (!pictureNoted) {
+    pictureNoted = true;
+    console.error(`ocr reading one picture. ${readerNote()}`);
+  }
+  try {
+    const meta = await sharp(buffer).metadata();
+    const width = meta && meta.width ? meta.width : 0;
+    const height = meta && meta.height ? meta.height : 0;
+    if (width > 0 && height > 0 && (width < 8 || height < 8)) {
+      console.error(`ocr skip picture ${width}x${height}`);
+      return "";
+    }
+    return await recognizePrepared(buffer, profile.shrink, 0, pool);
+  } finally {
+    await stopWorkers(pool.workers);
+  }
+}
+
+function joinedText(parts) {
+  return (parts.pages || [])
+    .map((page) => [page.layer, page.ocr].filter(Boolean).join("\n"))
+    .filter(Boolean)
+    .join("\n\n");
 }
 
 function arg(name) {
@@ -553,15 +755,21 @@ function arg(name) {
 }
 
 function testRaster() {
-  const letter = rasterPixels(612, 792);
+  const low = qualityProfile("low");
+  const letter = rasterPixels(612, 792, low);
   if (letter.width !== 1700 || letter.height !== 2200) {
     throw new Error(`letter page ${letter.width}x${letter.height}`);
   }
-  const wide = rasterPixels(1600, 400);
+  const wide = rasterPixels(1600, 400, low);
   if (wide.width !== 4000 || wide.height !== 1000) {
     throw new Error(`wide page ${wide.width}x${wide.height}`);
   }
-  const missing = rasterPixels(0, 0);
+  const medium = qualityProfile("medium");
+  const sharper = rasterPixels(612, 792, medium);
+  if (sharper.width !== 2550 || sharper.height !== 3300) {
+    throw new Error(`medium letter ${sharper.width}x${sharper.height}`);
+  }
+  const missing = rasterPixels(0, 0, low);
   if (missing.width !== 1700 || missing.height !== 2200) {
     throw new Error(`default page ${missing.width}x${missing.height}`);
   }
@@ -602,6 +810,12 @@ function testSlots() {
   }
   if (ocrSlots(Number.NaN, Number.NaN) !== 1) {
     throw new Error("missing cpu info should still run one worker");
+  }
+  if (clampSlots(10, null) !== 10 || clampSlots(10, "") !== 10 || clampSlots(10, "nope") !== 10) {
+    throw new Error("a missing budget should leave the host sample alone");
+  }
+  if (clampSlots(10, "2") !== 2 || clampSlots(10, "0") !== 0 || clampSlots(2, "8") !== 2) {
+    throw new Error("the budget is a ceiling, including zero while Qdrant is refused");
   }
 }
 
@@ -730,7 +944,7 @@ async function main() {
     }
     const pdf = arg("--pdf");
     if (pdf) {
-      const text = await readPdf(readFileSync(pdf));
+      const text = joinedText(await readPdf(readFileSync(pdf), qualityProfile("low")));
       if (!/HELLO/i.test(text)) {
         throw new Error(`pdf read ${JSON.stringify(text)}`);
       }
@@ -741,12 +955,26 @@ async function main() {
   yieldToHost();
   const file = arg("--file");
   const kind = arg("--kind");
+  const profile = qualityProfile(arg("--quality") || "medium");
   if (!file || (kind !== "pdf" && kind !== "image")) {
     throw new Error("usage: --file PATH --kind pdf|image");
   }
   const buffer = readFileSync(file);
-  const text = kind === "pdf" ? await readPdf(buffer) : await readImage(buffer);
-  process.stdout.write(text);
+  if (kind === "image") {
+    const text = await readImage(buffer, profile);
+    if (arg("--format") === "pages") {
+      process.stdout.write(JSON.stringify({ ocr: text, drew: true, pages: [] }));
+      return;
+    }
+    process.stdout.write(text);
+    return;
+  }
+  const parts = await readPdf(buffer, profile);
+  if (arg("--format") === "pages") {
+    process.stdout.write(JSON.stringify(parts));
+    return;
+  }
+  process.stdout.write(joinedText(parts));
 }
 
 const launched = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;

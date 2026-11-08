@@ -17,12 +17,15 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from nomad_turbo.discover import Install
+from nomad_turbo.discover import Install, state_dir
+from nomad_turbo.passes import normalize_ocr_quality
+from nomad_turbo.progress import ocr_status_level
 
 REPO = Path(__file__).resolve().parent.parent
 QUEUECTL = REPO / "worker" / "queuectl.mjs"
 EXTRACT = REPO / "worker" / "extract.mjs"
 OCR = REPO / "worker" / "ocr.mjs"
+ZIM_EXTRA = REPO / "worker" / "zim-extra.mjs"
 TESSDATA = REPO / "worker" / "tessdata"
 OCR_NAME = "nomad-turbo-ocr"
 
@@ -530,9 +533,45 @@ def read_zim_date(install: Install, host_zim: str, *, run=None) -> str | None:
     return None
 
 
-def start_extract(install: Install, host_zim: str, skip: int, after_path: str | None, index_start: int) -> subprocess.Popen:
+def container_ocr_env(*, socket: bool, device: str = "", reader: str = "") -> dict[str, str]:
+    """Paths inside the OCR container. The host writes the same state directory."""
+    env = {"NOMAD_TURBO_OCR_BUDGET": "/turbo-state/ocr-budget"}
+    if device:
+        env["NOMAD_TURBO_OCR_DEVICE"] = device
+    if reader:
+        env["NOMAD_TURBO_OCR_READER"] = reader
+    if socket:
+        env["NOMAD_TURBO_OCR_SOCKET"] = "/turbo-state/ocr.sock"
+    return env
+
+
+def _env_args(env: dict[str, str] | None) -> list[str]:
+    args: list[str] = []
+    for key, value in (env or {}).items():
+        if key and value:
+            args.extend(["-e", f"{key}={value}"])
+    return args
+
+
+def start_extract(
+    install: Install,
+    host_zim: str,
+    skip: int,
+    after_path: str | None,
+    index_start: int,
+    *,
+    quality: str | None = None,
+    spill_id: str | None = None,
+    zim_pass: str | None = None,
+    resume_path: str | None = None,
+    ocr_env: dict[str, str] | None = None,
+    ocr_ahead: bool = False,
+    ocr_queue: bool = False,
+) -> subprocess.Popen:
     name = "nomad-turbo-extract"
     _remove_ours(name)
+    state = state_dir()
+    (state / "spill").mkdir(parents=True, exist_ok=True)
     command = [
         "docker",
         "run",
@@ -549,6 +588,15 @@ def start_extract(install: Install, host_zim: str, skip: int, after_path: str | 
         f"{install.storage_host}:{install.container_storage}:ro",
         "-v",
         f"{EXTRACT}:/app/nomad-turbo-extract.mjs:ro",
+        "-v",
+        f"{ZIM_EXTRA}:/app/zim-extra.mjs:ro",
+        "-v",
+        f"{OCR}:/app/nomad-turbo-ocr.mjs:ro",
+        "-v",
+        f"{TESSDATA}:/tessdata:ro",
+        "-v",
+        f"{state}:/turbo-state",
+        *_env_args(ocr_env),
         "-w",
         "/app",
         "--entrypoint",
@@ -565,6 +613,18 @@ def start_extract(install: Install, host_zim: str, skip: int, after_path: str | 
     ]
     if after_path:
         command += ["--after-path", after_path]
+    if quality:
+        command += ["--quality", normalize_ocr_quality(quality)]
+    if spill_id:
+        command += ["--spill-id", spill_id]
+    if zim_pass:
+        command += ["--pass", zim_pass]
+    if resume_path:
+        command += ["--resume-path", resume_path]
+    if ocr_ahead:
+        command += ["--ocr-ahead"]
+    if ocr_queue:
+        command += ["--ocr-queue"]
     return subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
 
@@ -575,17 +635,36 @@ def visual_text(returncode: int, stdout: str) -> str | None:
     return stdout
 
 
+def visual_pages(returncode: int, stdout: str) -> dict | None:
+    """Page JSON from the OCR reader. A failed read is None, not an empty document.
+
+    When the reader did not print JSON, the text is kept as one plain body.
+    """
+    if int(returncode) != 0:
+        return None
+    raw = stdout or ""
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return {"text": raw, "drew": False, "pages": []}
+    if isinstance(data, dict):
+        return data
+    return {"text": raw, "drew": False, "pages": []}
+
+
 def read_visual(
     install: Install,
     host_path: str,
     kind: str,
     stop: threading.Event | None = None,
     on_status=None,
-) -> str | None:
-    """Text of one uploaded PDF or picture, using the NOMAD image's OCR libraries.
+    quality: str = "medium",
+    ocr_env: dict[str, str] | None = None,
+) -> dict | None:
+    """Pages of one uploaded PDF or picture, using the NOMAD image's OCR libraries.
 
-    Every PDF page keeps its text layer and is also read from the page image.
-    Turbo embeds the result itself.
+    The text layer is kept. A page is drawn according to the quality setting.
+    Turbo embeds the result itself and does not write it back into the file.
     """
     if kind not in ("pdf", "image"):
         return None
@@ -611,6 +690,9 @@ def read_visual(
         f"{OCR}:/app/nomad-turbo-ocr.mjs:ro",
         "-v",
         f"{TESSDATA}:/tessdata:ro",
+        "-v",
+        f"{state_dir()}:/turbo-state",
+        *_env_args(ocr_env),
         "-w",
         "/app",
         "--entrypoint",
@@ -618,9 +700,13 @@ def read_visual(
         install.admin_image,
         "/app/nomad-turbo-ocr.mjs",
         "--file",
-        host_to_container(install, host_path),
+        container_file(install, host_path),
         "--kind",
         kind,
+        "--quality",
+        normalize_ocr_quality(quality),
+        "--format",
+        "pages",
     ]
     try:
         proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -643,7 +729,7 @@ def read_visual(
                 if not text:
                     continue
                 if on_status is None:
-                    log.info("ocr: %s", text[:300])
+                    log.log(ocr_status_level(text), "ocr: %s", text[:300])
                     continue
                 try:
                     on_status(text)
@@ -673,10 +759,25 @@ def read_visual(
     if stopped:
         raise RuntimeError("stopped")
     stdout = out_box["text"]
-    text = visual_text(proc.returncode or 0, stdout)
-    if text is None:
+    parsed = visual_pages(proc.returncode or 0, stdout)
+    if parsed is None:
         log.warning("ocr failed for %s", host_path)
-    return text
+    return parsed
+
+
+def container_file(install: Install, host_path: str) -> str:
+    """Path inside the OCR container.
+
+    Library files live under NOMAD storage. A PDF copied out of a ZIM lives
+    under the turbo state directory, which the container sees at /turbo-state.
+    """
+    path = Path(host_path).resolve()
+    state = state_dir().resolve()
+    try:
+        relative = path.relative_to(state)
+    except ValueError:
+        return host_to_container(install, host_path)
+    return str(Path("/turbo-state") / relative)
 
 
 def host_to_container(install: Install, host_path: str) -> str:

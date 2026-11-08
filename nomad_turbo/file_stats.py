@@ -495,6 +495,15 @@ class FileStats:
             self._touch(source)
             return True
 
+    def clear_priorities(self) -> None:
+        """Drop every priority mark. Finished files and a deleted index do this."""
+        with self._lock:
+            for source, row in self._rows.items():
+                if not row.priority:
+                    continue
+                row.priority = False
+                self._touch(source)
+
     def set_priority(self, source: str, on: bool) -> None:
         with self._lock:
             row = self._ensure(source)

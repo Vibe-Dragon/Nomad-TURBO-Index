@@ -7,6 +7,7 @@ from nomad_turbo.qdrant_status import (
     QdrantView,
     activity_from_text,
     changes_allowed,
+    delete_allowed,
     describe_qdrant,
     growth_line,
     indexing_problem_line,
@@ -91,6 +92,20 @@ class QdrantStatusTest(unittest.TestCase):
         self.assertIn("Qdrant is ready for changes.", ready.text)
         self.assertIn("Collection nomad_knowledge_base answered.", ready.text)
 
+        gone = describe_qdrant(
+            health_ok=True,
+            ready_ok=True,
+            collection_ok=False,
+            collection_missing=True,
+            **common,
+        )
+        self.assertFalse(gone.ready)
+        self.assertTrue(gone.collection_missing)
+        self.assertIn("The knowledge index is not there.", gone.text)
+        self.assertIn("Collection nomad_knowledge_base is not there.", gone.text)
+        self.assertNotIn("Do not restart it or delete the index.", gone.text)
+        self.assertNotIn("replay this write", gone.text)
+
         down = describe_qdrant(
             running=False,
             status="exited",
@@ -163,6 +178,10 @@ class QdrantStatusTest(unittest.TestCase):
     def test_changes_wait_until_the_collection_answers(self):
         self.assertFalse(changes_allowed(False))
         self.assertTrue(changes_allowed(True))
+        self.assertFalse(delete_allowed(False))
+        self.assertTrue(delete_allowed(True))
+        self.assertTrue(delete_allowed(False, collection_missing=True))
+        self.assertFalse(delete_allowed(False, collection_missing=False))
 
     def test_a_timeout_after_store_is_reloaded_is_not_an_error(self):
         # importlib.reload(store) builds a new StoreError. The probe must still
@@ -190,6 +209,35 @@ class QdrantStatusTest(unittest.TestCase):
             self.assertTrue(qdrant_status._collection_answered("http://127.0.0.1:6333/collections/x"))
         finally:
             qdrant_status._request = original
+
+    def test_a_missing_collection_is_not_a_busy_write(self):
+        original = qdrant_status._request
+
+        def missing(url, timeout=3):
+            raise RuntimeError("qdrant 404: not found")
+
+        qdrant_status._request = missing
+        try:
+            answered, _status, _error, gone = qdrant_status._collection_info(
+                "http://127.0.0.1:6333/collections/nomad_knowledge_base"
+            )
+        finally:
+            qdrant_status._request = original
+        self.assertFalse(answered)
+        self.assertTrue(gone)
+
+        def busy(url, timeout=3):
+            raise RuntimeError("qdrant unreachable: timed out")
+
+        qdrant_status._request = busy
+        try:
+            answered, _status, _error, gone = qdrant_status._collection_info(
+                "http://127.0.0.1:6333/collections/nomad_knowledge_base"
+            )
+        finally:
+            qdrant_status._request = original
+        self.assertFalse(answered)
+        self.assertFalse(gone)
 
 
 if __name__ == "__main__":

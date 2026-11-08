@@ -171,6 +171,9 @@ class ProgressTest(unittest.TestCase):
         self.assertEqual(pulse.chunks_stored, later.chunks_stored)
         self.assertEqual([item.source for item in pulse.files], ["b.zim"])
         self.assertEqual(pulse.files[0].eta, later.files[1].eta)
+        book.update("a.zim", articles=1, total=10, chunks=1, state="running", now=11)
+        both = book.pulse(now=11)
+        self.assertEqual([item.source for item in both.files], ["a.zim", "b.zim"])
 
     def test_pulse_skips_idle_files_until_the_library_changes(self):
         book = ProgressBook(
@@ -301,6 +304,13 @@ class ProgressTest(unittest.TestCase):
         self.assertIn("ETA", text)
         self.assertEqual(format_current_file(None)[0], "No file is indexing.")
 
+    def test_the_file_bar_shows_a_percent_during_ocr(self):
+        from nomad_turbo.window import pass_percent_text
+
+        self.assertEqual(pass_percent_text(0), "0%")
+        self.assertEqual(pass_percent_text(52), "52%")
+        self.assertEqual(pass_percent_text(100), "100%")
+
     def test_ocr_names_the_file_and_counts_pages(self):
         self.assertEqual(ocr_page("ocr page 12 of 317 1450x1925"), (12, 317))
         self.assertIsNone(ocr_page("cluster lookahead 268435456 bytes"))
@@ -322,6 +332,100 @@ class ProgressTest(unittest.TestCase):
         self.assertAlmostEqual(plain_fraction, 0.0)
         self.assertIn("articles", plain_text)
         self.assertNotIn("OCR", plain_text)
+
+    def test_ocr_pages_fill_articles_and_pages_per_minute(self):
+        from nomad_turbo.progress import (
+            OcrPace,
+            ocr_note_matches,
+            ocr_pages,
+            ocr_status_level,
+            overlay_ocr_columns,
+        )
+        from nomad_turbo.schedule import (
+            COL_ARTICLES,
+            COL_ART_MIN,
+            COL_CHUNKS,
+            COL_ETA,
+            COL_ETA_SORT,
+            COL_PROGRESS,
+            COL_STATUS,
+            index_store_row,
+        )
+
+        self.assertEqual(ocr_status_level("ocr page 3 of 9 100x100"), logging.DEBUG)
+        self.assertEqual(ocr_status_level("ocr workers 4 of 12 threads"), logging.DEBUG)
+        self.assertEqual(ocr_status_level("ocr: Image too small to scale"), logging.INFO)
+        self.assertEqual(ocr_pages(ocr_note("book.pdf", 14, 40)), (14, 40))
+        self.assertIsNone(ocr_pages("Indexing."))
+        book = ProgressBook([CatalogRow("book.pdf", "book.pdf", "upload", "pdf", 1000, "running")])
+        book.update("book.pdf", articles=0, total=None, chunks=0, state="running", now=0)
+        row = index_store_row(book.snapshot(now=0).files[0], priority=False)
+        pace = OcrPace()
+        self.assertIsNone(pace.observe(ocr_note("book.pdf", 4, 40), now=0))
+        self.assertIsNone(pace.observe(ocr_note("book.pdf", 10, 40), now=0.4))
+        ppm = pace.observe(ocr_note("book.pdf", 14, 40), now=10)
+        self.assertAlmostEqual(ppm, 60.0)
+        shown = overlay_ocr_columns(row, ocr_note("book.pdf", 14, 40), ppm)
+        self.assertEqual(shown[COL_STATUS], "OCR")
+        self.assertEqual(shown[COL_PROGRESS], 35)
+        self.assertEqual(shown[COL_ARTICLES], "14 / 40")
+        self.assertEqual(shown[COL_ART_MIN], "60")
+        self.assertEqual(shown[COL_CHUNKS], row[COL_CHUNKS])
+        self.assertEqual(shown[COL_ETA], "26s")
+        self.assertEqual(shown[COL_ETA_SORT], 26)
+        self.assertEqual(overlay_ocr_columns(row, ocr_note("book.pdf", 14, 40), None)[COL_ETA], row[COL_ETA])
+        self.assertFalse(ocr_note_matches(ocr_note("book.pdf", 14, 40), "other.pdf"))
+        self.assertTrue(ocr_note_matches(ocr_note("book.pdf", 14, 40), "book.pdf"))
+        self.assertEqual(overlay_ocr_columns(row, "Indexing.", ppm)[COL_STATUS], row[COL_STATUS])
+        self.assertIsNone(pace.observe("Indexing.", now=11))
+        self.assertIsNone(pace.observe(ocr_note("other.pdf", 2, 8), now=11))
+
+    def test_one_article_file_shows_chunk_progress_while_it_embeds(self):
+        from nomad_turbo.schedule import COL_ARTICLES, COL_ART_MIN, COL_CHUNKS, COL_CHUNKS_SORT, COL_CHK_S, index_store_row
+
+        book = ProgressBook([CatalogRow("a.pdf", "a.pdf", "upload", "pdf", 5000, "pending")])
+        book.update("a.pdf", articles=0, total=1, chunks=0, state="running", now=0)
+
+        class _Stats:
+            def __init__(self) -> None:
+                self.notes = 0
+
+            def note_progress(self, *_args, **_kwargs) -> None:
+                self.notes += 1
+
+            def note_rates(self, *_args, **_kwargs) -> None:
+                return None
+
+        stats = _Stats()
+        book.attach_stats(stats)
+        book.note_flight("a.pdf", 0, 200, now=0)
+        book.note_flight("a.pdf", 50, 200, now=10)
+        self.assertEqual(stats.notes, 0)
+        item = book.snapshot(now=10).files[0]
+        self.assertEqual(item.count, "0 / 1")
+        self.assertEqual(item.chunks, 0)
+        self.assertEqual(item.chunks_text, "50")
+        self.assertEqual(item.percent, 25)
+        self.assertEqual(item.chk_text, "5")
+        self.assertEqual(item.art_text, "—")
+        self.assertEqual(item.eta, format_eta(30))
+        row = index_store_row(item, priority=False)
+        self.assertEqual(row[COL_ARTICLES], "0 / 1")
+        self.assertEqual(row[COL_ART_MIN], "—")
+        self.assertEqual(row[COL_CHUNKS], "50")
+        self.assertEqual(row[COL_CHUNKS_SORT], 50)
+        self.assertEqual(row[COL_CHK_S], "5")
+        _title, fraction, text = format_current_file(book.snapshot(now=10))
+        self.assertAlmostEqual(fraction, 0.25)
+        self.assertIn("50 chunks", text)
+        self.assertIn("0 / 1 articles", text)
+        book.update("a.pdf", articles=1, total=1, chunks=200, state="running", now=12)
+        self.assertEqual(stats.notes, 1)
+        done = book.snapshot(now=12).files[0]
+        self.assertEqual(done.chunks, 200)
+        self.assertEqual(done.chunks_text, "200")
+        self.assertEqual(done.percent, 100)
+        self.assertEqual(done.count, "1 / 1")
 
     def test_column_width_uses_the_longest_text_and_stays_inside_the_limits(self):
         self.assertEqual(format_bytes(0), "—")
@@ -383,6 +487,14 @@ class ProgressTest(unittest.TestCase):
         self.assertEqual(embed_server_text(0), "0 embed servers")
         self.assertEqual(embed_server_text(1), "1 embed server")
         self.assertEqual(embed_server_text(2), "2 embed servers")
+        from nomad_turbo.progress import ocr_worker_text, ocr_workers, server_status_text
+
+        self.assertEqual(ocr_workers("ocr workers 9 of 12 threads, other cpu 2.7"), (9, 12))
+        self.assertIsNone(ocr_workers("ocr page 3 of 9"))
+        self.assertEqual(ocr_worker_text(None), "OCR workers: idle")
+        self.assertEqual(ocr_worker_text(9, 12), "9 of 12 OCR workers")
+        self.assertEqual(server_status_text(1, (9, 12)), "1 embed server\n9 of 12 OCR workers")
+        self.assertEqual(server_status_text(0, None), "0 embed servers\nOCR workers: idle")
         fresh = resume_log("a.zim", 0, 0, set())
         self.assertIn("from article 0", fresh)
         self.assertIn("0 paths already stored", fresh)
@@ -1169,9 +1281,22 @@ class AboutAndLayoutTest(unittest.TestCase):
         self.assertIn("Project NOMAD 1.35.1", changelog)
         self.assertIn("shared rows", changelog)
         notes = changelog.split(f"## {__version__}", 1)[1].split("\n## ", 1)[0]
-        self.assertIn("has not been started", notes)
+        self.assertIn("Settings", notes)
         self.assertIn("200 dpi", notes)
-        self.assertIn("not handed to NOMAD", notes)
+        self.assertIn("1570", notes)
+        self.assertIn("1536", notes)
+        self.assertIn("left out", notes)
+        released_117 = changelog.split("## 1.1.7", 1)[1].split("\n## ", 1)[0]
+        self.assertIn("has not been started", released_117)
+        self.assertIn("not handed to NOMAD", released_117)
+        self.assertIn("directory entry", released_117)
+        reload = window.split("def _reload_indexer", 1)[1].split("\n    def ", 1)[0]
+        self.assertLess(reload.index("reload(schedule)"), reload.index("reload(progress)"))
+        self.assertLess(reload.index("reload(progress)"), reload.index("reload(engine)"))
+        self.assertLess(reload.index("reload(passes)"), reload.index("reload(engine)"))
+        self.assertLess(reload.index("reload(runtime)"), reload.index("reload(engine)"))
+        delete = window.split("def _delete_only", 1)[1].split("\n    def ", 1)[0]
+        self.assertLess(delete.index("try:"), delete.index("_reload_indexer()"))
         released_116 = changelog.split("## 1.1.6", 1)[1].split("\n## ", 1)[0]
         self.assertIn("exact", released_116)
         self.assertIn("PUT", released_116)
@@ -1186,6 +1311,7 @@ class AboutAndLayoutTest(unittest.TestCase):
         previous_notes = changelog.split("## 1.1.4", 1)[1].split("\n## ", 1)[0]
         self.assertIn("Auto", previous_notes)
         self.assertIn("finished embed calls", previous_notes)
+        self.assertLess(changelog.index(f"## {__version__}"), changelog.index("## 1.1.7"))
         self.assertLess(changelog.index("## 1.1.7"), changelog.index("## 1.1.6"))
         self.assertLess(changelog.index("## 1.1.6"), changelog.index("## 1.1.5"))
         self.assertLess(changelog.index("## 1.1.5"), changelog.index("## 1.1.4"))

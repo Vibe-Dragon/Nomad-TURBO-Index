@@ -48,6 +48,11 @@ class Session:
         self._zim_dates: dict[str, str] = {}
         self._file_stats = None
         self._tune_auto = False
+        self._ocr_quality = "medium"
+        self._index_device = "auto"
+        self._ocr_device = "auto"
+        self._ocr_activity = ""
+        self._ocr_workers: tuple[int, int] | None = None
 
     def set_chunks(self, chunks: int) -> None:
         with self._lock:
@@ -87,6 +92,7 @@ class Session:
                 "phase": self.phase,
                 "error": self.error,
                 "note": self.note,
+                "ocr_note": self._ocr_activity,
                 "optimize_hold": self.optimize_hold,
                 "active_slots": self.active_slots,
                 "total_mib": self.total_mib,
@@ -104,6 +110,35 @@ class Session:
     def set_note(self, note: str) -> None:
         with self._lock:
             self.note = note
+
+    def set_ocr_activity(self, note: str) -> None:
+        """Page progress for the file being read. Indexing keeps `note`."""
+        with self._lock:
+            self._ocr_activity = str(note or "")
+
+    def ocr_activity(self) -> str:
+        with self._lock:
+            return self._ocr_activity
+
+    def clear_ocr_activity(self, name: str = "") -> None:
+        """Drop the page note. A name clears it only when that file owns it."""
+        with self._lock:
+            current = self._ocr_activity
+            if not name or current.startswith(f"Reading {name} with OCR"):
+                self._ocr_activity = ""
+                self._ocr_workers = None
+
+    def set_ocr_workers(self, shown: int, total: int) -> None:
+        """Workers busy in the current read, and the size of that pool."""
+        with self._lock:
+            self._ocr_workers = (int(shown), int(total))
+
+    def ocr_workers(self) -> tuple[int, int] | None:
+        with self._lock:
+            value = getattr(self, "_ocr_workers", None)
+            if not value:
+                return None
+            return int(value[0]), int(value[1])
 
     def note_embed_call(
         self,
@@ -203,6 +238,14 @@ class Session:
     def priorities(self) -> set[str]:
         with self._lock:
             return set(self._priority)
+
+    def clear_priorities(self) -> None:
+        """Drop every mark. A deleted index has nothing left to put first."""
+        with self._lock:
+            if not self._priority:
+                return
+            self._priority.clear()
+            self._priority_epoch += 1
 
     def arm_priority(self) -> int:
         """Epoch at the moment a file starts. Later marks are the ones that switch."""
@@ -337,3 +380,33 @@ class Session:
     def tune_auto(self) -> bool:
         with self._lock:
             return self._tune_auto
+
+    def set_ocr_quality(self, value: str) -> None:
+        from nomad_turbo.passes import normalize_ocr_quality
+
+        with self._lock:
+            self._ocr_quality = normalize_ocr_quality(value)
+
+    def ocr_quality(self) -> str:
+        with self._lock:
+            return self._ocr_quality
+
+    def set_index_device(self, value: str) -> None:
+        from nomad_turbo.devices import normalize_device_choice
+
+        with self._lock:
+            self._index_device = normalize_device_choice(value)
+
+    def index_device(self) -> str:
+        with self._lock:
+            return self._index_device
+
+    def set_ocr_device(self, value: str) -> None:
+        from nomad_turbo.devices import normalize_device_choice
+
+        with self._lock:
+            self._ocr_device = normalize_device_choice(value)
+
+    def ocr_device(self) -> str:
+        with self._lock:
+            return self._ocr_device

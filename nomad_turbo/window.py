@@ -17,10 +17,13 @@ from nomad_turbo.catalog import wipe_phrase_ok
 from nomad_turbo.desktop import icon_dir, write_shortcut
 from nomad_turbo.discover import load_install, save_install, state_dir
 from nomad_turbo.file_stats import STATS_NAME, FileStats, compose_detail, detail_lines, library_location
+from nomad_turbo.passes import bar_color, normalize_ocr_quality
 from nomad_turbo.progress import (
+    OcrPace,
     ProgressBook,
-    ocr_list_cells,
     format_run_stats,
+    ocr_note_matches,
+    overlay_ocr_columns,
     LOG_PANE_LINES,
     restored_frame,
     restored_log_top,
@@ -31,7 +34,7 @@ from nomad_turbo.progress import (
     preferred_column_width,
     embed_server_text,
 )
-from nomad_turbo.qdrant_status import changes_allowed
+from nomad_turbo.qdrant_status import changes_allowed, delete_allowed
 from nomad_turbo.repair import format_repair_current
 from nomad_turbo.runtime import gpu_rows
 from nomad_turbo.scan import scan_library
@@ -148,6 +151,97 @@ def describe_index_controls(app) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _hex_rgb(color: str) -> tuple[float, float, float]:
+    text = (color or "").strip().lstrip("#")
+    if len(text) != 6:
+        text = "1d4e89"
+    try:
+        value = int(text, 16)
+    except ValueError:
+        value = 0x1D4E89
+    return ((value >> 16) & 255) / 255.0, ((value >> 8) & 255) / 255.0, (value & 255) / 255.0
+
+
+def _round_box(cr, left: float, top: float, width: float, height: float, radius: float) -> None:
+    import math
+
+    radius = min(radius, width / 2.0, height / 2.0)
+    if radius <= 0:
+        cr.rectangle(left, top, width, height)
+        return
+    cr.new_sub_path()
+    cr.arc(left + width - radius, top + radius, radius, -math.pi / 2, 0)
+    cr.arc(left + width - radius, top + height - radius, radius, 0, math.pi / 2)
+    cr.arc(left + radius, top + height - radius, radius, math.pi / 2, math.pi)
+    cr.arc(left + radius, top + radius, radius, math.pi, math.pi * 1.5)
+    cr.close_path()
+
+
+def pass_percent_text(value: int) -> str:
+    """The number drawn on a file bar. OCR uses the same bar as the other passes."""
+    return f"{max(0, min(100, int(value)))}%"
+
+
+def paint_pass_bar(cr, area, value: int, color: str) -> None:
+    """One file bar. The color is the pass. An empty color uses the ordinary blue."""
+    if area is None or cr is None:
+        return
+    width = int(getattr(area, "width", 0) or 0)
+    height = int(getattr(area, "height", 0) or 0)
+    if width < 4 or height < 4:
+        return
+    left = float(getattr(area, "x", 0) or 0) + 2
+    wide = float(width - 4)
+    bar_h = float(min(14, height - 2))
+    top = float(getattr(area, "y", 0) or 0) + (height - bar_h) / 2.0
+    red, green, blue = _hex_rgb(color or "#1d4e89")
+    _round_box(cr, left, top, wide, bar_h, 3)
+    cr.set_source_rgba(red, green, blue, 0.22)
+    cr.fill()
+    shown = max(0, min(100, int(value)))
+    fraction = shown / 100.0
+    if fraction > 0:
+        _round_box(cr, left, top, max(6.0, min(wide, wide * fraction)), bar_h, 3)
+        cr.set_source_rgb(red, green, blue)
+        cr.fill()
+    label = pass_percent_text(shown)
+    cr.select_font_face("Sans")
+    cr.set_font_size(max(9.0, min(12.0, bar_h - 1.0)))
+    extents = cr.text_extents(label)
+    text_x = left + max(0.0, (wide - extents.width) / 2.0 - extents.x_bearing)
+    text_y = top + (bar_h - extents.height) / 2.0 - extents.y_bearing
+    cr.set_source_rgb(1, 1, 1)
+    cr.move_to(text_x, text_y)
+    cr.show_text(label)
+
+
+def _pass_renderer(gtk):
+    """A progress cell that can take a different color on each row."""
+    kind = getattr(_pass_renderer, "kind", None)
+    if kind is None:
+        from gi.repository import GObject
+
+        class PassBar(gtk.CellRenderer):
+            __gtype_name__ = "NomadTurboPassBar"
+            value = GObject.Property(type=int, default=0)
+            pass_color = GObject.Property(type=str, default="")
+
+            def __init__(self):
+                gtk.CellRenderer.__init__(self)
+                self.set_property("xpad", 3)
+                self.set_property("ypad", 3)
+
+            def do_get_preferred_height(self, widget):
+                return 16, 20
+
+            def do_render(self, cr, widget, background_area, cell_area, flags):
+                paint_pass_bar(cr, cell_area, int(self.value or 0), str(self.pass_color or ""))
+
+        _pass_renderer.kind = PassBar
+        kind = PassBar
+    return kind()
+
+
 def index_store_types() -> tuple:
     """Article, chunk, and size columns are 64-bit. A ZIM over 2 GB does not fit in 32."""
     from gi.repository import GObject
@@ -236,12 +330,18 @@ class _MemoryLog(logging.Handler):
             self.release()
 
 
-def _configure_logging(memory: _MemoryLog) -> Path:
-    from nomad_turbo.logbook import prepare_session_logs
+def _configure_logging(memory: _MemoryLog, install) -> Path:
+    from nomad_turbo.logbook import DailyLogHandler, daily_log_path, prepare_collection_logs
 
-    path, _previous = prepare_session_logs(state_dir())
+    directory = state_dir()
+    failed = None
+    try:
+        prepare_collection_logs(directory, install)
+    except Exception as exc:
+        failed = exc
+    path = daily_log_path(directory)
     formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
-    file_handler = logging.FileHandler(path, mode="w")
+    file_handler = DailyLogHandler(directory)
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(formatter)
     stream = logging.StreamHandler()
@@ -255,6 +355,8 @@ def _configure_logging(memory: _MemoryLog) -> Path:
     root.addHandler(stream)
     root.addHandler(memory)
     log.setLevel(logging.DEBUG)
+    if failed is not None:
+        log.warning("could not align log files with the knowledge index: %s", failed)
     return path
 
 
@@ -282,7 +384,7 @@ def open_window() -> int:
 
     install = load_install()
     memory = _MemoryLog()
-    log_path = _configure_logging(memory)
+    log_path = _configure_logging(memory, install)
     gpu = pick_gpu(gpu_rows())
     host = host_memory_mib()
     session = Session(
@@ -466,6 +568,7 @@ class _Window:
         self.qdrant_stop = threading.Event()
         self.qdrant_text = "Checking Qdrant…"
         self.qdrant_ready = False
+        self.collection_missing = False
         self.qdrant_vectors = None
         self._qdrant_error = None
         self._qdrant_problem = ""
@@ -487,6 +590,7 @@ class _Window:
         self._tree_dirty = False
         self._running_source = ""
         self._tree_indexing = ""
+        self._ocr_pace = OcrPace()
         self._pane_lock = False
         self._then_guard = False
         self._choice_guard = False
@@ -716,6 +820,7 @@ class _Window:
         self.server_label = gtk.Label(label=embed_server_text(0))
         self.server_label.set_valign(gtk.Align.CENTER)
         self.server_label.set_halign(gtk.Align.START)
+        self.server_label.set_xalign(0)
         self.server_label.set_tooltip_text(TIPS["usage"])
 
         self.stats = gtk.Label(label="")
@@ -770,7 +875,7 @@ class _Window:
         self.delete_tip = TIPS["delete"]
         self.delete_button.set_tooltip_text(TIPS["delete"])
         self.delete_button.get_style_context().add_class("destructive-action")
-        # Run actions, then the measure halves, then the embed batch. Delete stays apart.
+        # Run actions, then Measure, then OCR quality, then the embed batch. Delete stays apart.
         self.run_group = self._linked(
             self.start_button,
             self.stop_button,
@@ -778,6 +883,31 @@ class _Window:
             self.keep_check,
         )
         self.measure_group = self._linked(self.measure_button, self.then_index_button)
+        chosen_quality = normalize_ocr_quality(getattr(install, "ocr_quality", "medium"))
+        self.session.set_ocr_quality(chosen_quality)
+        self._ocr_guard = False
+        self.ocr_low = gtk.ToggleButton(label="Low")
+        self.ocr_medium = gtk.ToggleButton(label="Medium")
+        self.ocr_high = gtk.ToggleButton(label="High")
+        for name, button in (
+            ("low", self.ocr_low),
+            ("medium", self.ocr_medium),
+            ("high", self.ocr_high),
+        ):
+            button.set_tooltip_text(TIPS["ocr_quality"])
+            button.set_active(name == chosen_quality)
+        for name, button in (
+            ("low", self.ocr_low),
+            ("medium", self.ocr_medium),
+            ("high", self.ocr_high),
+        ):
+            button.connect("toggled", self.on_ocr_quality, name)
+        ocr_caption = gtk.Label(label="OCR")
+        ocr_caption.set_tooltip_text(TIPS["ocr_quality"])
+        self.ocr_group = self._flow(
+            ocr_caption,
+            self._linked(self.ocr_low, self.ocr_medium, self.ocr_high),
+        )
         self.tune_auto = gtk.ToggleButton(label="Auto")
         self.tune_auto.set_tooltip_text(TIPS["tune_auto"])
         self.tune_auto.set_active(bool(getattr(install, "tune_auto", False)))
@@ -795,7 +925,13 @@ class _Window:
         delete_pad.set_margin_start(16)
         delete_pad.pack_start(self.delete_button, False, False, 0)
         self.delete_pad = delete_pad
-        buttons = self._flow(self.run_group, self.measure_group, self.embed_group, delete_pad)
+        buttons = self._flow(
+            self.run_group,
+            self.measure_group,
+            self.ocr_group,
+            self.embed_group,
+            delete_pad,
+        )
         lower.pack_start(buttons, False, False, 0)
         self.index_buttons = buttons
         self.index_controls = lower
@@ -805,6 +941,7 @@ class _Window:
         index.pack_start(self.index_list, True, True, 0)
         index.pack_start(self.index_controls, False, False, 0)
         self._build_repair_page(headed)
+        self._build_settings_page()
         self._build_about_page()
 
         self.error_check = gtk.ToggleButton(label="Errors")
@@ -1011,6 +1148,10 @@ class _Window:
                 )
                 self.qdrant_text = view.text
                 self.qdrant_ready = view.ready
+                self.collection_missing = bool(getattr(view, "collection_missing", False))
+                from nomad_turbo.ocr_budget import note_qdrant
+
+                note_qdrant(view.ready, view.collection_status)
                 if view.vectors is not None:
                     self.qdrant_vectors = view.vectors
                 try:
@@ -1035,9 +1176,19 @@ class _Window:
                     log.warning("qdrant status check failed: %s", message)
                 self.qdrant_text = "Qdrant status could not be read. Not ready for changes."
                 self.qdrant_ready = False
+                self.collection_missing = False
+                from nomad_turbo.ocr_budget import note_qdrant
+
+                note_qdrant(False, "")
                 self._note_qdrant_problem(f"Qdrant status could not be read. {message}")
             else:
                 self._qdrant_error = None
+                try:
+                    from nomad_turbo.logbook import watch_collection_logs
+
+                    watch_collection_logs(state_dir(), self.install)
+                except Exception:
+                    log.exception("could not check log files against the knowledge index")
             if self.qdrant_stop.wait(5):
                 return
 
@@ -1330,7 +1481,7 @@ class _Window:
 
     def _on_destroy(self, *_args) -> None:
         self._frame_ready_at = time.monotonic() + 10**9
-        for name in ("_frame_timer", "layout_timer", "_log_settle", "_host_settle"):
+        for name in ("_frame_timer", "layout_timer", "_log_settle", "_host_settle", "_ocr_pulse"):
             timer = getattr(self, name, None)
             if timer:
                 self.glib.source_remove(timer)
@@ -1338,6 +1489,15 @@ class _Window:
         panel = getattr(self, "host_panel", None)
         if panel is not None:
             panel.stop()
+        stop = getattr(self, "_ocr_install_stop", None)
+        if stop is not None:
+            stop.set()
+        try:
+            from nomad_turbo.ocr_setup import stop_install
+
+            stop_install()
+        except Exception:
+            log.exception("could not stop the GPU reader download")
 
     def _flush_stats(self, *, wait: bool = False) -> None:
         stats = getattr(self, "file_stats", None)
@@ -1538,15 +1698,13 @@ class _Window:
             maximum=160,
             fit=fit,
         )
-        progress_cell = gtk.CellRendererProgress()
+        progress_cell = _pass_renderer(gtk)
         progress_column = headed(
             INDEX_HEADERS[4],
             TIPS["col_progress"],
             progress_cell,
-            value=COL_PROGRESS,
         )
-        if not headers:
-            progress_column.set_cell_data_func(progress_cell, self._hide_folder_progress)
+        progress_column.set_cell_data_func(progress_cell, self._paint_pass_bar)
         self._add_column(
             tree,
             "index:Progress",
@@ -1611,6 +1769,19 @@ class _Window:
 
     def _hide_folder_progress(self, _column, cell, model, iterator, _data) -> None:
         cell.set_property("visible", model.get_value(iterator, COL_TYPE) != FOLDER)
+
+    def _paint_pass_bar(self, _column, cell, model, iterator, _data) -> None:
+        """Color the file bar from the status word. A folder row has no bar."""
+        folder = model.get_value(iterator, COL_TYPE) == FOLDER
+        cell.set_property("visible", not folder)
+        if folder:
+            return
+        try:
+            value = int(model.get_value(iterator, COL_PROGRESS) or 0)
+        except (TypeError, ValueError):
+            value = 0
+        cell.value = max(0, min(100, value))
+        cell.pass_color = bar_color(str(model.get_value(iterator, COL_STATUS) or ""))
 
     def _paint_tree_mark(self, _column, cell, model, iterator, _data) -> None:
         """The indexing glyph and the priority asterisk. Status text is not either."""
@@ -1904,6 +2075,10 @@ class _Window:
             progressbar trough {
                 min-width: 48px;
             }
+            progressbar text {
+                color: #ffffff;
+                text-shadow: none;
+            }
             .nomad-segment button:checked {
                 background-image: none;
                 background-color: alpha(@theme_selected_bg_color, 0.45);
@@ -1981,6 +2156,7 @@ class _Window:
             for widget in (
                 getattr(self, "run_group", None),
                 getattr(self, "measure_group", None),
+                getattr(self, "ocr_group", None),
                 getattr(self, "embed_group", None),
                 getattr(self, "delete_pad", None),
                 getattr(self, "repair_choice", None),
@@ -1988,9 +2164,13 @@ class _Window:
                 getattr(self, "optimize_segments", None),
                 getattr(self, "log_filters", None),
                 getattr(self, "log_export_group", None),
+                getattr(self, "settings_page", None),
             )
         ]
-        return max(widths or [0]) + 4
+        # A hidden page still sets the stack's minimum. Settings is wider than
+        # the Index button groups, and the bar has to stop at that width.
+        pane = self._preferred_min_width(getattr(self, "content_pane", None))
+        return max(max(widths or [0]) + 4, pane)
 
     def _yield_host(self, pane_width: int, main_min: int) -> None:
         """Let the host side shrink when the window is already at its floor."""
@@ -2177,6 +2357,37 @@ class _Window:
             save_install(self.install)
         except Exception:
             log.exception("could not save the stay-on setting")
+
+    def on_ocr_quality(self, button, name: str) -> None:
+        """One of Low, Medium, or High stays on. The choice is saved."""
+        if getattr(self, "_ocr_guard", False):
+            return
+        self._ocr_guard = True
+        try:
+            buttons = (
+                ("low", self.ocr_low),
+                ("medium", self.ocr_medium),
+                ("high", self.ocr_high),
+            )
+            if button.get_active():
+                for _other_name, other in buttons:
+                    if other is not button and other.get_active():
+                        other.set_active(False)
+                chosen = name
+            elif any(other.get_active() for _other_name, other in buttons):
+                return
+            else:
+                button.set_active(True)
+                chosen = name
+            chosen = normalize_ocr_quality(chosen)
+            self.session.set_ocr_quality(chosen)
+            self.install.ocr_quality = chosen
+            try:
+                save_install(self.install)
+            except Exception:
+                log.exception("could not save the ocr quality")
+        finally:
+            self._ocr_guard = False
 
     def on_order(self, combo) -> None:
         """Choose which unfinished file comes next. The one already running stays."""
@@ -2423,7 +2634,8 @@ class _Window:
 
     def on_recommend(self, *_args) -> None:
         """Set the chunk count to the safe call for the computer running Turbo."""
-        gpu_total = self.live_gpu[1] if self.live_gpu else None
+        gpu = self._index_memory()
+        gpu_total = gpu[1] if gpu else None
         count = safe_call_chunks(
             gpu_total_mib=gpu_total,
             host_total_mib=self.host_total_mib,
@@ -2480,7 +2692,9 @@ class _Window:
         return True
 
     def on_delete_index(self, *_args) -> None:
-        if not self.rows_ready or self._work_alive() or not self.qdrant_ready:
+        if not self.rows_ready or self._work_alive() or not delete_allowed(
+            self.qdrant_ready, getattr(self, "collection_missing", False)
+        ):
             return
         gtk = self.gtk
         dialog = gtk.MessageDialog(
@@ -2517,15 +2731,52 @@ class _Window:
             self.delete_thread = threading.Thread(target=self._delete_only, name="nomad-turbo-delete")
             self.delete_thread.start()
 
-    def _delete_only(self) -> None:
+    def _reload_indexer(self):
+        """Reload the indexer and the modules it imports.
+
+        Delete and Start read engine.py again so a fix applies without
+        reopening the window. A name added after this window opened is
+        missing from the copy already in memory, and the reload then dies
+        before the index is touched. The providing module is reloaded
+        first. progress follows schedule. passes follows packing. slots
+        is first because pool binds it at import.
+        """
         import importlib
 
+        import nomad_turbo.chunking as chunking
+        import nomad_turbo.decisions as decisions
+        import nomad_turbo.discover as discover
         import nomad_turbo.engine as engine
+        import nomad_turbo.logbook as logbook
+        import nomad_turbo.packing as packing
+        import nomad_turbo.passes as passes
+        import nomad_turbo.pool as pool
+        import nomad_turbo.progress as progress
+        import nomad_turbo.runtime as runtime
+        import nomad_turbo.schedule as schedule
+        import nomad_turbo.session as session_mod
+        import nomad_turbo.slots as slots
         import nomad_turbo.store as store
 
+        importlib.reload(slots)
+        importlib.reload(discover)
+        importlib.reload(session_mod)
         importlib.reload(store)
+        importlib.reload(runtime)
+        importlib.reload(schedule)
+        importlib.reload(progress)
+        importlib.reload(decisions)
+        importlib.reload(chunking)
+        importlib.reload(packing)
+        importlib.reload(passes)
+        importlib.reload(pool)
+        importlib.reload(logbook)
         importlib.reload(engine)
+        return engine
+
+    def _delete_only(self) -> None:
         try:
+            engine = self._reload_indexer()
             engine.delete_index_only(self.session.stop, session=self.session)
         except Exception as exc:
             log.exception("index delete failed")
@@ -2534,48 +2785,6 @@ class _Window:
             return
         note = self.session.view().get("note") or "Knowledge index deleted. Indexing has not started."
         self.glib.idle_add(self._show, self.status, note)
-
-    def _choose_export_source(self):
-        """Current session, or the previous one. None when the user cancels."""
-        gtk = self.gtk
-        previous = self.log_path.with_name("session-previous.log")
-        has_previous = previous.is_file() and previous.stat().st_size > 0
-        dialog = gtk.Dialog(
-            title="Export log",
-            parent=self.window,
-            flags=gtk.DialogFlags.MODAL,
-        )
-        dialog.add_button("Cancel", gtk.ResponseType.CANCEL)
-        dialog.add_button("Continue", gtk.ResponseType.OK)
-        box = dialog.get_content_area()
-        box.set_border_width(12)
-        box.set_spacing(8)
-        note = gtk.Label(
-            label=(
-                "The log file keeps every line. The log buttons only hide lines in the window. "
-                "Older sessions are not kept."
-            )
-        )
-        note.set_xalign(0)
-        note.set_line_wrap(True)
-        note.set_max_width_chars(48)
-        current = gtk.ToggleButton(label="Current session")
-        last = gtk.ToggleButton(label="Last session")
-        current.set_active(True)
-        last.set_sensitive(has_previous)
-        if not has_previous:
-            last.set_tooltip_text("No earlier session is saved yet.")
-        self._bind_choice(current, last)
-        choice = self._linked(current, last)
-        box.pack_start(note, False, False, 0)
-        box.pack_start(choice, False, False, 0)
-        dialog.show_all()
-        response = dialog.run()
-        chosen = previous if last.get_active() and has_previous else self.log_path
-        dialog.destroy()
-        if response != gtk.ResponseType.OK:
-            return None
-        return chosen
 
     def on_log_help(self, *_args) -> None:
         from nomad_turbo.logbook import log_help_text
@@ -2606,10 +2815,9 @@ class _Window:
         dialog.destroy()
 
     def on_export(self, *_args) -> None:
+        from nomad_turbo.logbook import export_logs
+
         gtk = self.gtk
-        source = self._choose_export_source()
-        if source is None:
-            return
         chooser = gtk.FileChooserDialog(
             title="Export log",
             parent=self.window,
@@ -2621,10 +2829,7 @@ class _Window:
                 gtk.ResponseType.OK,
             ),
         )
-        name = "nomad-turbo-log.txt"
-        if source.name == "session-previous.log":
-            name = "nomad-turbo-previous-log.txt"
-        chooser.set_current_name(name)
+        chooser.set_current_name("nomad-turbo-logs.zip")
         chooser.set_do_overwrite_confirmation(True)
         response = chooser.run()
         target = chooser.get_filename()
@@ -2632,44 +2837,26 @@ class _Window:
         if response != gtk.ResponseType.OK or not target:
             return
         try:
-            shutil.copyfile(source, target)
+            export_logs(state_dir(), Path(target))
         except OSError as exc:
             self.status.set_text(f"Could not export the log: {exc}")
             return
-        self.status.set_text(f"Log saved to {target}")
+        self.status.set_text(f"Logs saved to {target}")
 
     def _run(self, wipe: bool) -> None:
         import importlib
 
-        import nomad_turbo.chunking as chunking
         import nomad_turbo.decisions as decisions
-        import nomad_turbo.engine as engine
-        import nomad_turbo.packing as packing
-        import nomad_turbo.pool as pool
-        import nomad_turbo.runtime as runtime
         import nomad_turbo.schedule as schedule
         import nomad_turbo.session as session_mod
-        import nomad_turbo.slots as slots
-        import nomad_turbo.store as store
         import nomad_turbo.tune as tune
 
         # Start loads the modules again so a fix applies without reopening the window.
         # tune is reloaded so Auto picks up a batch-rule fix on this Start.
-        # slots is first because pool and engine bind its functions at import.
-        # chunking is before packing because packing binds the fit helpers at import.
         # session is reloaded before engine, then the live object takes the new class.
         # The object was built when the window opened. Leaving it on the old class
         # makes the first recorded embed call abort the file.
-        importlib.reload(slots)
-        importlib.reload(session_mod)
-        importlib.reload(store)
-        importlib.reload(runtime)
-        importlib.reload(schedule)
-        importlib.reload(decisions)
-        importlib.reload(chunking)
-        importlib.reload(packing)
-        importlib.reload(pool)
-        importlib.reload(engine)
+        engine = self._reload_indexer()
         importlib.reload(tune)
         if self.session.__class__ is not session_mod.Session:
             try:
@@ -2692,9 +2879,19 @@ class _Window:
                 self.session.set_phase("done")
                 self.session.set_note(decisions.finished_status_note(saved_policy))
         except Exception as exc:
-            log.exception("turbo failed")
-            self.session.set_phase("error", str(exc))
-            self.session.set_note(str(exc))
+            # Stop during an embed raises RuntimeError("stopped"). That is a stop, not a failure.
+            if str(exc) == "stopped":
+                saved_policy = None
+                policy_path = engine.state_dir() / "policy"
+                if policy_path.is_file():
+                    saved_policy = policy_path.read_text(encoding="utf-8").strip()
+                log.info("stopped")
+                self.session.set_phase("stopped")
+                self.session.set_note(decisions.stop_status_note(saved_policy))
+            else:
+                log.exception("turbo failed")
+                self.session.set_phase("error", str(exc))
+                self.session.set_note(str(exc))
         finally:
             write_shortcut(False)
             self.session.wipe_confirmed = False
@@ -2754,8 +2951,9 @@ class _Window:
         repairing = file_repairing or optimizing
         library_idle = self.rows_ready and not running and not repairing and not deleting
         changes = changes_allowed(self.qdrant_ready)
+        can_delete = delete_allowed(self.qdrant_ready, getattr(self, "collection_missing", False))
         self.start_button.set_sensitive(library_idle and changes)
-        self.delete_button.set_sensitive(library_idle and changes)
+        self.delete_button.set_sensitive(library_idle and can_delete)
         self.rescan_button.set_sensitive(library_idle)
         measuring = bool(self.session.measuring()) if hasattr(self.session, "measuring") else False
         measure_ready = (
@@ -2767,7 +2965,10 @@ class _Window:
         armed = bool(measuring and hasattr(self.session, "measure_then_index") and self.session.measure_then_index())
         self._set_then_index_shown(armed)
         self._gate_tip(self.start_button, self.start_tip)
-        self._gate_tip(self.delete_button, self.delete_tip)
+        if can_delete:
+            self.delete_button.set_tooltip_text(self.delete_tip)
+        else:
+            self.delete_button.set_tooltip_text(TIPS["qdrant_gate"])
         self.stop_button.set_sensitive(running or deleting)
         if hasattr(self, "repair_start"):
             idle_repair = not running and not repairing and not deleting and not self.scanning and changes
@@ -2806,8 +3007,8 @@ class _Window:
         elif frozenset(priorities) != self._shown_priority:
             self._paint_marks(priorities)
         self._shown_priority = frozenset(priorities)
-        running = next((item for item in snap.files if item.state == "running"), None)
-        self._running_source = running.source if running is not None else ""
+        running = [item for item in snap.files if item.state == "running"][:2]
+        self._running_source = running[0].source if running else ""
         self._paint_running(running, priorities, activity)
         self.overall.set_fraction(min(1.0, max(0.0, snap.overall_fraction)))
         self._show(self.overall, snap.overall_text)
@@ -2827,6 +3028,15 @@ class _Window:
         if hasattr(self.session, "view"):
             return self.session.view().get("note") or ""
         return ""
+
+    def _ocr_activity(self) -> str:
+        """Page progress. Falls back to the status line when nothing else is reading."""
+        getter = getattr(self.session, "ocr_activity", None)
+        if callable(getter):
+            text = getter() or ""
+            if text:
+                return text
+        return self._activity()
 
     def _ensure_library(self, book, hide: bool, seen_epoch) -> bool:
         """Rebuild the folder cache when the library membership changes."""
@@ -2866,37 +3076,58 @@ class _Window:
             mark = row_mark(priority=item.source in priorities, indexing=item.state == "running")
             values = (*values[:COL_MARK], mark, *values[COL_MARK + 1 :])
         if item.state == "running":
-            cells = ocr_list_cells(activity)
-            if cells is not None:
-                status, percent = cells
-                values = (*values[:COL_STATUS], status, percent, *values[COL_PROGRESS + 1 :])
+            note = self._ocr_activity()
+            if ocr_note_matches(note, item.name):
+                pace = None
+                observer = getattr(self, "_ocr_pace", None)
+                if observer is not None:
+                    pace = observer.observe(note)
+                values = overlay_ocr_columns(values, note, pace)
         return values
 
-    def _sync_now_row(self, item, priorities, activity: str) -> None:
-        """The file being indexed stays above the folder tree, outside the scroll."""
-        if item is None or item.state != "running":
+    def _sync_now_rows(self, items, priorities, activity: str) -> None:
+        """Files in progress stay above the folder tree, outside the scroll.
+
+        CPU OCR can be reading one file while the GPU indexes another. Both
+        stay here. One file still uses the single row.
+        """
+        if not items:
             if len(self.now_store):
                 self.now_store.clear()
             return
-        values = self._file_values(item, priorities, activity)
-        if len(self.now_store) == 0:
-            self.now_store.append(values)
+        sources = [item.source for item in items]
+        current = [self.now_store[index][COL_SOURCE] for index in range(len(self.now_store))]
+        if current != sources:
+            self.now_store.clear()
+            for item in items:
+                self.now_store.append(self._file_values(item, priorities, activity))
             return
-        self._set_row(self.now_store, self.now_store.get_iter_first(), values)
+        iterator = self.now_store.get_iter_first()
+        for item in items:
+            if iterator is None:
+                break
+            self._set_row(self.now_store, iterator, self._file_values(item, priorities, activity))
+            iterator = self.now_store.iter_next(iterator)
 
-    def _paint_running(self, item, priorities, activity: str) -> None:
-        self._sync_now_row(item, priorities, activity)
-        current = item.source if item is not None and getattr(item, "state", "") == "running" else ""
-        previous = getattr(self, "_tree_indexing", "") or ""
-        if previous and previous != current:
-            self._rewrite_tree_file(previous, priorities, activity)
-        self._tree_indexing = current
-        if item is None:
-            return
-        iterator = self._file_iters.get(item.source)
-        if iterator is None:
-            return
-        self._set_row(self.store, iterator, self._file_values(item, priorities, activity, tree=True))
+    def _paint_running(self, items, priorities, activity: str) -> None:
+        if items is None or getattr(items, "state", None) == "running":
+            items = [items] if items is not None else []
+        self._sync_now_rows(items, priorities, activity)
+        current = [item.source for item in items]
+        previous = list(getattr(self, "_tree_indexing_sources", None) or [])
+        if not previous:
+            one = getattr(self, "_tree_indexing", "") or ""
+            previous = [one] if one else []
+        for source in previous:
+            if source not in current:
+                self._rewrite_tree_file(source, priorities, activity)
+        self._tree_indexing_sources = current
+        self._tree_indexing = current[0] if current else ""
+        for item in items:
+            iterator = self._file_iters.get(item.source)
+            if iterator is None:
+                continue
+            self._set_row(self.store, iterator, self._file_values(item, priorities, activity, tree=True))
 
     def _rewrite_tree_file(self, source: str, priorities, activity: str) -> None:
         """Drop the indexing mark once that file is no longer the one indexing."""
@@ -2915,9 +3146,13 @@ class _Window:
         self._set_row(self.store, iterator, self._file_values(item, priorities, activity, tree=True))
 
     def _paint_marks(self, priorities) -> None:
-        running = getattr(self, "_tree_indexing", "") or ""
+        running = set(getattr(self, "_tree_indexing_sources", None) or [])
+        if not running:
+            one = getattr(self, "_tree_indexing", "") or ""
+            if one:
+                running.add(one)
         for source, iterator in self._file_iters.items():
-            mark = row_mark(priority=source in priorities, indexing=source == running)
+            mark = row_mark(priority=source in priorities, indexing=source in running)
             if self.store.get_value(iterator, COL_MARK) != mark:
                 self.store.set_value(iterator, COL_MARK, mark)
 
@@ -3126,7 +3361,13 @@ class _Window:
     def refresh_usage(self) -> None:
         view = self.session.view()
         running = view["active_slots"] if view["phase"] in ("waiting", "running") else 0
-        text = embed_server_text(running)
+        workers = None
+        getter = getattr(self.session, "ocr_workers", None)
+        if callable(getter):
+            workers = getter()
+        from nomad_turbo.progress import server_status_text
+
+        text = server_status_text(running, workers)
         self._show(self.server_label, text)
         self.server_label.set_tooltip_text(f"{TIPS['usage']} {text}".strip())
         self._apply_tune()
@@ -3139,7 +3380,7 @@ class _Window:
             return
         view = self.session.view()
         running = view["phase"] in ("waiting", "running") and self.thread is not None and self.thread.is_alive()
-        gpu = self.live_gpu
+        gpu = self._index_memory()
         free = None
         if gpu and gpu[1]:
             free = max(0, int(gpu[1]) - int(gpu[2]))
@@ -3534,6 +3775,378 @@ class _Window:
         self.stack.add_titled(page, "repair", "Repair")
         self.repair_page = page
 
+    def _index_memory(self):
+        """The card indexing will use. None when indexing is on the CPU."""
+        from nomad_turbo.devices import pick_index
+
+        devices = getattr(self, "_devices", None)
+        if not devices:
+            return self.live_gpu
+        choice = self.session.index_device() if hasattr(self.session, "index_device") else "auto"
+        device = pick_index(devices, choice)
+        if device.kind != "nvidia":
+            return None
+        return (device.index, device.total_mib, device.used_mib)
+
+    def _build_settings_page(self) -> None:
+        """CPU or a card for indexing, and CPU or a card for OCR."""
+        from nomad_turbo.devices import list_devices, normalize_device_choice
+
+        gtk = self.gtk
+        page = gtk.Box(orientation=gtk.Orientation.VERTICAL, spacing=8)
+        page.set_vexpand(True)
+        scroll = gtk.ScrolledWindow()
+        scroll.set_policy(gtk.PolicyType.NEVER, gtk.PolicyType.AUTOMATIC)
+        inner = gtk.Box(orientation=gtk.Orientation.VERTICAL, spacing=12)
+        inner.set_margin_top(4)
+        inner.set_margin_bottom(8)
+        heading = gtk.Label()
+        heading.set_markup("<span size='large' weight='bold'>Settings</span>")
+        heading.set_xalign(0)
+        inner.pack_start(heading, False, False, 0)
+
+        self._devices = list_devices()
+        self._ocr_probe = {}
+        self._device_guard = False
+        self._device_touched = False
+        self.session.set_index_device(normalize_device_choice(getattr(self.install, "index_device", "auto")))
+        self.session.set_ocr_device(normalize_device_choice(getattr(self.install, "ocr_device", "auto")))
+
+        self.index_cpu = gtk.ToggleButton(label="CPU")
+        self.index_gpu = gtk.ToggleButton(label="GPU")
+        self.ocr_cpu = gtk.ToggleButton(label="CPU")
+        self.ocr_gpu = gtk.ToggleButton(label="GPU")
+        for button, tip in (
+            (self.index_cpu, TIPS["settings_index"]),
+            (self.index_gpu, TIPS["settings_index"]),
+            (self.ocr_cpu, TIPS["settings_ocr"]),
+            (self.ocr_gpu, TIPS["settings_ocr"]),
+        ):
+            button.set_tooltip_text(tip)
+        self.index_combo = gtk.ComboBoxText()
+        self.index_combo.set_tooltip_text(TIPS["settings_index"])
+        self.ocr_combo = gtk.ComboBoxText()
+        self.ocr_combo.set_tooltip_text(TIPS["settings_ocr"])
+        nvidia = [device for device in self._devices if device.kind == "nvidia"]
+        cards = [device for device in self._devices if device.kind != "cpu"]
+        for device in nvidia:
+            self.index_combo.append(device.id, device.name)
+        for device in cards:
+            self.ocr_combo.append(device.id, device.name)
+        if not nvidia:
+            self.index_gpu.set_sensitive(False)
+        # An NVIDIA card stays locked until its reader is installed and checked.
+        # Another card can still be chosen; the sentence says when it falls back.
+        if not cards or nvidia:
+            self.ocr_gpu.set_sensitive(False)
+
+        self.ocr_install = gtk.Button(label="Install GPU reader")
+        self.ocr_install.set_tooltip_text(TIPS["settings_install"])
+        self.ocr_install.set_sensitive(False)
+        self.ocr_install.connect("clicked", self.on_ocr_install)
+        self.ocr_install_bar = gtk.ProgressBar()
+        self.ocr_install_bar.set_show_text(False)
+        self.ocr_install_bar.set_hexpand(True)
+        self.ocr_install_note = gtk.Label(label="Checking the GPU reader…")
+        self.ocr_install_note.set_xalign(0)
+        self.ocr_install_note.set_line_wrap(True)
+        self.ocr_install_note.set_max_width_chars(80)
+        self.ocr_install_note.set_selectable(True)
+        self.ocr_install_note.set_tooltip_text(TIPS["settings_install"])
+        install_row = gtk.Box(orientation=gtk.Orientation.HORIZONTAL, spacing=8)
+        install_row.pack_start(self.ocr_install, False, False, 0)
+        install_row.pack_start(self.ocr_install_bar, True, True, 0)
+        self.ocr_install_row = gtk.Box(orientation=gtk.Orientation.VERTICAL, spacing=4)
+        self.ocr_install_row.pack_start(install_row, False, False, 0)
+        self.ocr_install_row.pack_start(self.ocr_install_note, False, False, 0)
+        self.ocr_install_bar.hide()
+        self._ocr_installing = False
+        self._ocr_install_stop = threading.Event()
+        self._ocr_pulse = None
+        if not nvidia:
+            self.ocr_install_row.hide()
+
+        self.device_sentence = gtk.Label(label="")
+        self.device_sentence.set_xalign(0)
+        self.device_sentence.set_line_wrap(True)
+        self.device_sentence.set_max_width_chars(80)
+        self.device_sentence.set_selectable(True)
+        self.device_sentence.set_tooltip_text(TIPS["settings_engine"])
+
+        inner.pack_start(self._device_block("Indexing", TIPS["settings_index"], self.index_cpu, self.index_gpu, self.index_combo), False, False, 0)
+        inner.pack_start(self._device_block("OCR", TIPS["settings_ocr"], self.ocr_cpu, self.ocr_gpu, self.ocr_combo), False, False, 0)
+        inner.pack_start(self.ocr_install_row, False, False, 0)
+        inner.pack_start(self.device_sentence, False, False, 0)
+        scroll.add(inner)
+        page.pack_start(scroll, True, True, 0)
+        self.stack.add_titled(page, "settings", "Settings")
+        self.settings_page = page
+        self._paint_devices()
+        self.index_cpu.connect("toggled", self.on_device_mode, "index", "cpu")
+        self.index_gpu.connect("toggled", self.on_device_mode, "index", "gpu")
+        self.ocr_cpu.connect("toggled", self.on_device_mode, "ocr", "cpu")
+        self.ocr_gpu.connect("toggled", self.on_device_mode, "ocr", "gpu")
+        self.index_combo.connect("changed", self.on_device_card, "index")
+        self.ocr_combo.connect("changed", self.on_device_card, "ocr")
+        threading.Thread(target=self._load_ocr_probe, name="nomad-turbo-ocr-probe", daemon=True).start()
+
+    def _device_block(self, title, tip, cpu, gpu, combo):
+        gtk = self.gtk
+        block = gtk.Box(orientation=gtk.Orientation.VERTICAL, spacing=4)
+        caption = gtk.Label(label=title)
+        caption.set_xalign(0)
+        caption.set_tooltip_text(tip)
+        line = gtk.Box(orientation=gtk.Orientation.HORIZONTAL, spacing=8)
+        card = gtk.Label(label="Card")
+        card.set_tooltip_text(tip)
+        line.pack_start(self._linked(cpu, gpu), False, False, 0)
+        line.pack_start(card, False, False, 0)
+        line.pack_start(combo, False, False, 0)
+        block.pack_start(caption, False, False, 0)
+        block.pack_start(line, False, False, 0)
+        return block
+
+    def _paint_devices(self) -> None:
+        from nomad_turbo.devices import assignment_sentence, resolve_assignment
+
+        if getattr(self, "_device_guard", False):
+            return
+        self._device_guard = True
+        try:
+            assignment = resolve_assignment(
+                self._devices,
+                self.session.index_device(),
+                self.session.ocr_device(),
+                getattr(self, "_ocr_probe", {}) or {},
+            )
+            index_gpu = assignment.index.kind == "nvidia" and self.index_gpu.get_sensitive()
+            self.index_cpu.set_active(not index_gpu)
+            self.index_gpu.set_active(index_gpu)
+            if assignment.index.kind == "nvidia":
+                self.index_combo.set_active_id(assignment.index.id)
+            elif self.index_combo.get_active() < 0:
+                self.index_combo.set_active(0)
+            self.index_combo.set_sensitive(bool(index_gpu))
+            ocr_choice = self.session.ocr_device()
+            if ocr_choice == "cpu" or not self.ocr_gpu.get_sensitive():
+                ocr_gpu = False
+            elif ocr_choice == "auto":
+                ocr_gpu = assignment.ocr.kind != "cpu"
+            else:
+                ocr_gpu = True
+            self.ocr_cpu.set_active(not ocr_gpu)
+            self.ocr_gpu.set_active(ocr_gpu)
+            if ocr_choice.startswith(("nvidia:", "amd:", "intel:")):
+                self.ocr_combo.set_active_id(ocr_choice)
+            elif assignment.ocr.kind != "cpu":
+                self.ocr_combo.set_active_id(assignment.ocr.id)
+            elif self.ocr_combo.get_active() < 0:
+                self.ocr_combo.set_active(0)
+            self.ocr_combo.set_sensitive(bool(ocr_gpu))
+            self.device_sentence.set_text(assignment_sentence(assignment))
+        finally:
+            self._device_guard = False
+
+    def _save_devices(self) -> None:
+        self.install.index_device = self.session.index_device()
+        self.install.ocr_device = self.session.ocr_device()
+        try:
+            save_install(self.install)
+        except Exception:
+            log.exception("could not save the device settings")
+
+    def on_device_mode(self, button, which: str, kind: str) -> None:
+        """CPU or GPU. The last one stays on. GPU uses the card in the list."""
+        if getattr(self, "_device_guard", False):
+            return
+        cpu = self.index_cpu if which == "index" else self.ocr_cpu
+        gpu = self.index_gpu if which == "index" else self.ocr_gpu
+        combo = self.index_combo if which == "index" else self.ocr_combo
+        if not button.get_active():
+            if not cpu.get_active() and not gpu.get_active():
+                self._device_guard = True
+                button.set_active(True)
+                self._device_guard = False
+            return
+        self._device_touched = True
+        self._device_guard = True
+        try:
+            cpu.set_active(kind == "cpu")
+            gpu.set_active(kind == "gpu" and gpu.get_sensitive())
+            if kind == "gpu" and gpu.get_sensitive():
+                if combo.get_active() < 0:
+                    combo.set_active(0)
+                chosen = combo.get_active_id() or "cpu"
+            else:
+                chosen = "cpu"
+            if which == "index":
+                self.session.set_index_device(chosen)
+            else:
+                self.session.set_ocr_device(chosen)
+        finally:
+            self._device_guard = False
+        self._paint_devices()
+        self._save_devices()
+
+    def on_device_card(self, combo, which: str) -> None:
+        if getattr(self, "_device_guard", False):
+            return
+        gpu = self.index_gpu if which == "index" else self.ocr_gpu
+        if not gpu.get_active():
+            return
+        chosen = combo.get_active_id()
+        if not chosen:
+            return
+        self._device_touched = True
+        if which == "index":
+            self.session.set_index_device(chosen)
+        else:
+            self.session.set_ocr_device(chosen)
+        self._paint_devices()
+        self._save_devices()
+
+    def on_ocr_install(self, *_args) -> None:
+        if self._ocr_installing:
+            self._ocr_install_stop.set()
+            self.ocr_install.set_sensitive(False)
+            self.ocr_install_note.set_text("Stopping the download.")
+            return
+        gtk = self.gtk
+        dialog = gtk.MessageDialog(
+            parent=self.window,
+            flags=0,
+            message_type=gtk.MessageType.QUESTION,
+            buttons=gtk.ButtonsType.NONE,
+            text="Install the GPU reader?",
+        )
+        dialog.format_secondary_text(
+            "This downloads PyTorch and EasyOCR into your home folder. "
+            "The download is a few gigabytes and needs a network connection. "
+            "GPU OCR turns on when the install finishes and a small check on the card succeeds. "
+            "The English models download the first time a page is read."
+        )
+        dialog.add_button("Cancel", gtk.ResponseType.CANCEL)
+        dialog.add_button("Install", gtk.ResponseType.OK)
+        dialog.show_all()
+        response = dialog.run()
+        dialog.destroy()
+        if response != gtk.ResponseType.OK:
+            return
+        self._ocr_installing = True
+        self._ocr_install_stop = threading.Event()
+        self.ocr_install.set_label("Cancel")
+        self.ocr_gpu.set_sensitive(False)
+        self.ocr_install_bar.show()
+        self.ocr_install_note.set_text("Starting the download.")
+        self._paint_devices()
+        if self._ocr_pulse:
+            self.glib.source_remove(self._ocr_pulse)
+        self._ocr_pulse = self.glib.timeout_add(120, self._pulse_ocr_install)
+        threading.Thread(target=self._install_ocr_reader, name="nomad-turbo-ocr-install", daemon=True).start()
+
+    def _pulse_ocr_install(self) -> bool:
+        if not self._ocr_installing:
+            self._ocr_pulse = None
+            return False
+        self.ocr_install_bar.pulse()
+        return True
+
+    def _show_ocr_install_line(self, text: str) -> bool:
+        if text:
+            self.ocr_install_note.set_text(text)
+        return False
+
+    def _install_ocr_reader(self) -> None:
+        from nomad_turbo.ocr_engine import probe_info, probe_map
+        from nomad_turbo.ocr_setup import install_gpu_reader
+
+        error = install_gpu_reader(lambda text: self.glib.idle_add(self._show_ocr_install_line, text), self._ocr_install_stop)
+        probes = {}
+        if not error and not self._ocr_install_stop.is_set():
+            try:
+                probe_info(force=True)
+                probes = probe_map(self._devices)
+            except Exception as exc:
+                log.exception("could not check the GPU OCR runtime")
+                error = str(exc)
+        self.glib.idle_add(self._finish_ocr_install, error, probes)
+
+    def _finish_ocr_install(self, error: str, probes: dict) -> bool:
+        from nomad_turbo.ocr_setup import reader_ready
+
+        self._ocr_installing = False
+        if self._ocr_pulse:
+            self.glib.source_remove(self._ocr_pulse)
+            self._ocr_pulse = None
+        self.ocr_install_bar.hide()
+        if probes:
+            self._ocr_probe = probes
+        ready = reader_ready(self._devices, self._ocr_probe)
+        self._apply_ocr_lock(ready)
+        self.ocr_install.set_label("Install GPU reader")
+        if error:
+            self.ocr_install_note.set_text(error)
+            self.ocr_install.set_sensitive(True)
+            self.ocr_install.show()
+        elif ready:
+            self.ocr_install_note.set_text("GPU reader installed. Choose GPU to use it on the next file.")
+            self.ocr_install.hide()
+        else:
+            self.ocr_install_note.set_text("The download finished, but the card could not run the reader.")
+            self.ocr_install.set_sensitive(True)
+            self.ocr_install.show()
+        return False
+
+    def _apply_ocr_lock(self, ready: bool) -> None:
+        nvidia = any(device.kind == "nvidia" for device in self._devices)
+        cards = any(device.kind != "cpu" for device in self._devices)
+        if ready or not nvidia:
+            self.ocr_gpu.set_sensitive(bool(cards))
+        else:
+            self.ocr_gpu.set_sensitive(False)
+        self._paint_devices()
+
+    def _load_ocr_probe(self) -> None:
+        from nomad_turbo.ocr_engine import ocr_python, probe_info, probe_map
+
+        if not any(device.kind == "nvidia" for device in self._devices):
+            return
+        if not ocr_python():
+            self.glib.idle_add(self._finish_ocr_probe, {}, "")
+            return
+        try:
+            probe_info(force=True)
+            probes = probe_map(self._devices)
+            error = ""
+        except Exception as exc:
+            log.exception("could not check the GPU OCR runtime")
+            probes = {}
+            error = str(exc)
+        self.glib.idle_add(self._finish_ocr_probe, probes, error)
+
+    def _finish_ocr_probe(self, probes: dict, error: str) -> bool:
+        from nomad_turbo.ocr_setup import reader_ready
+
+        if self._ocr_installing:
+            return False
+        if probes:
+            self._ocr_probe = probes
+        ready = reader_ready(self._devices, self._ocr_probe)
+        self._apply_ocr_lock(ready)
+        if error:
+            self.ocr_install_note.set_text(error)
+            self.ocr_install.set_sensitive(True)
+            self.ocr_install.show()
+        elif ready:
+            self.ocr_install_note.set_text("GPU reader installed. Choose GPU to use it on the next file.")
+            self.ocr_install.hide()
+        else:
+            self.ocr_install_note.set_text("GPU reader is not installed.")
+            self.ocr_install.set_label("Install GPU reader")
+            self.ocr_install.set_sensitive(True)
+            self.ocr_install.show()
+        return False
+
     def _build_about_page(self) -> None:
         gtk = self.gtk
         facts = about_facts()
@@ -3733,18 +4346,11 @@ class _Window:
     def _repair_scan(self, mode: str) -> None:
         import importlib
 
-        import nomad_turbo.decisions as decisions
-        import nomad_turbo.engine as engine
         import nomad_turbo.repair as repair
-        import nomad_turbo.runtime as runtime
-        import nomad_turbo.store as store
 
         # Scan does not pause NOMAD. The desktop icon does not change.
         try:
-            importlib.reload(decisions)
-            importlib.reload(store)
-            importlib.reload(runtime)
-            importlib.reload(engine)
+            self._reload_indexer()
             importlib.reload(repair)
             board = repair.RepairBoard()
             self.repair_board = board
@@ -3779,18 +4385,11 @@ class _Window:
     def _repair(self, mode: str) -> None:
         import importlib
 
-        import nomad_turbo.decisions as decisions
-        import nomad_turbo.engine as engine
         import nomad_turbo.repair as repair
-        import nomad_turbo.runtime as runtime
-        import nomad_turbo.store as store
 
         # The desktop icon does not change. Stop is in this window and the tray.
         try:
-            importlib.reload(decisions)
-            importlib.reload(store)
-            importlib.reload(runtime)
-            importlib.reload(engine)
+            self._reload_indexer()
             importlib.reload(repair)
             board = repair.RepairBoard()
             self.repair_board = board

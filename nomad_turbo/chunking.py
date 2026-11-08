@@ -1,9 +1,10 @@
 """Chunk text the way stock NOMAD embeds it, without cutting a page short.
 
 Stock uses 1500 estimated tokens, 2 characters per token, and 150 tokens of
-overlap, then embeds `search_document: ` plus the chunk. The stored payload
-text does not include that prefix. Queries stay on `search_query: ` inside
-NOMAD. A different embedding model is not used.
+overlap, then embeds `search_document: ` plus the chunk. The caller may put
+a title line in that prefix. The stored payload text does not include the
+prefix or that line. Queries stay on `search_query: ` inside NOMAD. A
+different embedding model is not used.
 
 Turbo keeps the meat of a long page and splits it into those chunks. It does
 not drop the rest of a book, law, or other long page to save a call.
@@ -105,8 +106,8 @@ def split_chunks(text: str) -> list[str]:
 def embed_input(chunk: str, prefix: str = DOCUMENT_PREFIX) -> tuple[str, str]:
     """Return (prefixed model input, payload text without the prefix).
 
-    The model sees `search_document: ` plus the chunk, which is the stock
-    NOMAD document prefix. The text stored in Qdrant omits that prefix.
+    The model sees `search_document: ` plus the chunk. The prefix may also
+    carry a title line. The text stored in Qdrant omits that prefix.
     NOMAD queries with `search_query: ` through its own Ollama. Turbo does
     not change either prefix.
     """
@@ -178,8 +179,19 @@ def fit_embed_inputs(
     return _fit_payload(payload, prefix, limit, 0)
 
 
+def _over_budget(payload: str, prefix: str, limit: int) -> bool:
+    """True when the embedder would see too much, or would clip the stored text.
+
+    The high guess keeps dense text inside the server window. The character
+    guess is the same check that clips a chunk, so a title line splits the
+    section instead of dropping the end of it.
+    """
+    whole = prefix + payload
+    return token_upper_bound(whole) > limit or estimate_tokens(whole) > MAX_SAFE_TOKENS
+
+
 def _fit_payload(payload: str, prefix: str, limit: int, depth: int) -> list[tuple[str, str]]:
-    if token_upper_bound(prefix + payload) <= limit or len(payload) <= MIN_FIT_CHARS or depth >= 12:
+    if not _over_budget(payload, prefix, limit) or len(payload) <= MIN_FIT_CHARS or depth >= 12:
         prefixed, fitted = embed_input(payload, prefix)
         if not fitted:
             return []

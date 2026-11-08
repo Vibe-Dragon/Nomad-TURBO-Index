@@ -36,14 +36,22 @@ from nomad_turbo.catalog import origin_for, wipe_allowed
 from nomad_turbo.desktop import write_shortcut
 from nomad_turbo.discover import Install, load_install, state_dir
 from nomad_turbo.packing import ArticleFeed, PreparedArticle, prepare_article
-from nomad_turbo.progress import ocr_note, ocr_page
+from nomad_turbo.passes import (
+    ArticlePrints,
+    article_plain,
+    library_ledger,
+    pass_label,
+    reset_library_ledger,
+    sections_from_article,
+)
+from nomad_turbo.progress import ocr_note, ocr_page, ocr_status_level, remember_ocr_workers
 from nomad_turbo.plain import read_text
 from nomad_turbo.pool import EmbedPool
 from nomad_turbo.runtime import (
     active_embeds,
     ChunkRejected,
+    container_ocr_env,
     embed,
-    gpu_rows,
     host_to_container,
     list_jobs,
     queue_is_paused,
@@ -69,7 +77,7 @@ from nomad_turbo.schedule import (
     pick_next,
 )
 from nomad_turbo.session import Session
-from nomad_turbo.slots import install_embed_chunks, pick_gpu, safe_call_chunks
+from nomad_turbo.slots import install_embed_chunks, safe_call_chunks
 from nomad_turbo.tune import content_kind
 from nomad_turbo.store import (
     clear_ingest_rows,
@@ -420,6 +428,15 @@ class FileWork:
     bad: int = 0
     # Copied onto every point. False only when the ingest row turned the file off.
     point_active: bool = True
+    # html, text, or ocr. A checkpoint without it is still the HTML walk.
+    zim_pass: str = "html"
+    pass_done: int = 0
+    pass_total: int | None = None
+    label: str = ""
+    phase: str = "html"
+    # PDFs from this ZIM that are still in the OCR queue, and ones already stored.
+    ocr_pending: list[str] = field(default_factory=list)
+    ocr_done: list[str] = field(default_factory=list)
 
 
 def _checkpoint_file(source: str) -> Path:
@@ -448,9 +465,140 @@ def _write_checkpoint(work: FileWork) -> None:
                 "done": work.done,
                 "jobs": work.jobs,
                 "total_articles": work.total_articles,
+                "pass": getattr(work, "zim_pass", None) or "html",
+                "ocr_pending": list(getattr(work, "ocr_pending", []) or []),
+                "ocr_done": list(getattr(work, "ocr_done", []) or []),
             }
         )
     )
+
+
+def _ocr_tally_note(total: int) -> str:
+    """Status line while a ZIM walk is still finding files that need OCR."""
+    count = max(0, int(total))
+    if count == 1:
+        return "Indexing. 1 file in this ZIM is waiting for OCR."
+    return f"Indexing. {count} files in this ZIM are waiting for OCR."
+
+
+def _clear_zim_ocr_ahead(spill_id: str) -> None:
+    """Drop OCR text read during a ZIM walk once that ZIM is stored."""
+    if not spill_id:
+        return
+    folder = state_dir() / "ocr-ahead" / spill_id
+    if not folder.is_dir():
+        return
+    import shutil
+
+    shutil.rmtree(folder, ignore_errors=True)
+
+
+def _spill_paths(source: str) -> dict[str, Path]:
+    """On-disk lists for the text pass and the OCR pass. The id matches the checkpoint."""
+    import hashlib
+
+    folder = state_dir() / "spill"
+    folder.mkdir(parents=True, exist_ok=True)
+    spill_id = hashlib.sha256(source.encode()).hexdigest()[:16]
+    return {
+        "id": spill_id,
+        "text": folder / f"{spill_id}-text.jsonl",
+        "ocr": folder / f"{spill_id}-ocr.jsonl",
+        "prints": folder / f"{spill_id}.prints",
+        "go": folder / f"{spill_id}.go",
+    }
+
+
+def _extract_resume(work: FileWork) -> tuple[str | None, str | None, str]:
+    """HTML after-path, later-pass resume path, and the pass name.
+
+    A text or OCR resume does not walk the HTML again. The saved path is the
+    last entry committed in that pass. A path from the HTML walk is not in
+    the later list, and the reader starts that pass at the beginning.
+    """
+    name = getattr(work, "zim_pass", None) or "html"
+    if name == "queued":
+        return None, None, "queued"
+    if name not in ("html", "text", "ocr"):
+        name = "html"
+    if name in ("text", "ocr"):
+        return None, work.path, name
+    return work.path, None, name
+
+
+def _ocr_quality(session: Session | None, install: Install) -> str:
+    from nomad_turbo.passes import normalize_ocr_quality
+
+    getter = getattr(session, "ocr_quality", None) if session is not None else None
+    if callable(getter):
+        return normalize_ocr_quality(getter())
+    return normalize_ocr_quality(getattr(install, "ocr_quality", "medium"))
+
+
+def _ocr_assignment(session: Session | None, install: Install):
+    from nomad_turbo.devices import assignment_sentence, list_devices, resolve_assignment, saved_choice
+    from nomad_turbo.ocr_budget import set_runtime
+    from nomad_turbo.ocr_engine import ocr_python, probe_map
+
+    devices = list_devices()
+    ocr_choice = saved_choice(session, install, "ocr_device")
+    probes = probe_map(devices) if ocr_choice != "cpu" and ocr_python() else {}
+    assignment = resolve_assignment(
+        devices,
+        saved_choice(session, install, "index_device"),
+        ocr_choice,
+        probes,
+    )
+    set_runtime(share=assignment.share, index_cpu=assignment.index.kind == "cpu", cpus=os_cpu())
+    told = getattr(_ocr_assignment, "told", "")
+    sentence = assignment_sentence(assignment)
+    if sentence != told:
+        _ocr_assignment.told = sentence
+        log.info("%s", sentence)
+    return assignment
+
+
+def _ocr_container(session: Session | None, install: Install, *, wait: bool) -> dict[str, str]:
+    """Budget is always published. The GPU socket is set only when that reader is up, or will be."""
+    from nomad_turbo.devices import reader_label
+    from nomad_turbo.ocr_engine import gpu_ocr
+
+    assignment = _ocr_assignment(session, install)
+    socket = False
+    if assignment.uses_gpu_ocr:
+        if wait:
+            socket = gpu_ocr.ensure(assignment)
+            if not socket:
+                log.warning("GPU OCR did not start. This file uses the CPU reader.")
+        else:
+            gpu_ocr.plan(assignment)
+            socket = True
+    if socket:
+        return container_ocr_env(
+            socket=True,
+            device=assignment.ocr.name,
+            reader=reader_label(assignment.backend.name),
+        )
+    return container_ocr_env(socket=False, device="CPU", reader="Tesseract")
+
+
+def _release_ocr(work: FileWork) -> None:
+    """Hand the article prints to the OCR pass, then let it draw.
+
+    A GPU reader is loaded here, after HTML is fingerprinted and before the
+    first page is drawn. The same device waits inside the CPU budget.
+    """
+    from nomad_turbo.ocr_engine import gpu_ocr
+
+    paths = getattr(work, "spill", None) or _spill_paths(work.source)
+    prints = getattr(work, "prints", None) or ArticlePrints()
+    prints.merge_file(paths["prints"])
+    prints.write(paths["prints"])
+    work.prints = prints
+    planned = gpu_ocr.planned()
+    if planned is not None and not gpu_ocr.ensure(planned):
+        log.warning("GPU OCR did not start. This file uses the CPU reader.")
+    paths["go"].write_text("go\n", encoding="utf-8")
 
 
 def _wants_control(session: Session | None, install: Install) -> bool:
@@ -655,6 +803,10 @@ def _watch_library(install: Install, session: Session | None, stop: threading.Ev
             _keep_nomad_quiet(install, stop)
         except Exception:
             log.exception("library scan failed")
+        try:
+            _collection_logbook().watch_collection_logs(state_dir(), install)
+        except Exception:
+            log.exception("could not check log files against the knowledge index")
         if stop.wait(SCAN_SECONDS):
             return
 
@@ -666,7 +818,64 @@ def _open_state(work: FileWork) -> str:
     return "pending"
 
 
+def _drop_priority(session: Session | None, source: str) -> None:
+    """A finished file does not keep its priority mark."""
+    if session is None or not source:
+        return
+    setter = getattr(session, "set_priority", None)
+    if callable(setter):
+        setter(source, False)
+    stats = session.file_stats() if hasattr(session, "file_stats") else None
+    if stats is None or not hasattr(stats, "set_priority"):
+        return
+    stats.set_priority(source, False)
+    saver = getattr(stats, "save", None)
+    if not callable(saver):
+        return
+    try:
+        saver()
+    except Exception:
+        log.exception("could not save the priority for %s", source)
+
+
+def _clear_saved_priorities(session: Session | None) -> None:
+    """Drop every priority mark. The index they pointed at is gone."""
+    from nomad_turbo.file_stats import STATS_NAME, FileStats
+
+    stats = None
+    if session is not None and hasattr(session, "file_stats"):
+        getter = session.file_stats
+        stats = getter() if callable(getter) else None
+    if stats is None:
+        stats = FileStats(state_dir() / STATS_NAME)
+        loader = getattr(stats, "load", None)
+        if callable(loader):
+            loader()
+    sources = list(stats.priorities()) if hasattr(stats, "priorities") else []
+    clearer = getattr(stats, "clear_priorities", None)
+    if callable(clearer):
+        clearer()
+    else:
+        for source in sources:
+            stats.set_priority(source, False)
+    saver = getattr(stats, "save", None)
+    if callable(saver):
+        saver()
+    if session is None:
+        return
+    session_clear = getattr(session, "clear_priorities", None)
+    if callable(session_clear):
+        session_clear()
+        return
+    setter = getattr(session, "set_priority", None)
+    if callable(setter):
+        for source in sources:
+            setter(source, False)
+
+
 def _report(session: Session | None, work: FileWork, state: str) -> None:
+    if state == "indexed":
+        _drop_priority(session, work.source)
     if session is None:
         return
     book = session.get_book()
@@ -678,7 +887,26 @@ def _report(session: Session | None, work: FileWork, state: str) -> None:
         total=work.total_articles,
         chunks=work.chunks,
         state=state,
+        label=getattr(work, "label", "") or "",
+        pass_done=int(getattr(work, "pass_done", 0) or 0),
+        pass_total=getattr(work, "pass_total", None),
     )
+
+
+def _collection_logbook():
+    """The logbook module. Reload once when this process still has the old copy.
+
+    A window opened before clear_collection_logs existed keeps that old module
+    in memory. Importing the name from it fails after the collection is
+    already gone.
+    """
+    import importlib
+
+    import nomad_turbo.logbook as logbook
+
+    if not hasattr(logbook, "clear_collection_logs"):
+        importlib.reload(logbook)
+    return logbook
 
 
 def wipe_knowledge_index(install: Install) -> None:
@@ -688,16 +916,18 @@ def wipe_knowledge_index(install: Install) -> None:
     """
     if not offsets_are_safe(active_embeds(install)):
         raise RuntimeError("refusing to delete the index while an embed job is active")
-    log.warning("deleting the knowledge index. Library files are kept.")
     queuectl(install, "clear")
     delete_collection(install)
+    clear_collection_logs = _collection_logbook().clear_collection_logs
+    clear_collection_logs(state_dir())
     collection_ready(install)
     clear_ingest_rows(install)
     folder = state_dir() / "checkpoints"
     if folder.is_dir():
         for path in folder.glob("*.json"):
             path.unlink()
-    log.warning("knowledge index deleted.")
+    reset_library_ledger()
+    log.warning("knowledge index deleted. Library files are kept.")
 
 
 def delete_index_only(stop: threading.Event, session: Session | None = None) -> None:
@@ -741,6 +971,7 @@ def delete_index_only(stop: threading.Event, session: Session | None = None) -> 
         if session:
             session.set_note("Deleting the knowledge index.")
         wipe_knowledge_index(install)
+        _clear_saved_priorities(session)
         if session and session.get_book():
             session.get_book().mark_all_unindexed()
         if session:
@@ -929,6 +1160,11 @@ def _work_list(
         if checkpoint and int(checkpoint.get("articles") or 0) >= articles and checkpoint.get("path"):
             resume_path = checkpoint["path"]
             articles = int(checkpoint["articles"])
+        zim_pass = str((checkpoint or {}).get("pass") or "html")
+        if zim_pass not in ("html", "text", "ocr", "queued"):
+            zim_pass = "ocr" if zim_pass == "done" else "html"
+        ocr_pending = [str(path) for path in ((checkpoint or {}).get("ocr_pending") or []) if path]
+        ocr_done = [str(path) for path in ((checkpoint or {}).get("ocr_done") or []) if path]
         total = None
         chunks = int((checkpoint or {}).get("chunks") or 0)
         for _job_id, _offset, data in entries:
@@ -947,6 +1183,9 @@ def _work_list(
                 jobs=[(job_id, offset) for job_id, offset, _data in entries],
                 total_articles=total,
                 mtime=mtime,
+                zim_pass=zim_pass,
+                ocr_pending=ocr_pending,
+                ocr_done=ocr_done,
             )
         )
     return work
@@ -1024,6 +1263,8 @@ def _commit_article(work: FileWork, seen: set[str], session: Session | None, art
     work.articles = int(article["index"])
     work.path = article.get("path")
     work.touched = True
+    if getattr(work, "pass_total", None):
+        work.pass_done = int(getattr(work, "pass_done", 0) or 0) + 1
     path = article.get("path")
     if path:
         seen.add(path)
@@ -1069,6 +1310,10 @@ def _store_ready(
         if stop is not None and not _wait_to_write(install, stop, session):
             raise RuntimeError("stopped")
         upsert(install, flat)
+        ledger = getattr(work, "ledger", None)
+        if ledger is not None:
+            for point in flat:
+                ledger.remember(str((point.get("payload") or {}).get("text") or ""))
     for prepared, points in staged:
         _count_article(work, session, prepared, len(points))
         _commit_article(work, seen, session, prepared.article, len(points))
@@ -1102,15 +1347,44 @@ def _prepare_article(install: Install, work: FileWork, article: dict, seen: set[
             section_for_input=[],
             already_stored=True,
         )
+    article = dict(article)
+    drop_short = getattr(work, "kind", "") == "zim"
+    sections = sections_from_article(article, drop_short_image=drop_short)
+    article["sections"] = sections
+    if article.get("kind") == "image" and drop_short and not sections and not article.get("skip"):
+        article["skip"] = "photo" if str(article.get("ocr") or "").strip() else "empty"
+    if not sections and not article.get("skip"):
+        article["skip"] = "empty"
+    plain = ""
+    prints = getattr(work, "prints", None)
+    if not article.get("skip"):
+        plain = article_plain(article)
+        # HTML is first and is not compared with itself. A later copy is.
+        if prints is not None and getattr(work, "phase", "html") != "html" and prints.duplicate(plain):
+            article["skip"] = "duplicate"
+            article["sections"] = []
+            article["text"] = ""
+            plain = ""
+    if article.get("skip"):
+        article["sections"] = []
+        article["text"] = ""
+    ledger = getattr(work, "ledger", None)
+
+    def _keep(payload: str) -> bool:
+        return not ledger.seen(payload)
+
     prepared = prepare_article(
         article,
         work.source,
         article.get("_archive") or {},
         str(uuid.uuid4()),
         install.document_prefix or DOCUMENT_PREFIX,
+        keep_chunk=_keep if ledger is not None else None,
     )
     for section in prepared.sections:
         section.meta["active"] = work.point_active
+    if prints is not None and not article.get("skip") and plain:
+        prints.keep(plain)
     return prepared
 
 
@@ -1182,6 +1456,9 @@ def _index_zim(
     session: Session | None,
     retire: threading.Event | None = None,
     switch_check=None,
+    on_idle=None,
+    on_enqueue=None,
+    on_body_done=None,
 ) -> None:
     _load_point_active(install, work)
     already = count_source(install, work.source)
@@ -1189,23 +1466,68 @@ def _index_zim(
     if already is not None and already <= _PATH_LIST_LIMIT:
         paths = existing_paths(install, work.source)
     stored = paths or set()
+    after_path, resume_path, zim_pass = _extract_resume(work)
+    work.zim_pass = zim_pass
+    spill = _spill_paths(work.source)
+    work.spill = spill
+    if zim_pass == "html" and not after_path:
+        spill["go"].unlink(missing_ok=True)
+        spill["prints"].unlink(missing_ok=True)
+    prints = ArticlePrints()
+    prints.merge_file(spill["prints"])
+    prints.bind(spill["prints"])
+    work.prints = prints
+    work.ledger = library_ledger()
+    if zim_pass in ("text", "ocr"):
+        work.phase = zim_pass
+        work.label = pass_label(zim_pass)
+    else:
+        work.phase = "html"
+        work.label = "HTML"
     log.info("%s", resume_log(work.source, work.articles, already, paths))
     _report(session, work, "running")
+    ocr_ahead = False
+    if zim_pass == "html":
+        try:
+            from nomad_turbo.overlap import cpu_ocr_overlaps_gpu
+
+            ocr_ahead = cpu_ocr_overlaps_gpu(_ocr_assignment(session, install))
+        except Exception:
+            log.exception("could not see where OCR will run")
+            ocr_ahead = False
+    if ocr_ahead:
+        log.info("PDFs found in this ZIM go to the front of the OCR queue while its pages are indexed.")
     proc = start_extract(
         install,
         str(work.host),
-        0 if work.path else work.articles,
-        work.path,
+        0 if after_path else work.articles,
+        after_path,
         work.articles,
+        quality=_ocr_quality(session, install),
+        spill_id=spill["id"],
+        zim_pass=zim_pass,
+        resume_path=resume_path,
+        ocr_env=_ocr_container(session, install, wait=False),
+        ocr_ahead=ocr_ahead and on_enqueue is None,
+        ocr_queue=on_enqueue is not None,
     )
     assert proc.stdout is not None
     assert proc.stderr is not None
 
     def _drain() -> None:
+        name = work.host.name
         for line in proc.stderr:
             text = line.strip()
-            if text:
-                log.info("extract: %s", text[:300])
+            if not text:
+                continue
+            if text.startswith("ocr ") or text.startswith("pdf text layer"):
+                log.log(ocr_status_level(text), "extract: %s", text[:300])
+                remember_ocr_workers(session, text)
+                found = ocr_page(text)
+                if found and getattr(work, "phase", "") == "ocr" and session is not None:
+                    session.set_note(ocr_note(name, found[0], found[1]))
+                continue
+            log.info("extract: %s", text[:300])
 
     threading.Thread(target=_drain, daemon=True).start()
 
@@ -1261,7 +1583,62 @@ def _index_zim(
                 if callable(note_date) and "date" in event:
                     note_date(work.source, str(event.get("date") or ""))
                 continue
+            if event.get("type") == "ocr-enqueue":
+                if on_enqueue is not None:
+                    try:
+                        on_enqueue(event)
+                    except Exception:
+                        log.exception("could not queue a PDF from %s", work.source)
+                continue
+            if event.get("type") == "ocr-tally":
+                try:
+                    total = max(0, int(event.get("total") or 0))
+                except (TypeError, ValueError):
+                    total = 0
+                if total and session is not None:
+                    session.set_note(_ocr_tally_note(total))
+                if event.get("complete") and total:
+                    log.info("%s", _ocr_tally_note(total).removeprefix("Indexing. "))
+                continue
+            if event.get("type") == "pass":
+                name = str(event.get("pass") or "")
+                if name in ("text", "ocr"):
+                    work.zim_pass = name
+                    work.phase = name
+                    work.label = pass_label(name)
+                    total = int(event.get("total") or 0)
+                    work.pass_total = total or None
+                    work.pass_done = int(event.get("done") or 0)
+                    if session is not None:
+                        session.set_note("Indexing.")
+                    _write_checkpoint(work)
+                    _report(session, work, "running")
+                continue
+            if event.get("type") == "hold":
+                try:
+                    _release_ocr(work)
+                except Exception:
+                    log.exception("could not release the OCR pass for %s", work.source)
+                    held = getattr(work, "spill", None)
+                    if held is not None:
+                        held["go"].write_text("go\n", encoding="utf-8")
+                continue
+            if event.get("type") == "phase":
+                phase = str(event.get("phase") or "")
+                if phase in ("html", "text", "ocr"):
+                    work.phase = phase
+                    work.label = pass_label(phase)
+                    if phase != "ocr" and session is not None:
+                        session.set_note("Indexing.")
+                    _report(session, work, "running")
+                continue
             if event.get("type") == "article":
+                if getattr(work, "phase", "") == "ocr":
+                    work.phase = "ocr-text"
+                    work.label = pass_label("ocr-text")
+                    if session is not None:
+                        session.set_note("Indexing.")
+                    _report(session, work, "running")
                 event["_archive"] = archive
                 return event
             if event.get("type") == "done":
@@ -1269,11 +1646,17 @@ def _index_zim(
         return None
 
     try:
-        outcome = _consume_articles(install, pool, work, stop, session, stored, _pull, retire, switch_check)
-        if outcome == "done":
+        outcome = _consume_articles(
+            install, pool, work, stop, session, stored, _pull, retire, switch_check, on_idle
+        )
+        if outcome == "done" and on_body_done is not None:
+            on_body_done()
+        elif outcome == "done":
             work.done = True
+            work.zim_pass = "done"
             work.touched = True
             _write_checkpoint(work)
+            _clear_zim_ocr_ahead(spill["id"])
             _report(session, work, "indexed")
             log.info(
                 "finished %s, %s chunks, %s skipped, %s bad",
@@ -1285,6 +1668,9 @@ def _index_zim(
         if proc.wait(timeout=10) not in (0, -15, None) and not work.done and not stop.is_set():
             raise RuntimeError(f"extractor exited {proc.returncode} for {work.source}")
     finally:
+        close_prints = getattr(getattr(work, "prints", None), "close", None)
+        if callable(close_prints):
+            close_prints()
         release_extract(proc)
 
 
@@ -1304,7 +1690,7 @@ def _halt_reason(stop: threading.Event, retire: threading.Event | None = None, s
     return None
 
 
-def _consume_articles(install, pool, work, stop, session, seen, pull, retire=None, switch_check=None) -> str:
+def _consume_articles(install, pool, work, stop, session, seen, pull, retire=None, switch_check=None, on_idle=None) -> str:
     """Embed across articles. Checkpoint an article only after its points are stored."""
     feed = ArticleFeed()
     pipe = _UpsertPipe()
@@ -1316,7 +1702,7 @@ def _consume_articles(install, pool, work, stop, session, seen, pull, retire=Non
         while _halt_reason(stop, retire, switch_check) is None:
             width = _next_call_chunks(pool, session, install)
             if width != last_width:
-                log.info("%s chunks per call", width)
+                log.debug("%s chunks per call", width)
                 last_width = width
             kind = content_kind(getattr(work, "source", "") or "")
             while feed.pending() < width and not ended and _halt_reason(stop, retire, switch_check) is None:
@@ -1331,6 +1717,7 @@ def _consume_articles(install, pool, work, stop, session, seen, pull, retire=Non
                     ended = True
                     break
                 feed.add(_prepare_article(install, work, item, seen))
+                _publish_flight(session, work, feed)
             if _halt_reason(stop, retire, switch_check):
                 break
             if feed.pending() == 0:
@@ -1340,6 +1727,14 @@ def _consume_articles(install, pool, work, stop, session, seen, pull, retire=Non
                     continue
                 if ended:
                     break
+                # The ZIM has nothing to embed on this turn. A finished OCR
+                # read can use the GPU, then this file is checked again.
+                if on_idle is not None:
+                    pipe.retire()
+                    if _halt_reason(stop, retire, switch_check):
+                        break
+                    if on_idle(seen):
+                        continue
                 continue
             if not pool.urls:
                 raise RuntimeError("the embed server is not running")
@@ -1348,9 +1743,16 @@ def _consume_articles(install, pool, work, stop, session, seen, pull, retire=Non
             token_mean = mean_tokens(texts)
             started = time.monotonic()
             try:
-                vectors = embed(pool.urls[0], install.embed_model, texts)
+                from nomad_turbo.ocr_budget import note_embed
+
+                note_embed(True)
+                try:
+                    vectors = embed(pool.urls[0], install.embed_model, texts)
+                finally:
+                    note_embed(False)
             except ChunkRejected as exc:
                 action, article_path = feed.split_rejected(exc.index)
+                _publish_flight(session, work, feed)
                 name = Path(work.source).name
                 if action == "split":
                     log.info(
@@ -1392,6 +1794,7 @@ def _consume_articles(install, pool, work, stop, session, seen, pull, retire=Non
                 if callable(note_sequences):
                     note_sequences(token_mean, len(texts), elapsed, stop)
             ready = feed.push_vectors(vectors)
+            _publish_flight(session, work, feed)
             if ready:
                 pipe.submit(lambda batch=ready: _store_ready(install, work, seen, session, batch, stop))
     except Exception as exc:
@@ -1413,77 +1816,181 @@ def _consume_articles(install, pool, work, stop, session, seen, pull, retire=Non
     return "done" if saw_done else "closed"
 
 
-def _index_plain(
+def _publish_flight(session, work, feed) -> None:
+    """Show chunk progress for a file that is not a ZIM.
+
+    A ZIM reports each stored article. A PDF or other upload is one article,
+    so the row would stay empty until that article was upserted.
+    """
+    if session is None or getattr(work, "kind", "") == "zim":
+        return
+    book = session.get_book() if hasattr(session, "get_book") else None
+    note = getattr(book, "note_flight", None) if book is not None else None
+    if not callable(note):
+        return
+    done, total = feed.vector_progress()
+    if total <= 0:
+        return
+    note(work.source, done, total)
+
+
+def _skip_stored_plain(install: Install, session: Session | None, work: FileWork) -> bool:
+    """A file that already has points is indexed. OCR does not read it again."""
+    existing = count_source(install, work.source)
+    if not existing:
+        return False
+    log.info("skipping %s, points already stored", work.source)
+    work.done = True
+    work.touched = True
+    work.chunks = existing
+    work.total_articles = 1
+    work.articles = 1
+    _write_checkpoint(work)
+    _report(session, work, "indexed")
+    return True
+
+
+def _show_ocr(session, work: FileWork, name: str, page: int | None, total: int | None, *, announce: bool) -> None:
+    """The OCR row. `announce` also writes the status line.
+
+    A second file can be embedding. Its status line stays put when this read
+    was started beside it.
+    """
+    note = ocr_note(name, page, total) if page and total else ocr_note(name)
+    work.phase = "ocr"
+    work.label = "OCR"
+    if session is not None:
+        setter = getattr(session, "set_ocr_activity", None)
+        if callable(setter):
+            setter(note)
+        if announce:
+            session.set_note(note)
+    if "\n" not in str(getattr(work, "source", "")):
+        _report(session, work, "running")
+
+
+def _clear_ocr_note(session, name: str) -> None:
+    if session is None:
+        return
+    clear = getattr(session, "clear_ocr_activity", None)
+    if callable(clear):
+        clear(name)
+
+
+def _rearm_measure(session) -> None:
+    """The five-minute sample is embedding time. The OCR read does not use it up."""
+    if session is None or not callable(getattr(session, "measuring", None)) or not session.measuring():
+        return
+    arm = getattr(session, "arm_measure_clock", None)
+    if callable(arm):
+        arm()
+
+
+def _read_plain_visual(install, work: FileWork, stop, session, *, announce: bool) -> dict | None:
+    """Read one uploaded PDF or picture. None means the read failed."""
+    name = getattr(work, "title", "") or work.host.name
+    quality = _ocr_quality(session, install)
+    drawing = work.kind == "image" or quality != "low"
+    if drawing:
+        _show_ocr(session, work, name, None, None, announce=announce)
+    else:
+        work.phase = "text"
+        work.label = "text"
+        if "\n" not in str(work.source):
+            _report(session, work, "running")
+        if session is not None and announce:
+            session.set_note("Indexing.")
+
+    def _ocr_status(line: str) -> None:
+        log.log(ocr_status_level(line), "ocr: %s", line[:300])
+        remember_ocr_workers(session, line)
+        found = ocr_page(line)
+        if found is None or str(line).rstrip().endswith(" text"):
+            return
+        _show_ocr(session, work, name, found[0], found[1], announce=announce)
+
+    visual = read_visual(
+        install,
+        str(work.host),
+        work.kind,
+        stop,
+        _ocr_status,
+        quality,
+        ocr_env=_ocr_container(session, install, wait=True),
+    )
+    if visual is None:
+        return None
+    drew = bool(visual.get("drew"))
+    pages = visual.get("pages") or []
+    total = len(pages) if pages else None
+    work.phase = "ocr-text" if drew else "text"
+    work.label = "OCR text" if drew else "text"
+    if session is not None and session.get_book() is not None and "\n" not in str(work.source):
+        session.get_book().update(
+            work.source,
+            articles=int(work.articles or 0),
+            total=work.total_articles,
+            chunks=int(work.chunks or 0),
+            state="running",
+            label=work.label,
+            pass_done=int(total or 0),
+            pass_total=total,
+        )
+    return visual
+
+
+def _article_from_visual(work: FileWork, visual: dict) -> dict:
+    if visual.get("pages"):
+        return {
+            "index": 1,
+            "path": work.source,
+            "title": work.host.name,
+            "kind": "pdf",
+            "pages": visual.get("pages") or [],
+            "sections": [],
+        }
+    if "ocr" in visual:
+        return {
+            "index": 1,
+            "path": work.source,
+            "title": work.host.name,
+            "kind": "image",
+            "ocr": visual.get("ocr") or "",
+            "sections": [],
+        }
+    body = str(visual.get("text") or "")
+    return {
+        "index": 1,
+        "path": work.source,
+        "title": work.host.name,
+        "text": body,
+        "sections": [{"heading": "", "text": body, "level": 2}],
+    }
+
+
+def _embed_plain_article(
     install: Install,
     pool: EmbedPool,
     work: FileWork,
     stop: threading.Event,
     session: Session | None,
-    retire: threading.Event | None = None,
-    switch_check=None,
+    retire: threading.Event | None,
+    switch_check,
+    article,
 ) -> None:
-    reason = _halt_reason(stop, retire, switch_check)
-    if reason == "replaced" or (retire is not None and retire.is_set()):
-        raise RuntimeError("replaced")
-    if reason in SWITCH_REASONS:
-        raise RuntimeError(reason)
-    if reason:
-        return
-    _load_point_active(install, work)
-    existing = count_source(install, work.source)
-    if existing:
-        log.info("skipping %s, points already stored", work.source)
-        work.done = True
-        work.touched = True
-        work.chunks = existing
-        work.total_articles = 1
-        work.articles = 1
-        _write_checkpoint(work)
-        _report(session, work, "indexed")
-        return
-    if work.kind in ("pdf", "image"):
-        name = work.host.name
-        _report(session, work, "running")
-        if session is not None:
-            session.set_note(ocr_note(name))
-
-        def _ocr_status(line: str) -> None:
-            log.info("ocr: %s", line[:300])
-            found = ocr_page(line)
-            if session is None or found is None:
-                return
-            session.set_note(ocr_note(name, found[0], found[1]))
-
-        text = read_visual(install, str(work.host), work.kind, stop, _ocr_status)
-        # The five-minute sample is embedding time. The OCR read does not use it up.
-        if (
-            session is not None
-            and callable(getattr(session, "measuring", None))
-            and session.measuring()
-        ):
-            arm = getattr(session, "arm_measure_clock", None)
-            if callable(arm):
-                arm()
-        if session is not None:
-            session.set_note("Indexing.")
-    else:
-        text = read_text(work.host, work.kind)
-    if text is None:
+    if article is None:
         log.warning("%s could not be read. Marked needs NOMAD.", work.source)
         work.done = True
         work.deferred = True
         _report(session, work, "deferred")
         if session is not None:
             session.set_note("Indexing.")
+        _clear_ocr_note(session, work.host.name)
         return
+    # One document is one article. The total is known before its chunks are.
+    if not work.total_articles:
+        work.total_articles = 1
     _report(session, work, "running")
-    article = {
-        "index": 1,
-        "path": work.source,
-        "title": work.host.name,
-        "text": text,
-        "sections": [{"heading": "", "text": text, "level": 2}],
-    }
     sent = False
 
     def _pull(_timeout: float):
@@ -1508,6 +2015,90 @@ def _index_plain(
         work.skipped,
         work.bad,
     )
+
+
+def _begin_plain_embed(install: Install, work: FileWork) -> None:
+    _load_point_active(install, work)
+    work.prints = ArticlePrints()
+    work.ledger = library_ledger()
+
+
+def _index_prepared_plain(
+    install: Install,
+    pool: EmbedPool,
+    work: FileWork,
+    stop: threading.Event,
+    session: Session | None,
+    retire: threading.Event | None,
+    switch_check,
+    visual: dict | None,
+) -> None:
+    """Embed a PDF or picture whose text is already read."""
+    reason = _halt_reason(stop, retire, switch_check)
+    if reason == "replaced" or (retire is not None and retire.is_set()):
+        raise RuntimeError("replaced")
+    if reason in SWITCH_REASONS:
+        raise RuntimeError(reason)
+    if reason:
+        return
+    if _skip_stored_plain(install, session, work):
+        return
+    _begin_plain_embed(install, work)
+    _rearm_measure(session)
+    article = None
+    if visual is not None:
+        drew = bool(visual.get("drew"))
+        work.phase = "ocr-text" if drew else "text"
+        work.label = "OCR text" if drew else "text"
+        if session is not None:
+            session.set_note("Indexing.")
+        _clear_ocr_note(session, work.host.name)
+        article = _article_from_visual(work, visual)
+    _embed_plain_article(install, pool, work, stop, session, retire, switch_check, article)
+
+
+def _index_plain(
+    install: Install,
+    pool: EmbedPool,
+    work: FileWork,
+    stop: threading.Event,
+    session: Session | None,
+    retire: threading.Event | None = None,
+    switch_check=None,
+) -> None:
+    reason = _halt_reason(stop, retire, switch_check)
+    if reason == "replaced" or (retire is not None and retire.is_set()):
+        raise RuntimeError("replaced")
+    if reason in SWITCH_REASONS:
+        raise RuntimeError(reason)
+    if reason:
+        return
+    if _skip_stored_plain(install, session, work):
+        return
+    _begin_plain_embed(install, work)
+    article = None
+    if work.kind in ("pdf", "image"):
+        visual = _read_plain_visual(install, work, stop, session, announce=True)
+        _rearm_measure(session)
+        if visual is not None:
+            drew = bool(visual.get("drew"))
+            work.phase = "ocr-text" if drew else "text"
+            work.label = "OCR text" if drew else "text"
+            if session is not None:
+                session.set_note("Indexing.")
+            _clear_ocr_note(session, work.host.name)
+            article = _article_from_visual(work, visual)
+    else:
+        text = read_text(work.host, work.kind)
+        if text is not None:
+            article = {
+                "index": 1,
+                "path": work.source,
+                "title": work.host.name,
+                "text": text,
+                "sections": [{"heading": "", "text": text, "level": 2}],
+            }
+    _embed_plain_article(install, pool, work, stop, session, retire, switch_check, article)
 
 
 def _finalize(install: Install, previous: str, files: list[FileWork]) -> bool:
@@ -1779,17 +2370,49 @@ def article_stay_reason(session, source: str, sample_started, now: float, armed_
     return engine_switch_reason(session, source, sample_started, now, armed_epoch)
 
 
-def _switch_check(session, work: FileWork, sample_started, armed: int):
+def _release_finished_index_now(install: Install, session, batch: list[FileWork]) -> None:
+    """Drop Index now when this pass cannot open that file.
+
+    The window can still call a file partial after the knowledge base has
+    finished it. The work list then skips it. Leaving the request set aborts
+    the file in progress and starts that same file again, because the next
+    pick never sees the request. A file written in the last 10 seconds is
+    kept: it is waiting to settle and the next walk can open it.
+    """
+    if session is None or not hasattr(session, "index_now"):
+        return
+    target = session.index_now()
+    if not target:
+        return
+    if any(item.source == target for item in batch):
+        return
+    host = _library_host(install, target)
+    if host is not None and host.exists():
+        try:
+            if time.time() - host.stat().st_mtime < 10:
+                return
+        except OSError:
+            pass
+    log.info(
+        "Index now left %s alone. It is already finished, so the file in progress keeps going.",
+        Path(target).name,
+    )
+    session.clear_index_now()
+
+
+def _switch_check(install: Install, session, work: FileWork, sample_started, armed: int, batch: list[FileWork]):
     """The between-article check for the file now in progress.
 
     Measure on a file that already has articles or chunks leaves at the next
     boundary and does not replace its ETA. A file with nothing stored yet is
     sampled for the usual five minutes, and the articles that sample stores
-    do not end it early.
+    do not end it early. Index now on a file this pass cannot open is cleared
+    here, so the file in progress is not stopped and started again.
     """
     held = {"progress": None}
 
     def switch_check(started=sample_started, source=work.source, epoch=armed, file=work):
+        _release_finished_index_now(install, session, batch)
         # A PDF re-arms this clock after OCR, so the sample starts then.
         measuring_now = False
         asked_now = None
@@ -1830,6 +2453,7 @@ def _next_work(install: Install, pool, session, batch: list[FileWork], stop: thr
         _learn_zim_dates(install, session, batch, stop)
     if not batch:
         return None, None, 0, ""
+    _release_finished_index_now(install, session, batch)
     choice = session.get_order() if session is not None and hasattr(session, "get_order") else "library"
     rows = _order_rows(batch, session)
     index_now = open_index_now(session, rows) if session is not None else None
@@ -1859,6 +2483,407 @@ def _next_work(install: Install, pool, session, batch: list[FileWork], stop: thr
     return work, sample_started, armed, ""
 
 
+def _ocr_job_source(owner: str, article_path: str) -> str:
+    if article_path and article_path != owner:
+        return owner + "\n" + article_path
+    return owner
+
+
+def _export_pdf_name(article_path: str) -> str:
+    import hashlib
+
+    return hashlib.sha256(article_path.encode()).hexdigest()[:16] + ".pdf"
+
+
+def _export_host(container_file: str) -> Path:
+    text = str(container_file or "").replace("\\", "/")
+    marker = "/turbo-state/"
+    if marker in text:
+        return state_dir() / text.split(marker, 1)[1]
+    return Path(text)
+
+
+def _read_spill_list(path: Path) -> list[str]:
+    if not path.is_file():
+        return []
+    rows: list[str] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            rows.append(line)
+            continue
+        if isinstance(value, str) and value:
+            rows.append(value)
+    return rows
+
+
+def _clear_ocr_queue_dir(spill_id: str) -> None:
+    if not spill_id:
+        return
+    folder = state_dir() / "ocr-queue" / spill_id
+    if not folder.is_dir():
+        return
+    import shutil
+
+    shutil.rmtree(folder, ignore_errors=True)
+
+
+def _upload_job(work: FileWork):
+    from nomad_turbo.overlap import OcrJob
+
+    return OcrJob(
+        source=work.source,
+        host=work.host,
+        kind=work.kind,
+        title=work.host.name,
+        owner=work.source,
+        article_path=work.source,
+    )
+
+
+def _zim_job(owner: str, article_path: str, host: Path, title: str):
+    from nomad_turbo.overlap import OcrJob
+
+    return OcrJob(
+        source=_ocr_job_source(owner, article_path),
+        host=host,
+        kind="pdf",
+        title=title or Path(article_path).name,
+        owner=owner,
+        article_path=article_path,
+    )
+
+
+def _remember_touched(touched: list[FileWork], work: FileWork) -> None:
+    if all(item.source != work.source for item in touched):
+        touched.append(work)
+
+
+def _fill_upload_queue(lane, install: Install, session, batch: list[FileWork], finished: set[str], touched: list[FileWork]) -> None:
+    """Put every uploaded PDF and picture at the back of the OCR queue."""
+    reserved = lane.reserved()
+    jobs = []
+    for work in batch:
+        if work.kind not in ("pdf", "image") or work.done or work.source in finished:
+            continue
+        if work.source in reserved:
+            continue
+        if _skip_stored_plain(install, session, work):
+            finished.add(work.source)
+            _remember_touched(touched, work)
+            continue
+        jobs.append(_upload_job(work))
+    if jobs:
+        lane.offer(jobs)
+
+
+def _accept_zim_enqueue(lane, work: FileWork, event: dict) -> None:
+    path = str(event.get("path") or "")
+    raw = str(event.get("file") or "")
+    if not path or not raw:
+        return
+    done = set(getattr(work, "ocr_done", []) or [])
+    if path in done:
+        return
+    pending = list(getattr(work, "ocr_pending", []) or [])
+    if path not in pending:
+        pending.append(path)
+        work.ocr_pending = pending
+    lane.offer([_zim_job(work.source, path, _export_host(raw), str(event.get("title") or path))], front=True)
+
+
+def _catch_up_exports(lane, work: FileWork) -> None:
+    """Queue ZIM PDFs whose bytes are already on disk."""
+    if work.kind != "zim":
+        return
+    spill = getattr(work, "spill", None) or _spill_paths(work.source)
+    work.spill = spill
+    done = set(getattr(work, "ocr_done", []) or [])
+    pending = [path for path in (getattr(work, "ocr_pending", []) or []) if path not in done]
+    for path in _read_spill_list(spill["ocr"]):
+        if path in done or path in pending:
+            continue
+        pending.append(path)
+    spill_id = str(spill["id"])
+    kept: list[str] = []
+    for path in pending:
+        host = state_dir() / "ocr-queue" / spill_id / _export_pdf_name(path)
+        source = _ocr_job_source(work.source, path)
+        if lane.pending(source) or lane.has_result(source):
+            kept.append(path)
+            continue
+        if host.is_file():
+            kept.append(path)
+            lane.offer([_zim_job(work.source, path, host, Path(path).name)], front=True)
+            continue
+        log.warning("the OCR copy of %s in %s is missing, so that PDF is left unread", path, work.source)
+    work.ocr_pending = kept
+
+
+def _finish_queued_zim(work: FileWork, lane, session, finished: set[str]) -> None:
+    """A ZIM is finished once its pages and its queued PDFs are stored."""
+    if work.kind != "zim" or work.done or getattr(work, "zim_pass", "") != "queued":
+        return
+    done = set(getattr(work, "ocr_done", []) or [])
+    pending = [path for path in (getattr(work, "ocr_pending", []) or []) if path not in done]
+    work.ocr_pending = pending
+    if pending:
+        return
+    if lane is not None and lane.owner_busy(work.source):
+        return
+    work.done = True
+    work.zim_pass = "done"
+    work.touched = True
+    _write_checkpoint(work)
+    spill = getattr(work, "spill", None) or _spill_paths(work.source)
+    _clear_zim_ocr_ahead(str(spill["id"]))
+    _clear_ocr_queue_dir(str(spill["id"]))
+    finished.add(work.source)
+    _report(session, work, "indexed")
+    log.info(
+        "finished %s, %s chunks, %s skipped, %s bad",
+        work.source,
+        work.chunks,
+        work.skipped,
+        work.bad,
+    )
+
+
+def _embed_one_article(install, pool, work, stop, session, retire, switch_check, article, seen) -> bool:
+    if article is None:
+        return False
+    sent = False
+
+    def _pull(_timeout: float):
+        nonlocal sent
+        if sent:
+            return _EXTRACT_DONE
+        sent = True
+        return article
+
+    outcome = _consume_articles(install, pool, work, stop, session, seen, _pull, retire, switch_check)
+    return outcome == "done"
+
+
+def _embed_ready_source(
+    lane,
+    source: str,
+    install: Install,
+    pool,
+    stop: threading.Event,
+    session,
+    batch: list[FileWork],
+    finished: set[str],
+    touched: list[FileWork],
+    retire,
+    switch_check,
+    seen,
+) -> bool:
+    """Embed one finished OCR read. The GPU is between ZIM articles or between ZIMs."""
+    job = lane.job(source)
+    visual, err = lane.take(source)
+    if job is None:
+        return False
+    if str(err) == "stopped":
+        raise RuntimeError("stopped")
+    owner = str(getattr(job, "owner", "") or getattr(job, "source", ""))
+    article_path = str(getattr(job, "article_path", "") or owner)
+    by_source = {item.source: item for item in batch}
+    work = by_source.get(owner)
+    if work is None:
+        return False
+    _remember_touched(touched, work)
+    if "\n" in str(getattr(job, "source", "")):
+        work.zim_pass = "queued"
+        title = str(getattr(job, "title", "") or article_path)
+        if err is not None or visual is None:
+            log.warning("ocr failed for %s in %s: %s", article_path, owner, err)
+            article = {
+                "index": int(work.articles or 0) + 1,
+                "path": article_path,
+                "title": title,
+                "sections": [],
+                "skip": "read",
+            }
+        else:
+            drew = bool(visual.get("drew"))
+            work.phase = "ocr-text" if drew else "text"
+            work.label = "OCR text" if drew else "text"
+            if session is not None:
+                session.set_note("Indexing.")
+            article = _article_from_visual(work, visual)
+            article["index"] = int(work.articles or 0) + 1
+            article["path"] = article_path
+            article["title"] = title
+        use_seen = seen if seen is not None else set()
+        if not _embed_one_article(install, pool, work, stop, session, retire, switch_check, article, use_seen):
+            return False
+        stored = list(getattr(work, "ocr_done", []) or [])
+        if article_path not in stored:
+            stored.append(article_path)
+        work.ocr_done = stored
+        work.ocr_pending = [path for path in (work.ocr_pending or []) if path != article_path]
+        work.zim_pass = "queued"
+        _write_checkpoint(work)
+        _finish_queued_zim(work, lane, session, finished)
+        return True
+    if err is not None:
+        log.warning("ocr failed for %s: %s", owner, err)
+        work.done = True
+        work.deferred = True
+        work.touched = True
+        _report(session, work, "deferred")
+        finished.add(work.source)
+        return True
+    try:
+        _index_prepared_plain(install, pool, work, stop, session, retire, switch_check, visual)
+    except RuntimeError as exc:
+        text = str(exc)
+        if text in ("stopped", "replaced") or text in SWITCH_REASONS:
+            raise
+        log.exception("could not embed %s", owner)
+        work.done = True
+        work.deferred = True
+        _report(session, work, "deferred")
+        finished.add(work.source)
+        return True
+    if work.done:
+        finished.add(work.source)
+        if session is not None and hasattr(session, "clear_index_now"):
+            session.clear_index_now(work.source)
+    return True
+
+
+def _drain_ready_ocr(
+    lane,
+    install: Install,
+    pool,
+    stop: threading.Event,
+    session,
+    batch: list[FileWork],
+    finished: set[str],
+    touched: list[FileWork],
+    retire=None,
+    switch_check=None,
+    seen=None,
+    *,
+    one: bool = False,
+    hold: str | None = None,
+) -> int:
+    """Embed OCR text that is already ready. Leave a read that is still going.
+
+    `hold` is the ZIM whose pages are still being embedded. Its own PDFs wait
+    until that embed finishes, so a crash can resume the walk.
+    """
+    if lane is None:
+        return 0
+    count = 0
+    while not stop.is_set():
+        ready = []
+        for source in lane.ready_sources():
+            job = lane.job(source)
+            if hold and job is not None and getattr(job, "owner", None) == hold:
+                continue
+            ready.append(source)
+        if not ready:
+            return count
+        if _embed_ready_source(
+            lane,
+            ready[0],
+            install,
+            pool,
+            stop,
+            session,
+            batch,
+            finished,
+            touched,
+            retire,
+            switch_check,
+            seen,
+        ):
+            count += 1
+        if one:
+            return count
+    return count
+
+
+def _offer_overlap(lane, install: Install, session, batch: list[FileWork], hold: str | None) -> list[FileWork]:
+    """Queue the PDFs and pictures that can be read before the next ordinary file.
+
+    A file that already has points is marked indexed and returned. The caller
+    records it finished so it is not read.
+    """
+    from nomad_turbo.overlap import preview_order, visual_reads
+
+    rows = _order_rows(batch, session)
+    choice = session.get_order() if session is not None and hasattr(session, "get_order") else "library"
+    index_now = open_index_now(session, rows) if session is not None else None
+    measuring = bool(session is not None and hasattr(session, "measuring") and session.measuring())
+    defer = _measure_defer(batch, session) if measuring else set()
+    kinds = {item.source: item.kind for item in batch}
+    # A ZIM can run for hours with nothing for the CPU to read. Uploaded
+    # PDFs and pictures later in the queue are read during that time.
+    past_ordinary = kinds.get(hold or "", "") == "zim"
+    order = preview_order(
+        rows,
+        choice=choice,
+        index_now=index_now,
+        defer=defer,
+        kind_of=lambda source: kinds.get(source, ""),
+        limit=None,
+        past_ordinary=past_ordinary,
+    )
+    reserved = lane.reserved()
+    wanted = visual_reads(order, reserved=reserved, hold=hold, limit=None, past_ordinary=past_ordinary)
+    by_source = {item.source: item for item in batch}
+    offer = []
+    done: list[FileWork] = []
+    for source in wanted:
+        work = by_source.get(source)
+        if work is None or source in reserved:
+            continue
+        if _skip_stored_plain(install, session, work):
+            done.append(work)
+            continue
+        offer.append(work)
+    if past_ordinary and offer:
+        log.info(
+            "CPU OCR will read %s uploaded file%s while this ZIM is indexed.",
+            len(offer),
+            "" if len(offer) == 1 else "s",
+        )
+    lane.offer(offer)
+    return done
+
+
+def _await_visual(lane, work: FileWork, stop: threading.Event, session):
+    """Wait until this file's read finishes.
+
+    Returns the reader dict, an error, and whether a result arrived. A failed
+    read is a dict of None with no error, and the file is marked needs NOMAD.
+    Stopping before a result returns finished False.
+    """
+    while not stop.is_set():
+        if lane.has_result(work.source):
+            visual, err = lane.take(work.source)
+            return visual, err, True
+        if not lane.pending(work.source):
+            return None, RuntimeError("ocr did not start"), True
+        if session is not None:
+            note = session.ocr_activity() if hasattr(session, "ocr_activity") else ""
+            if note:
+                session.set_note(note)
+        stop.wait(0.3)
+    if lane.has_result(work.source):
+        visual, err = lane.take(work.source)
+        return visual, err, True
+    return None, None, False
+
+
 def execute(
     stop: threading.Event,
     session: Session | None = None,
@@ -1872,12 +2897,19 @@ def execute(
     if manage_icon:
         write_shortcut(True)
     pool: EmbedPool | None = None
+    lane = None
     paused = False
+    budget_stop = threading.Event()
+    budget_on = False
     previous = None
     touched: list[FileWork] = []
     finished: set[str] = set()
     failed_before_work = False
     try:
+        try:
+            _collection_logbook().align_running_logs(state_dir(), install)
+        except Exception:
+            log.exception("could not align log files with the knowledge index")
         collection_ready(install)
         previous = get_policy(install)
         (state_dir() / "policy").write_text(previous)
@@ -1913,13 +2945,23 @@ def execute(
             jobs: list[dict] = []
         else:
             jobs = list_jobs(install)
-        rows = gpu_rows()
-        chosen = pick_gpu(rows)
-        if chosen:
-            gpu_index, total, used = chosen
+        from nomad_turbo.devices import list_devices, pick_index, saved_choice
+        from nomad_turbo.ocr_budget import arm, serve_budget
+
+        index_device = pick_index(list_devices(), saved_choice(session, install, "index_device"))
+        if index_device.kind == "nvidia" and index_device.index is not None:
+            gpu_index, total, used = index_device.index, index_device.total_mib, index_device.used_mib
             has_gpu = True
         else:
             gpu_index, total, used, has_gpu = None, 0, 0, False
+        arm(state_dir() / "ocr-budget", os_cpu())
+        threading.Thread(
+            target=serve_budget,
+            args=(budget_stop,),
+            name="nomad-turbo-ocr-budget",
+            daemon=True,
+        ).start()
+        budget_on = True
         pool = EmbedPool(
             install,
             use_gpu=has_gpu,
@@ -1934,6 +2976,47 @@ def execute(
             session.set_phase("running")
             session.set_note("Indexing.")
         _status(phase="running", paused_queue=True, slots=len(pool.urls))
+        try:
+            import importlib
+
+            import nomad_turbo.overlap as overlap_mod
+
+            # This window reloads engine on Start. Reload the reader here so
+            # that Start also picks up a change in the overlap module.
+            importlib.reload(overlap_mod)
+            from nomad_turbo.overlap import VisualLane, cpu_ocr_overlaps_gpu
+
+            if cpu_ocr_overlaps_gpu(_ocr_assignment(session, install)):
+                holder: dict = {"lane": None}
+
+                def _ahead(item, _holder=holder):
+                    flag = _holder["lane"].stop_flag() if _holder["lane"] is not None else stop
+                    return _read_plain_visual(install, item, flag, session, announce=False)
+
+                spill = state_dir() / "ocr-ahead"
+                spill.mkdir(parents=True, exist_ok=True)
+                for old in spill.glob("*.json"):
+                    try:
+                        old.unlink()
+                    except OSError:
+                        log.exception("could not clear a leftover OCR read")
+                lane = VisualLane(_ahead, stop, spill_dir=spill)
+                holder["lane"] = lane
+                log.info(
+                    "CPU OCR reads uploaded PDFs and pictures while the GPU indexes. "
+                    "A PDF found in a ZIM goes to the front of that queue. "
+                    "Finished OCR text is embedded after the ZIM the GPU is on, before the next ZIM. "
+                    "A plain upload, such as markdown, stays in the embed list and is indexed when the GPU reaches it. "
+                    "Finished reads stay in memory until they pass a quarter of system memory, then they wait on disk."
+                )
+        except Exception:
+            log.exception("could not see where OCR will run")
+            if lane is not None:
+                try:
+                    lane.close()
+                except Exception:
+                    log.exception("could not stop the OCR read")
+            lane = None
         failed: set[str] = set()
         retried: set[tuple[str, int]] = set()
         live = _LiveFile()
@@ -1948,6 +3031,7 @@ def execute(
         _library_live = live
         watch_thread.start()
         idle_note = ""
+        queue_told = False
         try:
             while not stop.is_set():
                 # One walk while no file is open. New files, the queue, and
@@ -1997,7 +3081,37 @@ def execute(
                     stop.wait(SCAN_SECONDS)
                     continue
                 idle_note = ""
-                work, sample_started, armed, action = _next_work(install, pool, session, batch, stop)
+                if lane is not None:
+                    _fill_upload_queue(lane, install, session, batch, finished, touched)
+                    for queued in batch:
+                        if queued.kind == "zim" and queued.zim_pass == "queued":
+                            queued.spill = getattr(queued, "spill", None) or _spill_paths(queued.source)
+                            _catch_up_exports(lane, queued)
+                            _finish_queued_zim(queued, lane, session, finished)
+                    _drain_ready_ocr(lane, install, pool, stop, session, batch, finished, touched)
+                    if not queue_told:
+                        uploads = sum(
+                            1 for item in batch if item.kind in ("pdf", "image") and item.source not in finished
+                        )
+                        log.info(
+                            "CPU OCR queue has %s uploaded PDFs and pictures. "
+                            "A PDF found in a ZIM goes to the front. "
+                            "Finished OCR text is embedded after the current ZIM, before the next one. "
+                            "A plain upload, such as markdown, stays in the embed list.",
+                            uploads,
+                        )
+                        queue_told = True
+                    now = open_index_now(session) if session is not None else None
+                    from nomad_turbo.overlap import gpu_candidates
+
+                    gpu_batch = gpu_candidates(batch, overlap=True, index_now=now, finished=finished)
+                    if not gpu_batch:
+                        if stop.wait(0.3):
+                            break
+                        continue
+                else:
+                    gpu_batch = batch
+                work, sample_started, armed, action = _next_work(install, pool, session, gpu_batch, stop)
                 if work is None:
                     if action == "stop" or stop.is_set():
                         break
@@ -2022,12 +3136,99 @@ def execute(
                     work.touched = False
                     continue
 
-                switch_check = _switch_check(session, work, sample_started, armed)
+                switch_check = _switch_check(install, session, work, sample_started, armed, batch)
+                if lane is not None and work.kind in ("pdf", "image"):
+                    lane.offer([_upload_job(work)], front=True)
+                    lane.prefer(work.source)
 
                 live.begin(work.source)
                 try:
-                    if work.kind == "zim":
-                        _index_zim(install, pool, work, stop, session, live.retire, switch_check)
+                    if work.done:
+                        pass
+                    elif lane is not None and work.kind in ("pdf", "image"):
+                        prepared_visual, read_error, read_done = _await_visual(lane, work, stop, session)
+                        if not read_done or (read_error is not None and str(read_error) == "stopped"):
+                            _report(session, work, _open_state(work))
+                            break
+                        if read_error is not None:
+                            raise read_error
+                        _index_prepared_plain(
+                            install, pool, work, stop, session, live.retire, switch_check, prepared_visual
+                        )
+                    elif work.kind == "zim":
+                        def _idle(seen, _work=work, _switch=switch_check):
+                            if lane is None:
+                                return False
+                            did = _drain_ready_ocr(
+                                lane,
+                                install,
+                                pool,
+                                stop,
+                                session,
+                                batch,
+                                finished,
+                                touched,
+                                live.retire,
+                                _switch,
+                                seen,
+                                one=True,
+                                hold=_work.source,
+                            )
+                            if did and session is not None:
+                                _report(session, _work, "running")
+                            return bool(did)
+
+                        def _enq(event, _work=work):
+                            if lane is not None:
+                                _accept_zim_enqueue(lane, _work, event)
+
+                        def _body(_work=work):
+                            if lane is None:
+                                return
+                            _catch_up_exports(lane, _work)
+                            if _work.ocr_pending:
+                                _work.done = False
+                                _work.zim_pass = "queued"
+                                _work.touched = True
+                                _write_checkpoint(_work)
+                                _report(session, _work, "partial")
+                                count = len(_work.ocr_pending)
+                                log.info(
+                                    "%s pages are stored. %s PDF%s from it %s in the OCR queue.",
+                                    Path(_work.source).name,
+                                    count,
+                                    "" if count == 1 else "s",
+                                    "is" if count == 1 else "are",
+                                )
+                                return
+                            _work.done = True
+                            _work.zim_pass = "done"
+                            _work.touched = True
+                            _write_checkpoint(_work)
+                            spill = getattr(_work, "spill", None) or _spill_paths(_work.source)
+                            _clear_zim_ocr_ahead(str(spill["id"]))
+                            _clear_ocr_queue_dir(str(spill["id"]))
+                            _report(session, _work, "indexed")
+                            log.info(
+                                "finished %s, %s chunks, %s skipped, %s bad",
+                                _work.source,
+                                _work.chunks,
+                                _work.skipped,
+                                _work.bad,
+                            )
+
+                        _index_zim(
+                            install,
+                            pool,
+                            work,
+                            stop,
+                            session,
+                            live.retire,
+                            switch_check,
+                            on_idle=_idle if lane is not None else None,
+                            on_enqueue=_enq if lane is not None else None,
+                            on_body_done=_body if lane is not None else None,
+                        )
                     else:
                         _index_plain(install, pool, work, stop, session, live.retire, switch_check)
                 except Exception as exc:
@@ -2104,6 +3305,18 @@ def execute(
         failed_before_work = not any(item.touched for item in touched)
         raise
     finally:
+        if lane is not None:
+            try:
+                lane.close()
+            except Exception:
+                log.exception("could not stop the OCR read")
+        if budget_on:
+            budget_stop.set()
+            from nomad_turbo.ocr_budget import disarm
+            from nomad_turbo.ocr_engine import gpu_ocr
+
+            disarm()
+            gpu_ocr.stop()
         if pool is not None:
             pool.stop_all()
             pool.publish(session)

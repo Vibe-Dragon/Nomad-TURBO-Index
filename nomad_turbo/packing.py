@@ -2,7 +2,8 @@
 
 Stock stores one payload per section. Turbo does the same, and it keeps
 every section of a long page. The `search_document: ` prefix is added only
-on the text sent to the embed server. The stored payload leaves it off.
+on the text sent to the embed server. A title and section line is added
+there too. The stored payload leaves both off.
 """
 
 from __future__ import annotations
@@ -15,7 +16,10 @@ import nomad_turbo.chunking as chunking
 # The open window reloads this module on Start and does not reload chunking.
 # Reload it here so that Start still picks up the fit helpers.
 chunking = importlib.reload(chunking)
-from nomad_turbo.chunking import DOCUMENT_PREFIX, fit_embed_inputs, halve_text, split_chunks
+from nomad_turbo.chunking import DOCUMENT_PREFIX, fit_embed_inputs, halve_text, sanitize, split_chunks
+
+# A heading line longer than this crowds out the section. The rest is clipped.
+CONTEXT_CHARS = 400
 
 
 @dataclass
@@ -33,14 +37,45 @@ class PreparedArticle:
     already_stored: bool = False
 
 
+def _one_line(text: str) -> str:
+    return " ".join(sanitize(text).split())
+
+
+def embedding_context(title: str, heading: str) -> str:
+    """The line the embedder reads in front of a chunk. Empty when nothing names it.
+
+    The line is `Title > Heading` when the heading names something other than
+    the document. A heading that only repeats the title is used once, so a
+    plain upload does not become `notes.txt > notes.txt`. The stored chunk
+    does not include this line.
+    """
+    title = _one_line(title)
+    heading = _one_line(heading)
+    if heading and title and heading.casefold() == title.casefold():
+        heading = ""
+    if title and heading:
+        line = f"{title} > {heading}"
+    else:
+        line = title or heading
+    if len(line) > CONTEXT_CHARS:
+        clipped = line[:CONTEXT_CHARS].rsplit(" ", 1)[0].strip()
+        line = clipped or line[:CONTEXT_CHARS].strip()
+    return f"{line}\n" if line else ""
+
+
 def prepare_article(
     article: dict,
     source: str,
     archive: dict,
     document_id: str,
     prefix: str = DOCUMENT_PREFIX,
+    keep_chunk=None,
 ) -> PreparedArticle:
-    """Match stock NOMAD's per-section payload, with the prefix only on the model input."""
+    """Match stock NOMAD's per-section payload, with the prefix only on the model input.
+
+    keep_chunk, when set, returns false for a payload that is already stored.
+    That payload is left out. A section that loses every payload is left out too.
+    """
     title = article.get("title") or article.get("path") or ""
     sections_in = article.get("sections") or []
     if not sections_in:
@@ -78,8 +113,13 @@ def prepare_article(
             }
         )
         section_index = len(sections)
+        # The heading is part of the prefix, so the fit budget counts it and
+        # the stored chunk stays the section text.
+        section_prefix = prefix + embedding_context(title, heading)
         for piece in pieces:
-            for prefixed, payload in fit_embed_inputs(piece, prefix):
+            for prefixed, payload in fit_embed_inputs(piece, section_prefix):
+                if keep_chunk is not None and not keep_chunk(payload):
+                    continue
                 draft.payloads.append(payload)
                 inputs.append(prefixed)
                 owners.append(section_index)
@@ -99,12 +139,38 @@ class ArticleFeed:
         self._open: list[PreparedArticle] = []
         self._vectors: list[list[list[float] | None]] = []
         self._claim: list[tuple[int, int]] = []
+        # Kept after an article is emitted, so the row does not drop to zero
+        # while that article is stored.
+        self._last_progress = (0, 0)
 
     def add(self, prepared: PreparedArticle) -> None:
         if self._claim:
             raise RuntimeError("finish the open embed call before adding articles")
         self._open.append(prepared)
         self._vectors.append([None] * len(prepared.inputs))
+        self._remember_progress()
+
+    def _count_vectors(self) -> tuple[int, int]:
+        done = 0
+        total = 0
+        for row in self._vectors:
+            total += len(row)
+            done += sum(vector is not None for vector in row)
+        return done, total
+
+    def _remember_progress(self) -> None:
+        self._last_progress = self._count_vectors()
+
+    def vector_progress(self) -> tuple[int, int]:
+        """Chunks that have vectors, and chunks still in the feed.
+
+        After the article is emitted the last count is kept. The row can show
+        that count until the stored article replaces it.
+        """
+        done, total = self._count_vectors()
+        if total <= 0 and self._last_progress[1] > 0:
+            return self._last_progress
+        return done, total
 
     def pending(self) -> int:
         return sum(vector is None for row in self._vectors for vector in row)
@@ -167,6 +233,7 @@ class ArticleFeed:
             del section.payloads[payload_pos]
             del self._vectors[item_index][input_index]
             self._claim = []
+            self._remember_progress()
             if not prepared.inputs and (prepared.article.get("skip") or "").strip() not in ("read", "parse"):
                 prepared.article["skip"] = "embed"
                 return "dropped-last", path
@@ -179,6 +246,7 @@ class ArticleFeed:
         section.payloads.insert(payload_pos + 1, right)
         self._vectors[item_index].insert(input_index + 1, None)
         self._claim = []
+        self._remember_progress()
         return "split", path
 
     def push_vectors(self, vectors: list[list[float]]) -> list[tuple[PreparedArticle, list[list[float]]]]:
@@ -187,6 +255,7 @@ class ArticleFeed:
         for (item_index, input_index), vector in zip(self._claim, vectors):
             self._vectors[item_index][input_index] = vector
         self._claim = []
+        self._remember_progress()
         return self.drain_ready()
 
     def drain_ready(self) -> list[tuple[PreparedArticle, list[list[float]]]]:
