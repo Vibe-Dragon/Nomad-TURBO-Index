@@ -568,17 +568,21 @@ def pick_next(
     index_now: str | None,
     skip: set[str] | frozenset[str] | None = None,
     defer: set[str] | frozenset[str] | None = None,
+    manual: list[str] | None = None,
 ) -> Pick:
     """The file to index next.
 
-    Index now wins until that file finishes. Prioritized unfinished files
-    come next, in the selected order, and a prioritized file already running
-    is not dropped for a different one. Changing the order does not leave
-    the file already in progress. `defer` is files to pass over. Measure puts
-    files it has already sampled there, and files that already have progress.
+    Index now wins until that file finishes. A saved queue comes next, and
+    priority does not jump ahead of it. With no queue, prioritized unfinished
+    files come next, in the selected order, and a prioritized file already
+    running is not dropped for a different one. Changing the order, or the
+    queue, does not leave the file already in progress. `defer` is files to
+    pass over. Measure puts files it has already sampled there, and files
+    that already have progress.
     """
     skipped = set(skip or ())
     deferred = set(defer or ())
+    named = [source for source in (manual or []) if source]
 
     def eligible(item: OrderFile, *, honor_defer: bool) -> bool:
         return _open_file(item, index_now=index_now, skip=skipped, defer=deferred, honor_defer=honor_defer)
@@ -590,6 +594,14 @@ def pick_next(
         if hit is not None and hit.state not in ("indexed", "deferred"):
             target = hit.source
             reason = "now"
+    if target is None and named:
+        by_source = {item.source: item for item in files}
+        for source in named:
+            item = by_source.get(source)
+            if item is not None and eligible(item, honor_defer=True):
+                target = item.source
+                reason = "queue"
+                break
     pending = [item for item in files if eligible(item, honor_defer=True)]
     if target is None and pending:
         ordered = ordered_files(pending, choice)
@@ -605,7 +617,7 @@ def pick_next(
     current_open = current_row is not None and current_row.state not in ("indexed", "deferred") and current not in skipped
     if not current_open:
         return Pick(target, False, reason)
-    if reason == "order":
+    if reason in ("order", "queue"):
         return Pick(current, False, "stay")
     if reason == "priority" and current_row is not None and current_row.priority:
         return Pick(current, False, "stay")

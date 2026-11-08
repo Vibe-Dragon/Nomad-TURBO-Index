@@ -59,6 +59,13 @@ TIPS: dict[str, str] = {
         "Which reader is in use, and whether OCR waits for indexing or runs beside it. "
         "CPU OCR gives cores back while Qdrant is writing or optimizing."
     ),
+    "parallel_ocr": (
+        "Experimental. Off, one file is read or indexed at a time. "
+        "OCR waits until that file is stored, then the next file starts. "
+        "On, CPU OCR reads the next PDF or picture while the GPU indexes. "
+        "That overlap is still being worked out. "
+        "The choice is saved and applies the next time you start."
+    ),
     "ocr_quality": (
         "How hard a PDF page or a picture is read. "
         "Low is 200 dpi and skips a page that already has text. "
@@ -93,7 +100,19 @@ TIPS: dict[str, str] = {
         "The file already in progress keeps going. "
         "Prioritized files come next, in this same order. "
         "The list is the kb_uploads and zim folders, not this order. "
-        "The choice is remembered after Turbo is closed."
+        "The choice is remembered after Turbo is closed. "
+        "Changing this clears a queue you arranged, so this menu applies again."
+    ),
+    "queue": (
+        "Opens the embed queue and the OCR queue. "
+        "The left side is files waiting to be embedded. "
+        "The right side is files waiting for OCR. "
+        "Drag a waiting file to change what comes next. "
+        "The file already being read or indexed stays put and keeps its progress. "
+        "Index now still comes first. "
+        "A saved queue is used before priority and before the Order menu. "
+        "Changing Order clears that arrangement. "
+        "Files that show up later follow that queue."
     ),
     "hide_finished": (
         "Hide files that are already indexed. "

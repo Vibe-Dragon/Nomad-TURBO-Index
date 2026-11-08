@@ -77,6 +77,8 @@ def cpu_ocr_overlaps_gpu(assignment) -> bool:
 
     A GPU reader stays on one file. CPU indexing shares its cores with
     Tesseract, so a second file would only contend with the first.
+    This is whether the hardware can overlap. The run still stays on one
+    file until parallel OCR is turned on.
     """
     if assignment is None:
         return False
@@ -87,6 +89,16 @@ def cpu_ocr_overlaps_gpu(assignment) -> bool:
     if getattr(index, "kind", "") == "cpu":
         return False
     return getattr(backend, "name", "") == "tesseract"
+
+
+def parallel_ocr_enabled(wanted: bool, assignment) -> bool:
+    """Experimental overlap. Off unless it is turned on and the hardware can do it.
+
+    Off is one file at a time. A PDF or picture is read, then indexed,
+    before the next file starts. A ZIM stores its pages, then reads its
+    PDFs one at a time.
+    """
+    return bool(wanted) and cpu_ocr_overlaps_gpu(assignment)
 
 
 def visual_reads(
@@ -264,6 +276,9 @@ class VisualLane:
         self._errors: dict[str, BaseException] = {}
         self._closed = False
         self._told_spill = False
+        self._ocr_order = None
+        self._embed_order = None
+        self._watcher = None
         self._thread = threading.Thread(target=self._loop, name="nomad-turbo-ocr-ahead", daemon=True)
         self._thread.start()
 
@@ -328,6 +343,78 @@ class VisualLane:
             self._order.remove(source)
             self._order.appendleft(source)
             self._cv.notify()
+        self._publish()
+
+    def bind_orders(self, ocr_order, embed_order) -> None:
+        """Callables that return the saved waiting lists. None leaves the lane's order."""
+        self._ocr_order = ocr_order
+        self._embed_order = embed_order
+
+    def set_watcher(self, callback) -> None:
+        """Called with `view()` when the queue membership changes."""
+        self._watcher = callback
+
+    def arrange(self, order: list[str] | None) -> None:
+        """Reorder reads that have not started. The one already reading stays.
+
+        Sources the list does not name keep their relative order at the end.
+        Finished reads named in the list follow it too, so embed order can
+        move text that is waiting to be stored.
+        """
+        if not order:
+            return
+        with self._cv:
+            self._apply_order(order)
+        self._publish()
+
+    def _apply_order(self, order: list[str]) -> None:
+        from nomad_turbo.queue_view import apply_manual
+
+        self._order = deque(apply_manual(list(self._order), order))
+        self._finished = apply_manual(list(self._finished), order)
+
+    def _pull_orders(self) -> None:
+        """Apply the saved queues. The caller holds the lock."""
+        ocr = self._ocr_order() if callable(self._ocr_order) else None
+        embed = self._embed_order() if callable(self._embed_order) else None
+        if ocr:
+            self._apply_order(ocr)
+        if embed:
+            self._apply_order(embed)
+
+    def view(self) -> dict:
+        """Reading file, queued reads, and finished text that is not stored yet."""
+        with self._lock:
+            def face(source: str) -> dict:
+                job = self._meta.get(source)
+                total = getattr(job, "total_articles", None)
+                return {
+                    "source": source,
+                    "title": getattr(job, "title", "") or source,
+                    "owner": getattr(job, "owner", "") or source,
+                    "article_path": getattr(job, "article_path", "") or "",
+                    "articles": int(getattr(job, "articles", 0) or 0),
+                    "total_articles": int(total) if total else None,
+                    "chunks": int(getattr(job, "chunks", 0) or 0),
+                    "kind": getattr(job, "kind", "") or "",
+                }
+
+            reading = face(self._inflight) if self._inflight else None
+            live = set(self._ready) | set(self._spilled) | set(self._errors)
+            return {
+                "reading": reading,
+                "queued": [face(source) for source in self._order],
+                "ready": [face(source) for source in self._finished if source in live],
+            }
+
+    def _publish(self) -> None:
+        callback = self._watcher
+        if callback is None:
+            return
+        try:
+            callback(self.view())
+        except Exception:
+            log.exception("could not publish the OCR queue")
 
     def offer(self, works, *, front: bool = False) -> None:
         """Queue these reads. A source already known is left where it is.
@@ -353,20 +440,36 @@ class VisualLane:
                 self._meta[source] = work
                 known.add(source)
             self._cv.notify()
+        self._publish()
 
     def take(self, source: str) -> tuple[dict | None, BaseException | None]:
         """The finished read. The source must already have a result."""
         with self._cv:
             self._meta.pop(source, None)
             self._finished = [item for item in self._finished if item != source]
+            found = False
             if source in self._errors:
-                return None, self._errors.pop(source)
-            if source in self._ready:
+                error = self._errors.pop(source)
+                ready = None
+                path = None
+                found = True
+            elif source in self._ready:
                 self._ram -= self._sizes.pop(source, 0)
                 if self._ram < 0:
                     self._ram = 0
-                return self._ready.pop(source), None
-            path = self._spilled.pop(source, None)
+                ready = self._ready.pop(source)
+                error = None
+                path = None
+                found = True
+            else:
+                error = None
+                ready = None
+                path = self._spilled.pop(source, None)
+        self._publish()
+        if error is not None:
+            return None, error
+        if found:
+            return ready, None
         if path is None:
             return None, RuntimeError("ocr did not start")
         try:
@@ -422,12 +525,14 @@ class VisualLane:
             with self._cv:
                 if self._closed or self._abort.is_set() or self._run_stop.is_set():
                     return
+                self._pull_orders()
                 if not self._order:
                     self._cv.wait(timeout=0.3)
                     continue
                 source = self._order.popleft()
                 work = self._meta.get(source)
                 self._inflight = source
+            self._publish()
             if work is None:
                 continue
             try:
@@ -438,10 +543,12 @@ class VisualLane:
                     self._errors[source] = exc
                     self._remember(source)
                     self._cv.notify_all()
+                self._publish()
                 if self._abort.is_set() or self._run_stop.is_set() or str(exc) == "stopped":
                     break
                 continue
             self._keep(source, visual)
+            self._publish()
 
     def _keep(self, source: str, visual) -> None:
         size = text_bytes(visual)

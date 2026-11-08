@@ -434,9 +434,11 @@ class FileWork:
     pass_total: int | None = None
     label: str = ""
     phase: str = "html"
-    # PDFs from this ZIM that are still in the OCR queue, and ones already stored.
+    # PDFs from this ZIM that are still in the OCR queue, ones already stored,
+    # and copies that were not on disk. A missing copy is not tried again.
     ocr_pending: list[str] = field(default_factory=list)
     ocr_done: list[str] = field(default_factory=list)
+    ocr_skipped: list[str] = field(default_factory=list)
 
 
 def _checkpoint_file(source: str) -> Path:
@@ -468,6 +470,7 @@ def _write_checkpoint(work: FileWork) -> None:
                 "pass": getattr(work, "zim_pass", None) or "html",
                 "ocr_pending": list(getattr(work, "ocr_pending", []) or []),
                 "ocr_done": list(getattr(work, "ocr_done", []) or []),
+                "ocr_skipped": list(getattr(work, "ocr_skipped", []) or []),
             }
         )
     )
@@ -599,6 +602,14 @@ def _release_ocr(work: FileWork) -> None:
     if planned is not None and not gpu_ocr.ensure(planned):
         log.warning("GPU OCR did not start. This file uses the CPU reader.")
     paths["go"].write_text("go\n", encoding="utf-8")
+
+
+def _wants_parallel(session: Session | None, install: Install) -> bool:
+    """Experimental overlap. Off unless the saved switch is on."""
+    getter = getattr(session, "parallel_ocr", None) if session is not None else None
+    if callable(getter):
+        return bool(getter())
+    return bool(getattr(install, "parallel_ocr", False))
 
 
 def _wants_control(session: Session | None, install: Install) -> bool:
@@ -1165,6 +1176,7 @@ def _work_list(
             zim_pass = "ocr" if zim_pass == "done" else "html"
         ocr_pending = [str(path) for path in ((checkpoint or {}).get("ocr_pending") or []) if path]
         ocr_done = [str(path) for path in ((checkpoint or {}).get("ocr_done") or []) if path]
+        ocr_skipped = [str(path) for path in ((checkpoint or {}).get("ocr_skipped") or []) if path]
         total = None
         chunks = int((checkpoint or {}).get("chunks") or 0)
         for _job_id, _offset, data in entries:
@@ -1186,6 +1198,7 @@ def _work_list(
                 zim_pass=zim_pass,
                 ocr_pending=ocr_pending,
                 ocr_done=ocr_done,
+                ocr_skipped=ocr_skipped,
             )
         )
     return work
@@ -1489,9 +1502,12 @@ def _index_zim(
     ocr_ahead = False
     if zim_pass == "html":
         try:
-            from nomad_turbo.overlap import cpu_ocr_overlaps_gpu
+            from nomad_turbo.overlap import parallel_ocr_enabled
 
-            ocr_ahead = cpu_ocr_overlaps_gpu(_ocr_assignment(session, install))
+            ocr_ahead = parallel_ocr_enabled(
+                _wants_parallel(session, install),
+                _ocr_assignment(session, install),
+            )
         except Exception:
             log.exception("could not see where OCR will run")
             ocr_ahead = False
@@ -1690,6 +1706,12 @@ def _halt_reason(stop: threading.Event, retire: threading.Event | None = None, s
     return None
 
 
+# A ZIM that is still producing pages keeps the GPU. A half-second gap
+# between articles is not an idle walk. After this long with no page, one
+# finished OCR read can be embedded, then the walk is checked again.
+_ZIM_QUIET_SECONDS = 30
+
+
 def _consume_articles(install, pool, work, stop, session, seen, pull, retire=None, switch_check=None, on_idle=None) -> str:
     """Embed across articles. Checkpoint an article only after its points are stored."""
     feed = ArticleFeed()
@@ -1698,6 +1720,7 @@ def _consume_articles(install, pool, work, stop, session, seen, pull, retire=Non
     saw_done = False
     last_width = None
     error = None
+    quiet_since = time.monotonic()
     try:
         while _halt_reason(stop, retire, switch_check) is None:
             width = _next_call_chunks(pool, session, install)
@@ -1717,6 +1740,7 @@ def _consume_articles(install, pool, work, stop, session, seen, pull, retire=Non
                     ended = True
                     break
                 feed.add(_prepare_article(install, work, item, seen))
+                quiet_since = time.monotonic()
                 _publish_flight(session, work, feed)
             if _halt_reason(stop, retire, switch_check):
                 break
@@ -1727,13 +1751,14 @@ def _consume_articles(install, pool, work, stop, session, seen, pull, retire=Non
                     continue
                 if ended:
                     break
-                # The ZIM has nothing to embed on this turn. A finished OCR
-                # read can use the GPU, then this file is checked again.
-                if on_idle is not None:
+                # The walk has gone quiet. One finished OCR read can use the
+                # GPU, then this ZIM is checked again before another read.
+                if on_idle is not None and time.monotonic() - quiet_since >= _ZIM_QUIET_SECONDS:
                     pipe.retire()
                     if _halt_reason(stop, retire, switch_check):
                         break
                     if on_idle(seen):
+                        quiet_since = time.monotonic()
                         continue
                 continue
             if not pool.urls:
@@ -2461,12 +2486,17 @@ def _next_work(install: Install, pool, session, batch: list[FileWork], stop: thr
         session.clear_index_now()
     measuring = bool(session is not None and hasattr(session, "measuring") and session.measuring())
     defer = _measure_defer(batch, session) if measuring else set()
+    manual = None
+    getter = getattr(session, "embed_queue", None) if session is not None else None
+    if callable(getter):
+        manual = getter()
     picked = pick_next(
         rows,
         choice=choice,
         current=None,
         index_now=index_now,
         defer=defer,
+        manual=manual,
     )
     if picked.target is None:
         if measuring:
@@ -2481,6 +2511,45 @@ def _next_work(install: Install, pool, session, batch: list[FileWork], stop: thr
         arm = getattr(session, "arm_measure_clock", None)
         sample_started = arm() if callable(arm) else time.monotonic()
     return work, sample_started, armed, ""
+
+
+def _saved_queue(session, name: str):
+    getter = getattr(session, name, None) if session is not None else None
+    if not callable(getter):
+        return None
+    return getter()
+
+
+def _publish_lane(session, view) -> None:
+    setter = getattr(session, "set_lane_view", None) if session is not None else None
+    if callable(setter):
+        setter(view)
+
+
+def _load_saved_queues(session) -> None:
+    """The waiting lists from the last Queue window, including a headless Start."""
+    set_embed = getattr(session, "set_embed_queue", None) if session is not None else None
+    set_ocr = getattr(session, "set_ocr_queue", None) if session is not None else None
+    if not callable(set_embed) or not callable(set_ocr):
+        return
+    from nomad_turbo.queue_view import load_queues
+
+    embed, ocr = load_queues()
+    set_embed(embed)
+    set_ocr(ocr)
+
+
+def _sync_saved_queue(lane, session) -> None:
+    """Apply a drag to reads that have not started, then publish the lane."""
+    if lane is None:
+        return
+    ocr = _saved_queue(session, "ocr_queue")
+    if ocr:
+        lane.arrange(ocr)
+    embed = _saved_queue(session, "embed_queue")
+    if embed:
+        lane.arrange(embed)
+    _publish_lane(session, lane.view())
 
 
 def _ocr_job_source(owner: str, article_path: str) -> str:
@@ -2603,13 +2672,20 @@ def _catch_up_exports(lane, work: FileWork) -> None:
     spill = getattr(work, "spill", None) or _spill_paths(work.source)
     work.spill = spill
     done = set(getattr(work, "ocr_done", []) or [])
-    pending = [path for path in (getattr(work, "ocr_pending", []) or []) if path not in done]
+    skipped = [str(path) for path in (getattr(work, "ocr_skipped", []) or []) if path]
+    skip_set = set(skipped)
+    pending = [
+        path
+        for path in (getattr(work, "ocr_pending", []) or [])
+        if path not in done and path not in skip_set
+    ]
     for path in _read_spill_list(spill["ocr"]):
-        if path in done or path in pending:
+        if path in done or path in pending or path in skip_set:
             continue
         pending.append(path)
     spill_id = str(spill["id"])
     kept: list[str] = []
+    newly_skipped = False
     for path in pending:
         host = state_dir() / "ocr-queue" / spill_id / _export_pdf_name(path)
         source = _ocr_job_source(work.source, path)
@@ -2621,7 +2697,26 @@ def _catch_up_exports(lane, work: FileWork) -> None:
             lane.offer([_zim_job(work.source, path, host, Path(path).name)], front=True)
             continue
         log.warning("the OCR copy of %s in %s is missing, so that PDF is left unread", path, work.source)
+        skipped.append(path)
+        skip_set.add(path)
+        newly_skipped = True
     work.ocr_pending = kept
+    work.ocr_skipped = skipped
+    if newly_skipped:
+        _write_checkpoint(work)
+
+
+def _rest_queued_zim(session, work: FileWork) -> None:
+    """A ZIM with PDFs still queued is partial once this OCR article is done.
+
+    The purple bar is only for the PDF the GPU is storing. Leaving the row
+    running paints every such ZIM as if it were embedding at the same time.
+    """
+    if work.done:
+        return
+    work.label = ""
+    work.phase = "html"
+    _report(session, work, "partial")
 
 
 def _finish_queued_zim(work: FileWork, lane, session, finished: set[str]) -> None:
@@ -2721,6 +2816,7 @@ def _embed_ready_source(
             article["title"] = title
         use_seen = seen if seen is not None else set()
         if not _embed_one_article(install, pool, work, stop, session, retire, switch_check, article, use_seen):
+            _rest_queued_zim(session, work)
             return False
         stored = list(getattr(work, "ocr_done", []) or [])
         if article_path not in stored:
@@ -2730,6 +2826,7 @@ def _embed_ready_source(
         work.zim_pass = "queued"
         _write_checkpoint(work)
         _finish_queued_zim(work, lane, session, finished)
+        _rest_queued_zim(session, work)
         return True
     if err is not None:
         log.warning("ocr failed for %s: %s", owner, err)
@@ -2894,6 +2991,7 @@ def execute(
     if wipe and not do_wipe:
         raise RuntimeError("refusing to delete the index without confirmation")
     install = load_install()
+    _load_saved_queues(session)
     if manage_icon:
         write_shortcut(True)
     pool: EmbedPool | None = None
@@ -2984,9 +3082,11 @@ def execute(
             # This window reloads engine on Start. Reload the reader here so
             # that Start also picks up a change in the overlap module.
             importlib.reload(overlap_mod)
-            from nomad_turbo.overlap import VisualLane, cpu_ocr_overlaps_gpu
+            from nomad_turbo.overlap import VisualLane, cpu_ocr_overlaps_gpu, parallel_ocr_enabled
 
-            if cpu_ocr_overlaps_gpu(_ocr_assignment(session, install)):
+            wanted = _wants_parallel(session, install)
+            assignment = _ocr_assignment(session, install)
+            if parallel_ocr_enabled(wanted, assignment):
                 holder: dict = {"lane": None}
 
                 def _ahead(item, _holder=holder):
@@ -3003,12 +3103,19 @@ def execute(
                 lane = VisualLane(_ahead, stop, spill_dir=spill)
                 holder["lane"] = lane
                 log.info(
-                    "CPU OCR reads uploaded PDFs and pictures while the GPU indexes. "
+                    "Experimental. CPU OCR reads uploaded PDFs and pictures while the GPU indexes. "
                     "A PDF found in a ZIM goes to the front of that queue. "
                     "Finished OCR text is embedded after the ZIM the GPU is on, before the next ZIM. "
                     "A plain upload, such as markdown, stays in the embed list and is indexed when the GPU reaches it. "
                     "Finished reads stay in memory until they pass a quarter of system memory, then they wait on disk."
                 )
+            elif cpu_ocr_overlaps_gpu(assignment):
+                log.info(
+                    "One file at a time. OCR waits until the file being indexed is stored. "
+                    "Parallel OCR is experimental and stays off until it is turned on."
+                )
+            elif wanted:
+                log.info("Parallel OCR is on, but this device still reads and indexes one file at a time.")
         except Exception:
             log.exception("could not see where OCR will run")
             if lane is not None:
@@ -3017,6 +3124,14 @@ def execute(
                 except Exception:
                     log.exception("could not stop the OCR read")
             lane = None
+        if lane is not None:
+            lane.bind_orders(
+                lambda: _saved_queue(session, "ocr_queue"),
+                lambda: _saved_queue(session, "embed_queue"),
+            )
+            lane.set_watcher(lambda view, _session=session: _publish_lane(_session, view))
+        else:
+            _publish_lane(session, None)
         failed: set[str] = set()
         retried: set[tuple[str, int]] = set()
         live = _LiveFile()
@@ -3083,6 +3198,7 @@ def execute(
                 idle_note = ""
                 if lane is not None:
                     _fill_upload_queue(lane, install, session, batch, finished, touched)
+                    _sync_saved_queue(lane, session)
                     for queued in batch:
                         if queued.kind == "zim" and queued.zim_pass == "queued":
                             queued.spill = getattr(queued, "spill", None) or _spill_paths(queued.source)

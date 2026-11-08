@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.2.1
+
+### Moderate
+
+- **Parallel OCR** on the Index page is experimental and stays off until it is turned on. Off, one file is read or indexed at a time. A PDF or picture is read, then stored, before the next file starts. A ZIM stores its pages, then reads its PDFs one at a time. On, and when OCR is on the CPU and indexing is on a GPU, CPU OCR reads the next PDF or picture while that GPU indexes. The GPU is not interrupted. The choice is saved and applies the next time indexing starts. Reopen Turbo once so the open window shows the button.
+- **Queue** on the header opens the embed queue and the OCR queue beside the Index page. The left side is files waiting to be embedded. The right side is files waiting for OCR. Drag a waiting file to change what comes next. The file already being read or indexed stays put and shows the same progress as the file list. Index now still comes first. A saved queue is used before priority and before the Order menu. Changing Order clears that arrangement. With Parallel OCR off, both sides are one waiting list: a PDF or a picture is on the right, and a drag on either side rewrites that list. With Parallel OCR on, the right side is the OCR lane, including a PDF found in a ZIM, and text that has finished OCR waits on the left. The arrangement is saved and is used the next time indexing starts, including a headless start. Reopen Turbo once so the open window shows the button.
+
+### Minor
+
+- While a ZIM still has pages coming, the GPU stays on those pages. A pause of a few seconds does not send it off to embed a finished OCR read. After the walk has been quiet for half a minute, one finished read is embedded, then the walk is checked again.
+- A ZIM whose pages are stored and whose PDFs are still waiting shows as partial. It is purple only while one of those PDFs is being stored.
+- A PDF copied out of a ZIM that is no longer on disk is left unread once. Later files do not warn about that copy again.
+
 ## 1.2.0
 
 ### Major

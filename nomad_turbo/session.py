@@ -10,6 +10,18 @@ from nomad_turbo.schedule import normalize_order
 from nomad_turbo.slots import clamp_embed_chunks
 
 
+def _queue_copy(sources: list[str] | None) -> list[str] | None:
+    if not sources:
+        return None
+    found: list[str] = []
+    seen: set[str] = set()
+    for source in sources:
+        if isinstance(source, str) and source and source not in seen:
+            found.append(source)
+            seen.add(source)
+    return found or None
+
+
 class Session:
     def __init__(self, percent: int):
         self.stop = threading.Event()
@@ -49,6 +61,10 @@ class Session:
         self._file_stats = None
         self._tune_auto = False
         self._ocr_quality = "medium"
+        self._parallel_ocr = False
+        self._embed_queue: list[str] | None = None
+        self._ocr_queue: list[str] | None = None
+        self._lane_view: dict | None = None
         self._index_device = "auto"
         self._ocr_device = "auto"
         self._ocr_activity = ""
@@ -225,6 +241,35 @@ class Session:
         with self._lock:
             return self._order
 
+    def set_embed_queue(self, sources: list[str] | None) -> None:
+        """Waiting embed order. None uses the Order menu. The running file is not listed."""
+        with self._lock:
+            self._embed_queue = _queue_copy(sources)
+
+    def embed_queue(self) -> list[str] | None:
+        with self._lock:
+            value = self._embed_queue
+            return None if not value else list(value)
+
+    def set_ocr_queue(self, sources: list[str] | None) -> None:
+        """Waiting OCR order. None leaves the reader's own order."""
+        with self._lock:
+            self._ocr_queue = _queue_copy(sources)
+
+    def ocr_queue(self) -> list[str] | None:
+        with self._lock:
+            value = self._ocr_queue
+            return None if not value else list(value)
+
+    def set_lane_view(self, view: dict | None) -> None:
+        """The OCR reader's queue, for the Queue window. None when that reader is off."""
+        with self._lock:
+            self._lane_view = view
+
+    def lane_view(self) -> dict | None:
+        with self._lock:
+            return self._lane_view
+
     def set_priority(self, source: str, on: bool) -> None:
         """Mark or clear one file. A new mark is what makes a running file switch."""
         with self._lock:
@@ -390,6 +435,14 @@ class Session:
     def ocr_quality(self) -> str:
         with self._lock:
             return self._ocr_quality
+
+    def set_parallel_ocr(self, on: bool) -> None:
+        with self._lock:
+            self._parallel_ocr = bool(on)
+
+    def parallel_ocr(self) -> bool:
+        with self._lock:
+            return self._parallel_ocr
 
     def set_index_device(self, value: str) -> None:
         from nomad_turbo.devices import normalize_device_choice

@@ -898,6 +898,75 @@ class SafeSwitchTest(unittest.TestCase):
             self.assertEqual(outcome, "done")
             self.assertEqual(calls["embed"], 1)
 
+    def test_a_short_gap_stays_on_the_zim_and_a_quiet_walk_embeds_one_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            install = _install(tmp)
+            work = engine.FileWork(
+                host=Path(tmp) / "book.zim",
+                kind="zim",
+                source="/app/storage/zim/book.zim",
+            )
+            session = Session(8)
+
+            class _Pool:
+                urls = ["http://127.0.0.1:9/embed"]
+
+                def batch_width(self, _chunks: int) -> int:
+                    return 1
+
+            def run(clock, pull, on_idle):
+                with mock.patch.object(engine.time, "monotonic", lambda: clock["t"]):
+                    return engine._consume_articles(
+                        install,
+                        _Pool(),
+                        work,
+                        threading.Event(),
+                        session,
+                        set(),
+                        pull,
+                        None,
+                        None,
+                        on_idle,
+                    )
+
+            short = {"n": 0, "idle": 0}
+            clock = {"t": 1000.0}
+
+            def pull_short(_timeout):
+                short["n"] += 1
+                clock["t"] += 0.5
+                if short["n"] >= 4:
+                    return engine._EXTRACT_DONE
+                return None
+
+            def idle_short(_seen):
+                short["idle"] += 1
+                return True
+
+            (Path(tmp) / "state").mkdir()
+            with mock.patch.dict(os.environ, {"NOMAD_TURBO_STATE": str(Path(tmp) / "state")}):
+                outcome = run(clock, pull_short, idle_short)
+            self.assertEqual(outcome, "done")
+            self.assertEqual(short["idle"], 0)
+
+            quiet = {"idle": 0}
+            clock["t"] = 2000.0
+
+            def pull_quiet(_timeout):
+                if quiet["idle"]:
+                    return engine._EXTRACT_DONE
+                clock["t"] += engine._ZIM_QUIET_SECONDS
+                return None
+
+            def idle_quiet(_seen):
+                quiet["idle"] += 1
+                return True
+
+            with mock.patch.dict(os.environ, {"NOMAD_TURBO_STATE": str(Path(tmp) / "state")}):
+                outcome = run(clock, pull_quiet, idle_quiet)
+            self.assertEqual(outcome, "done")
+            self.assertEqual(quiet["idle"], 1)
+
     def test_index_now_on_a_finished_or_missing_file_lets_indexing_continue(self):
         done = "/app/storage/zim/done.zim"
         later = "/app/storage/zim/later.zim"
@@ -1931,10 +2000,37 @@ class IndexPageControlsTest(unittest.TestCase):
                 "Stay on after the last file, and index new files as they arrive",
                 app.keep_check.get_tooltip_text(),
             )
+            self.assertFalse(app.parallel_ocr.get_active())
+            self.assertIn("Experimental", app.parallel_ocr.get_tooltip_text())
+            self.assertIn(app.parallel_ocr, app.ocr_group.get_children())
+            self.assertEqual(app.queue_button.get_label(), "Queue")
+            self.assertIn("priority", app.queue_button.get_tooltip_text().lower())
+            self.assertNotIn(app.queue_button, app.run_group.get_children())
+            header = app.queue_button.get_parent()
+            self.assertIs(header, app.order_combo.get_parent())
+            children = header.get_children()
+            self.assertLess(children.index(app.queue_button), children.index(app.version_label))
+            self.assertLess(children.index(app.version_label), children.index(app.project_link))
+            app.on_queue()
+            self.assertEqual(app.queue_window.get_title(), "Queue")
+            self.assertFalse(app.queue_window.get_modal())
+            self.assertEqual(
+                [column.get_title() for column in app.queue_embed_tree.get_columns()],
+                ["File", "File type", "Status", "Progress", "Articles", "art/min", "Chunks", "ETA"],
+            )
+            self.assertEqual(
+                [column.get_title() for column in app.queue_ocr_tree.get_columns()],
+                ["File", "File type", "Status", "Progress", "Articles", "art/min", "Chunks", "ETA"],
+            )
+            app.on_queue()
+            self.assertTrue(app.queue_window.get_visible())
+            app.queue_window.destroy()
+            self.assertIsNone(app.queue_window)
             for widget in (
                 app.host_button,
                 app.hide_finished,
                 app.keep_check,
+                app.parallel_ocr,
                 app.tune_auto,
                 app.error_check,
                 app.info_check,
@@ -1987,8 +2083,12 @@ class IndexPageControlsTest(unittest.TestCase):
             self.assertIn("keep indexing", app.then_index_button.get_tooltip_text().lower())
             self.assertEqual(app.order_combo.get_active_id(), "library")
             app.session.set_order("name_asc")
+            app.session.set_embed_queue(["/queued.md"])
+            app.session.set_ocr_queue(["/queued.pdf"])
             app.order_combo.set_active_id("size_desc")
             self.assertEqual(app.session.get_order(), "size_desc")
+            self.assertIsNone(app.session.embed_queue())
+            self.assertIsNone(app.session.ocr_queue())
             self.assertEqual(app.install.index_order, "size_desc")
             from nomad_turbo.schedule import normalize_order
 

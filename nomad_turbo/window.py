@@ -35,6 +35,7 @@ from nomad_turbo.progress import (
     embed_server_text,
 )
 from nomad_turbo.qdrant_status import changes_allowed, delete_allowed
+from nomad_turbo.queue_view import build_queue, load_queues, locked_moved, rewrite_side, save_queues
 from nomad_turbo.repair import format_repair_current
 from nomad_turbo.runtime import gpu_rows
 from nomad_turbo.scan import scan_library
@@ -545,6 +546,13 @@ class _Window:
             log.exception("could not read saved file stats")
         if hasattr(session, "bind_file_stats"):
             session.bind_file_stats(self.file_stats)
+        try:
+            embed, ocr = load_queues()
+            if hasattr(session, "set_embed_queue"):
+                session.set_embed_queue(embed)
+                session.set_ocr_queue(ocr)
+        except Exception:
+            log.exception("could not read the saved queue")
         self.memory = memory
         self.log_path = log_path
         self.gtk = gtk
@@ -618,6 +626,11 @@ class _Window:
         self.host_total_mib = memory[0] if memory else 0
         self.cpu_count = os.cpu_count() or 1
         self.tick = 0
+        self.queue_window = None
+        self._queue_drag = False
+        self._queue_boards = None
+        self._queue_order = {"embed": [], "ocr": []}
+        self._queue_locked = {"embed": [], "ocr": []}
         self.save_timer = None
         self.hidden = False
         self.raise_requested = False
@@ -707,6 +720,7 @@ class _Window:
         self.version_label.set_halign(gtk.Align.END)
         self.version_label.set_tooltip_text(TIPS["version"])
         project = gtk.LinkButton.new_with_label(REPO_URL, "Nomad TURBO Index")
+        self.project_link = project
         project.set_halign(gtk.Align.END)
         project.set_tooltip_text(TIPS["project"])
         # The full title stays at the normal window size. A short floor can ellipsize it.
@@ -718,6 +732,11 @@ class _Window:
             link_label.set_width_chars(8)
         header.pack_end(project, False, False, 0)
         header.pack_end(self.version_label, False, False, 0)
+        self.queue_button = gtk.Button(label="Queue")
+        self.queue_button.set_tooltip_text(TIPS["queue"])
+        self.queue_button.set_valign(gtk.Align.CENTER)
+        self.queue_button.connect("clicked", self.on_queue)
+        header.pack_end(self.queue_button, False, False, 0)
         # Order names are wide. A short window clips this row instead of
         # growing past the floor the controls were fitted to.
         header_scroll = gtk.ScrolledWindow()
@@ -904,9 +923,17 @@ class _Window:
             button.connect("toggled", self.on_ocr_quality, name)
         ocr_caption = gtk.Label(label="OCR")
         ocr_caption.set_tooltip_text(TIPS["ocr_quality"])
+        self.parallel_ocr = gtk.ToggleButton(label="Parallel OCR")
+        self.parallel_ocr.set_active(bool(getattr(install, "parallel_ocr", False)))
+        self.parallel_ocr.set_halign(gtk.Align.START)
+        self.parallel_ocr.set_valign(gtk.Align.CENTER)
+        self.parallel_ocr.set_tooltip_text(TIPS["parallel_ocr"])
+        self.session.set_parallel_ocr(bool(getattr(install, "parallel_ocr", False)))
+        self.parallel_ocr.connect("toggled", self.on_parallel_ocr)
         self.ocr_group = self._flow(
             ocr_caption,
             self._linked(self.ocr_low, self.ocr_medium, self.ocr_high),
+            self.parallel_ocr,
         )
         self.tune_auto = gtk.ToggleButton(label="Auto")
         self.tune_auto.set_tooltip_text(TIPS["tune_auto"])
@@ -2358,6 +2385,18 @@ class _Window:
         except Exception:
             log.exception("could not save the stay-on setting")
 
+    def on_parallel_ocr(self, button) -> None:
+        """Experimental overlap. The running file keeps going. The next Start uses this."""
+        value = bool(button.get_active())
+        self.session.set_parallel_ocr(value)
+        self.install.parallel_ocr = value
+        try:
+            save_install(self.install)
+        except Exception:
+            log.exception("could not save the parallel OCR setting")
+        if hasattr(self, "device_sentence"):
+            self._paint_devices()
+
     def on_ocr_quality(self, button, name: str) -> None:
         """One of Low, Medium, or High stays on. The choice is saved."""
         if getattr(self, "_ocr_guard", False):
@@ -2398,7 +2437,267 @@ class _Window:
             save_install(self.install)
         except Exception:
             log.exception("could not save the index order")
+        if hasattr(self.session, "set_embed_queue"):
+            self.session.set_embed_queue(None)
+            self.session.set_ocr_queue(None)
+        try:
+            save_queues(None, None)
+        except Exception:
+            log.exception("could not clear the queue")
         self.refresh_rows()
+        self._paint_queue(None)
+
+    def on_queue(self, *_args) -> None:
+        """Show the embed queue and the OCR queue. A second click raises that window."""
+        window = getattr(self, "queue_window", None)
+        if window is not None:
+            window.present()
+            return
+        self._open_queue_window()
+
+    def _open_queue_window(self) -> None:
+        gtk = self.gtk
+        window = gtk.Window(title="Queue")
+        window.set_modal(False)
+        window.set_transient_for(self.window)
+        window.set_destroy_with_parent(True)
+        window.set_default_size(960, 560)
+        try:
+            origin_x, origin_y = self.window.get_position()
+            width, _height = self.window.get_size()
+            window.move(max(0, origin_x + width + 8), max(0, origin_y))
+        except Exception:
+            log.debug("could not place the queue window", exc_info=True)
+        window.connect("destroy", self._on_queue_destroy)
+        root = gtk.Box(orientation=gtk.Orientation.VERTICAL, spacing=8)
+        root.set_border_width(12)
+        hint = gtk.Label(
+            label=(
+                "The file in progress stays put. Drag a waiting file to change what comes next. "
+                "Index now still comes first. A saved queue comes before priority and before the Order menu."
+            )
+        )
+        hint.set_xalign(0)
+        hint.set_line_wrap(True)
+        hint.set_max_width_chars(80)
+        root.pack_start(hint, False, False, 0)
+        paned = gtk.Paned(orientation=gtk.Orientation.HORIZONTAL)
+        paned.set_wide_handle(True)
+        self.queue_embed_store = gtk.ListStore(*index_store_types())
+        self.queue_ocr_store = gtk.ListStore(*index_store_types())
+        self.queue_embed_tree = self._make_queue_tree(self.queue_embed_store, "queue-embed")
+        self.queue_ocr_tree = self._make_queue_tree(self.queue_ocr_store, "queue-ocr")
+        self.queue_embed_tree.connect("drag-begin", self._on_queue_drag_begin)
+        self.queue_ocr_tree.connect("drag-begin", self._on_queue_drag_begin)
+        self.queue_embed_tree.connect("drag-end", self._on_queue_drag_end, "embed")
+        self.queue_ocr_tree.connect("drag-end", self._on_queue_drag_end, "ocr")
+        paned.pack1(self._queue_column("Embedding", self.queue_embed_tree), True, False)
+        paned.pack2(self._queue_column("OCR", self.queue_ocr_tree), True, False)
+        paned.set_position(460)
+        root.pack_start(paned, True, True, 0)
+        window.add(root)
+        self.queue_window = window
+        self._paint_queue(None)
+        window.show_all()
+
+    def _queue_column(self, title: str, tree):
+        gtk = self.gtk
+        box = gtk.Box(orientation=gtk.Orientation.VERTICAL, spacing=4)
+        label = gtk.Label(label=title)
+        label.set_xalign(0)
+        box.pack_start(label, False, False, 0)
+        scroll = gtk.ScrolledWindow()
+        scroll.set_policy(gtk.PolicyType.AUTOMATIC, gtk.PolicyType.AUTOMATIC)
+        scroll.set_shadow_type(gtk.ShadowType.IN)
+        scroll.add(tree)
+        box.pack_start(scroll, True, True, 0)
+        return box
+
+    def _make_queue_tree(self, store, prefix: str):
+        """File, type, status, and the same progress facts as the file list."""
+        gtk = self.gtk
+        from gi.repository import Pango
+
+        tree = gtk.TreeView(model=store)
+        tree.set_headers_visible(True)
+        tree.set_tooltip_column(COL_SOURCE)
+        tree.set_reorderable(True)
+        tree.get_selection().set_mode(gtk.SelectionMode.SINGLE)
+
+        def headed(title: str, tip: str, cell, **props):
+            column = gtk.TreeViewColumn(title, cell, **props)
+            caption = gtk.Label(label=title)
+            caption.set_tooltip_text(tip)
+            caption.show()
+            column.set_widget(caption)
+            return column
+
+        name_cell = gtk.CellRendererText()
+        name_cell.set_property("ellipsize", Pango.EllipsizeMode.MIDDLE)
+        file_column = gtk.TreeViewColumn()
+        file_column.set_title(INDEX_HEADERS[0])
+        file_label = gtk.Label(label=INDEX_HEADERS[0])
+        file_label.set_tooltip_text(TIPS["col_file"])
+        file_label.show()
+        file_column.set_widget(file_label)
+        mark_cell = gtk.CellRendererText()
+        mark_cell.set_property("foreground", PRIORITY_COLOR)
+        file_column.pack_start(mark_cell, False)
+        file_column.pack_start(name_cell, True)
+        file_column.add_attribute(mark_cell, "text", COL_MARK)
+        file_column.add_attribute(name_cell, "text", COL_NAME)
+        self._add_column(tree, f"{prefix}:File", file_column, text_index=COL_NAME, minimum=140, maximum=360, fit=True)
+        self._add_column(
+            tree,
+            f"{prefix}:File type",
+            headed(INDEX_HEADERS[1], TIPS["col_type"], gtk.CellRendererText(), text=COL_TYPE),
+            text_index=COL_TYPE,
+            minimum=64,
+            maximum=120,
+            fit=True,
+        )
+        self._add_column(
+            tree,
+            f"{prefix}:Status",
+            headed(INDEX_HEADERS[3], TIPS["col_status"], gtk.CellRendererText(), text=COL_STATUS),
+            text_index=COL_STATUS,
+            minimum=80,
+            maximum=160,
+            fit=True,
+        )
+        progress_cell = _pass_renderer(gtk)
+        progress_column = headed(INDEX_HEADERS[4], TIPS["col_progress"], progress_cell)
+        progress_column.set_cell_data_func(progress_cell, self._paint_pass_bar)
+        self._add_column(
+            tree,
+            f"{prefix}:Progress",
+            progress_column,
+            text_index=None,
+            minimum=120,
+            maximum=220,
+            fit=True,
+        )
+        self._add_column(
+            tree,
+            f"{prefix}:Articles",
+            headed(INDEX_HEADERS[5], TIPS["col_articles"], gtk.CellRendererText(), text=COL_ARTICLES),
+            text_index=COL_ARTICLES,
+            minimum=80,
+            maximum=180,
+            fit=True,
+        )
+        self._add_column(
+            tree,
+            f"{prefix}:art/min",
+            headed(INDEX_HEADERS[6], TIPS["col_art_min"], gtk.CellRendererText(), text=COL_ART_MIN),
+            text_index=COL_ART_MIN,
+            minimum=64,
+            maximum=110,
+            fit=True,
+        )
+        self._add_column(
+            tree,
+            f"{prefix}:Chunks",
+            headed(INDEX_HEADERS[7], TIPS["col_chunks"], gtk.CellRendererText(), text=COL_CHUNKS),
+            text_index=COL_CHUNKS,
+            minimum=70,
+            maximum=140,
+            fit=True,
+        )
+        self._add_column(
+            tree,
+            f"{prefix}:ETA",
+            headed(INDEX_HEADERS[9], TIPS["col_eta"], gtk.CellRendererText(), text=COL_ETA),
+            text_index=COL_ETA,
+            minimum=70,
+            maximum=140,
+            expand=True,
+            fit=True,
+        )
+        return tree
+
+    def _on_queue_destroy(self, *_args) -> None:
+        self.queue_window = None
+
+    def _on_queue_drag_begin(self, *_args) -> None:
+        self._queue_drag = True
+
+    def _on_queue_drag_end(self, tree, _context, side: str) -> None:
+        store = self.queue_embed_store if side == "embed" else self.queue_ocr_store
+        sources = [store[index][COL_SOURCE] for index in range(len(store))] if store is not None else []
+        previous = list(self._queue_order.get(side) or [])
+        locked = set(self._queue_locked.get(side) or ())
+        self._queue_drag = False
+        if sources != previous and not locked_moved(previous, sources, locked):
+            self._accept_queue_drag(side, sources)
+        self._paint_queue(None)
+
+    def _accept_queue_drag(self, side: str, sources: list[str]) -> None:
+        boards = self._queue_boards
+        if boards is None or not hasattr(self.session, "set_embed_queue"):
+            return
+        locked = set(self._queue_locked.get(side) or ())
+        waiting = [source for source in sources if source not in locked]
+        if boards.parallel:
+            if side == "embed":
+                self.session.set_embed_queue(waiting)
+            else:
+                self.session.set_ocr_queue(waiting)
+        else:
+            side_ids = boards.embed_waiting if side == "embed" else boards.ocr_waiting
+            full = rewrite_side(list(boards.sequential), side_ids, waiting)
+            visual = [source for source in full if source in set(boards.visual)]
+            self.session.set_embed_queue(full)
+            self.session.set_ocr_queue(visual)
+        try:
+            save_queues(self.session.embed_queue(), self.session.ocr_queue())
+        except Exception:
+            log.exception("could not save the queue")
+
+    def _paint_queue(self, snap) -> None:
+        if getattr(self, "queue_window", None) is None or self._queue_drag:
+            return
+        if snap is None:
+            book = self.session.get_book() if hasattr(self.session, "get_book") else None
+            if book is not None:
+                snap = book.pulse() if hasattr(book, "pulse") else book.snapshot()
+        files = list(getattr(snap, "files", []) or [])
+        dates = self.session.zim_dates() if hasattr(self.session, "zim_dates") else {}
+        lane = self.session.lane_view() if hasattr(self.session, "lane_view") else None
+        embed_order = self.session.embed_queue() if hasattr(self.session, "embed_queue") else None
+        ocr_order = self.session.ocr_queue() if hasattr(self.session, "ocr_queue") else None
+        boards = build_queue(
+            files,
+            choice=self.session.get_order() if hasattr(self.session, "get_order") else "library",
+            priorities=self._priorities(),
+            dates=dates,
+            embed_order=embed_order,
+            ocr_order=ocr_order,
+            lane=lane,
+        )
+        self._queue_boards = boards
+        activity = ""
+        self._fill_queue_store(self.queue_embed_store, boards.embed, "embed", activity)
+        self._fill_queue_store(self.queue_ocr_store, boards.ocr, "ocr", activity)
+
+    def _fill_queue_store(self, store, slots, side: str, activity: str) -> None:
+        priorities = self._priorities()
+        rows = [self._file_values(slot.item, priorities, activity) for slot in slots]
+        sources = [slot.source for slot in slots]
+        current = [store[index][COL_SOURCE] for index in range(len(store))]
+        if sources == current:
+            iterator = store.get_iter_first()
+            for values in rows:
+                if iterator is None:
+                    break
+                self._set_row(store, iterator, values)
+                iterator = store.iter_next(iterator)
+        else:
+            store.clear()
+            for values in rows:
+                store.append(values)
+        self._queue_order[side] = sources
+        self._queue_locked[side] = [slot.source for slot in slots if slot.locked]
 
     def on_hide_finished(self, button) -> None:
         """Show or hide indexed files. The setting is kept for the next open."""
@@ -2916,6 +3215,7 @@ class _Window:
                 self.overall.pulse()
             else:
                 snap = self.refresh_rows()
+            self._paint_queue(snap)
             self.refresh_stats(snap, view)
             self.refresh_usage()
             self.refresh_repair()
@@ -3943,7 +4243,9 @@ class _Window:
             elif self.ocr_combo.get_active() < 0:
                 self.ocr_combo.set_active(0)
             self.ocr_combo.set_sensitive(bool(ocr_gpu))
-            self.device_sentence.set_text(assignment_sentence(assignment))
+            self.device_sentence.set_text(
+                assignment_sentence(assignment, parallel=bool(self.session.parallel_ocr()))
+            )
         finally:
             self._device_guard = False
 

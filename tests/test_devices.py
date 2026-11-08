@@ -62,7 +62,11 @@ class ChoiceTest(unittest.TestCase):
         self.assertEqual(assignment.ocr.kind, "cpu")
         self.assertEqual(assignment.backend.name, "tesseract")
         self.assertFalse(assignment.share)
-        self.assertIn("gives cores back", assignment_sentence(assignment))
+        self.assertIn("waits", assignment_sentence(assignment))
+        self.assertIn("experimental", assignment_sentence(assignment).lower())
+        self.assertIn("one file", assignment_sentence(assignment).lower())
+        self.assertIn("gives cores back", assignment_sentence(assignment, parallel=True))
+        self.assertIn("Experimental", assignment_sentence(assignment, parallel=True))
 
     def test_a_second_card_with_a_reader_is_used_for_ocr(self):
         first = card("nvidia", "GPU-1", major=8, index=0, used=100)

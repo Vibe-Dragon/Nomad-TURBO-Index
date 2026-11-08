@@ -15,6 +15,7 @@ from nomad_turbo.overlap import (
     OcrJob,
     VisualLane,
     cpu_ocr_overlaps_gpu,
+    parallel_ocr_enabled,
     gpu_candidates,
     ocr_ram_budget,
     preview_order,
@@ -63,6 +64,21 @@ class OverlapChoiceTest(unittest.TestCase):
         self.assertFalse(cpu_ocr_overlaps_gpu(_assignment("cpu", "tesseract")))
         self.assertFalse(cpu_ocr_overlaps_gpu(_assignment("nvidia", "easyocr", ocr_kind="nvidia")))
         self.assertFalse(cpu_ocr_overlaps_gpu(None))
+
+    def test_parallel_stays_off_until_it_is_turned_on(self):
+        gpu = _assignment("nvidia", "tesseract")
+        self.assertFalse(parallel_ocr_enabled(False, gpu))
+        self.assertTrue(parallel_ocr_enabled(True, gpu))
+        self.assertFalse(parallel_ocr_enabled(True, _assignment("cpu", "tesseract")))
+        self.assertFalse(parallel_ocr_enabled(True, _assignment("nvidia", "easyocr", ocr_kind="nvidia")))
+        self.assertFalse(parallel_ocr_enabled(True, None))
+        engine = Path(__file__).resolve().parents[1].joinpath("nomad_turbo", "engine.py").read_text(encoding="utf-8")
+        self.assertEqual(engine.count("parallel_ocr_enabled("), 2)
+        from nomad_turbo.discover import Install, load_install
+        import inspect
+
+        self.assertFalse(Install.__dataclass_fields__["parallel_ocr"].default)
+        self.assertIn('"parallel_ocr"', inspect.getsource(load_install))
 
 
 class VisualReadTest(unittest.TestCase):
@@ -286,6 +302,37 @@ class VisualLaneTest(unittest.TestCase):
             time.sleep(0.01)
         self.assertEqual(started, ["upload.pdf", "zim.pdf", "other.pdf"])
 
+    def test_arrange_moves_waiting_reads_and_leaves_the_open_one(self):
+        gate = threading.Event()
+        started: list[str] = []
+        stop = threading.Event()
+
+        def reader(work):
+            started.append(work.source)
+            if work.source == "a.pdf":
+                self.assertTrue(gate.wait(2))
+            return {"text": work.source}
+
+        lane = VisualLane(reader, stop)
+        self.addCleanup(lane.close)
+        self.addCleanup(gate.set)
+        lane.offer([_Work("a.pdf"), _Work("b.pdf"), _Work("c.pdf")])
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and started != ["a.pdf"]:
+            time.sleep(0.01)
+        lane.arrange(["c.pdf", "missing.pdf"])
+        view = lane.view()
+        self.assertEqual(view["reading"]["source"], "a.pdf")
+        self.assertEqual([item["source"] for item in view["queued"]], ["c.pdf", "b.pdf"])
+        gate.set()
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and set(started) != {"a.pdf", "c.pdf", "b.pdf"}:
+            time.sleep(0.01)
+        self.assertEqual(started, ["a.pdf", "c.pdf", "b.pdf"])
+        self.assertEqual(lane.ready_sources(), ["a.pdf", "c.pdf", "b.pdf"])
+        lane.arrange(["b.pdf", "a.pdf"])
+        self.assertEqual(lane.ready_sources(), ["b.pdf", "a.pdf", "c.pdf"])
+
 
 class OcrJobReportTest(unittest.TestCase):
     def test_a_queued_pdf_can_be_reported_before_it_has_articles(self):
@@ -328,3 +375,134 @@ class GpuCandidateTest(unittest.TestCase):
         self.assertIn("notes.md", now)
         plain = [item.source for item in gpu_candidates(files, overlap=False)]
         self.assertEqual(plain, ["maps.zim", "notes.md", "book.pdf", "done.zim"])
+
+
+class QueuedZimRowTest(unittest.TestCase):
+    def test_one_ocr_article_leaves_the_zim_partial(self):
+        import os
+        from unittest import mock
+
+        from nomad_turbo import engine
+        from nomad_turbo.progress import ProgressBook
+        from nomad_turbo.catalog import CatalogRow
+
+        source = "/app/storage/zim/queued.zim"
+        book = ProgressBook(
+            [
+                CatalogRow(
+                    source=source,
+                    name="queued.zim",
+                    origin="zim",
+                    kind="zim",
+                    size_bytes=10,
+                    state="partial",
+                )
+            ]
+        )
+
+        class Session:
+            def get_book(self):
+                return book
+
+            def set_note(self, _note):
+                return None
+
+        work = engine.FileWork(
+            host=Path("/tmp/queued.zim"),
+            kind="zim",
+            source=source,
+            articles=4,
+            chunks=10,
+            zim_pass="queued",
+            ocr_pending=["a.pdf", "b.pdf"],
+            label="OCR text",
+            phase="ocr-text",
+        )
+        job = OcrJob(
+            source=source + "\na.pdf",
+            host=Path("/tmp/a.pdf"),
+            kind="pdf",
+            title="a.pdf",
+            owner=source,
+            article_path="a.pdf",
+        )
+
+        class Lane:
+            def job(self, _source):
+                return job
+
+            def take(self, _source):
+                return {"drew": True, "pages": [{"text": "page"}]}, None
+
+        session = Session()
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(os.environ, {"NOMAD_TURBO_STATE": str(tmp)}):
+                with (
+                    mock.patch.object(engine, "_embed_one_article", return_value=True),
+                    mock.patch.object(engine, "_finish_queued_zim", lambda *_args: None),
+                ):
+                    stored = engine._embed_ready_source(
+                        Lane(),
+                        job.source,
+                        None,
+                        None,
+                        threading.Event(),
+                        session,
+                        [work],
+                        set(),
+                        [],
+                        None,
+                        None,
+                        set(),
+                    )
+        self.assertTrue(stored)
+        shown = book.files_for([source])[source]
+        self.assertEqual(shown.state, "partial")
+        self.assertEqual(shown.status, "partial")
+        self.assertEqual(work.ocr_pending, ["b.pdf"])
+
+    def test_a_missing_zim_pdf_is_skipped_once(self):
+        import json
+        import os
+        from unittest import mock
+
+        from nomad_turbo import engine
+
+        source = "/app/storage/zim/library.zim"
+        path = "www.example.com/missing.pdf"
+        warnings = []
+
+        class Lane:
+            def pending(self, _source):
+                return False
+
+            def has_result(self, _source):
+                return False
+
+            def offer(self, _jobs, front=False):
+                raise AssertionError("a missing PDF was queued")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(os.environ, {"NOMAD_TURBO_STATE": str(tmp)}):
+                work = engine.FileWork(host=Path(tmp) / "library.zim", kind="zim", source=source)
+                spill = engine._spill_paths(source)
+                work.spill = spill
+                spill["ocr"].write_text(json.dumps(path) + "\n", encoding="utf-8")
+                with mock.patch.object(engine.log, "warning", lambda *args: warnings.append(args)):
+                    engine._catch_up_exports(Lane(), work)
+                    engine._catch_up_exports(Lane(), work)
+                self.assertEqual(len(warnings), 1)
+                self.assertEqual(work.ocr_pending, [])
+                self.assertEqual(work.ocr_skipped, [path])
+                saved = json.loads(engine._checkpoint_file(source).read_text())
+                self.assertEqual(saved["ocr_skipped"], [path])
+                again = engine.FileWork(
+                    host=work.host,
+                    kind="zim",
+                    source=source,
+                    ocr_skipped=saved["ocr_skipped"],
+                )
+                again.spill = spill
+                with mock.patch.object(engine.log, "warning", lambda *args: warnings.append(args)):
+                    engine._catch_up_exports(Lane(), again)
+                self.assertEqual(len(warnings), 1)

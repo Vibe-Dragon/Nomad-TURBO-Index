@@ -576,7 +576,7 @@ def resolve_assignment(
     return Assignment(index, ocr, backend, share)
 
 
-def assignment_sentence(assignment: Assignment) -> str:
+def assignment_sentence(assignment: Assignment, *, parallel: bool = False) -> str:
     index_where = "the CPU" if assignment.index.kind == "cpu" else assignment.index.name
     if assignment.backend.name == "tesseract":
         ocr_where = "the CPU"
@@ -593,10 +593,17 @@ def assignment_sentence(assignment: Assignment) -> str:
     elif assignment.index.kind == "cpu":
         parts.append("Page drawing gives cores back while the CPU embedder or Qdrant is busy.")
     elif assignment.backend.name == "tesseract":
-        parts.append(
-            "OCR reads the next PDF or picture while that GPU indexes the file it already has, "
-            "and gives cores back while Qdrant is writing or optimizing."
-        )
+        if parallel:
+            parts.append(
+                "Experimental. OCR reads the next PDF or picture while that GPU indexes "
+                "the file it already has, and gives cores back while Qdrant is writing or optimizing."
+            )
+        else:
+            parts.append(
+                "OCR waits until that file is stored. "
+                "One file is read or indexed at a time. "
+                "Parallel OCR is experimental and stays off until it is turned on."
+            )
     else:
         parts.append("OCR and indexing run at the same time.")
     return " ".join(parts)

@@ -193,6 +193,11 @@ class CollectionLogTest(unittest.TestCase):
             (directory / "session.log").write_text("2026-11-07 17:26:37,826 INFO this collection\n")
             with patch("nomad_turbo.logbook._read_clock", return_value=_clock(born)):
                 align_running_logs(directory, object())
+            # The open handler follows the machine clock. Pin it to the
+            # collection's day so the next line stays in that day's file.
+            for handler in logging.getLogger().handlers:
+                if isinstance(handler, DailyLogHandler):
+                    handler.clock = lambda: datetime(2026, 11, 7, 18, 0, 0)
             follow = logging.getLogger("nomad_turbo_align")
             follow.setLevel(logging.DEBUG)
             follow.info("still going")

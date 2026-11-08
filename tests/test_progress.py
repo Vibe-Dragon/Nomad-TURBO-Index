@@ -1281,11 +1281,17 @@ class AboutAndLayoutTest(unittest.TestCase):
         self.assertIn("Project NOMAD 1.35.1", changelog)
         self.assertIn("shared rows", changelog)
         notes = changelog.split(f"## {__version__}", 1)[1].split("\n## ", 1)[0]
-        self.assertIn("Settings", notes)
-        self.assertIn("200 dpi", notes)
-        self.assertIn("1570", notes)
-        self.assertIn("1536", notes)
-        self.assertIn("left out", notes)
+        self.assertIn("Parallel OCR", notes)
+        self.assertIn("Queue", notes)
+        self.assertIn("half a minute", notes)
+        self.assertIn("partial", notes)
+        self.assertIn("left unread once", notes)
+        released_120 = changelog.split("## 1.2.0", 1)[1].split("\n## ", 1)[0]
+        self.assertIn("Settings", released_120)
+        self.assertIn("200 dpi", released_120)
+        self.assertIn("1570", released_120)
+        self.assertIn("1536", released_120)
+        self.assertIn("left out", released_120)
         released_117 = changelog.split("## 1.1.7", 1)[1].split("\n## ", 1)[0]
         self.assertIn("has not been started", released_117)
         self.assertIn("not handed to NOMAD", released_117)
@@ -1311,7 +1317,8 @@ class AboutAndLayoutTest(unittest.TestCase):
         previous_notes = changelog.split("## 1.1.4", 1)[1].split("\n## ", 1)[0]
         self.assertIn("Auto", previous_notes)
         self.assertIn("finished embed calls", previous_notes)
-        self.assertLess(changelog.index(f"## {__version__}"), changelog.index("## 1.1.7"))
+        self.assertLess(changelog.index(f"## {__version__}"), changelog.index("## 1.2.0"))
+        self.assertLess(changelog.index("## 1.2.0"), changelog.index("## 1.1.7"))
         self.assertLess(changelog.index("## 1.1.7"), changelog.index("## 1.1.6"))
         self.assertLess(changelog.index("## 1.1.6"), changelog.index("## 1.1.5"))
         self.assertLess(changelog.index("## 1.1.5"), changelog.index("## 1.1.4"))

@@ -80,6 +80,8 @@ class Install:
     window_max: bool = False
     # How hard a PDF page or a picture is drawn. low, medium, or high.
     ocr_quality: str = "medium"
+    # Experimental. Off reads or indexes one file at a time.
+    parallel_ocr: bool = False
     # auto, cpu, or a card id such as nvidia:<uuid>. The OCR engine is not stored.
     index_device: str = "auto"
     ocr_device: str = "auto"
@@ -284,6 +286,7 @@ def load_install() -> Install:
         "window_height",
         "window_max",
         "ocr_quality",
+        "parallel_ocr",
         "index_device",
         "ocr_device",
     ):
