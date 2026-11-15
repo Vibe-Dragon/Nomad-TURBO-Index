@@ -26,6 +26,7 @@ from nomad_turbo.host import (
     pick_cpu_temp,
     plot_segments,
     rate_ceiling,
+    shown_history,
     storage_disks,
     vram_caption,
 )
@@ -199,6 +200,14 @@ class HostReadingTest(unittest.TestCase):
         self.assertIn("_READ", panel)
         self.assertIn("_WRITE", panel)
         self.assertNotIn("self.disk_label", panel)
+
+    def test_a_live_sample_beats_a_saved_reading(self):
+        saved = (HostPoint(cpu=10),)
+        live = (HostPoint(cpu=10), HostPoint(cpu=40))
+        self.assertEqual(shown_history(None, saved, live), live)
+        self.assertEqual(shown_history(saved, None, live), saved)
+        self.assertEqual(shown_history(None, saved, ()), saved)
+        self.assertEqual(shown_history(None, None, ()), ())
 
     def test_the_host_window_place_round_trips_and_is_not_a_gpu_name(self):
         install = _install()

@@ -43,6 +43,12 @@ class FileStat:
     min_chunk_rate: float | None = None
     max_chunk_rate: float | None = None
     measured_eta_seconds: int | None = None
+    skipped_articles: int = 0
+    bad_articles: int = 0
+    ocr_documents: int = 0
+    counts_at: float | None = None
+    inventory_pages: int | None = None
+    inventory_units: int | None = None
 
 
 def _known_fields() -> set[str]:
@@ -92,7 +98,7 @@ def format_chunks(chunks: int) -> str:
     return f"{int(chunks):,}"
 
 
-def detail_lines(stat: FileStat) -> list[tuple[str, str]]:
+def detail_lines(stat: FileStat, *, status: str = "") -> list[tuple[str, str]]:
     """Every saved fact, in the order the details window shows them."""
     from nomad_turbo.catalog import status_word
     from nomad_turbo.progress import format_bytes, format_eta
@@ -100,14 +106,15 @@ def detail_lines(stat: FileStat) -> list[tuple[str, str]]:
     name = stat.name or (stat.source.rsplit("/", 1)[-1] if stat.source else "")
     zim = stat.zim_date if stat.zim_date else EM_DASH
     eta = EM_DASH if stat.measured_eta_seconds is None else format_eta(stat.measured_eta_seconds)
-    return [
+    shown = status or (status_word(stat.state) if stat.state else EM_DASH)
+    lines = [
         ("Name", name or EM_DASH),
         ("File type", stat.file_type or EM_DASH),
         ("Size", format_bytes(int(stat.size_bytes or 0))),
         ("Location", stat.location or stat.source or EM_DASH),
         ("Date downloaded", format_downloaded(stat.mtime)),
         ("ZIM date", zim),
-        ("Status", status_word(stat.state) if stat.state else EM_DASH),
+        ("Status", shown),
         ("Priority", "prioritized" if stat.priority else "not prioritized"),
         ("Articles", format_articles(stat.articles, stat.total_articles)),
         ("Chunks", format_chunks(stat.chunks)),
@@ -119,6 +126,21 @@ def detail_lines(stat: FileStat) -> list[tuple[str, str]]:
         ("Maximum chk/s", format_chunk_pace(stat.max_chunk_rate)),
         ("Last measured ETA", eta),
     ]
+    if _zim_file(stat):
+        lines.extend(
+            [
+                ("Skipped articles", f"{int(stat.skipped_articles or 0):,}"),
+                ("Bad articles", f"{int(stat.bad_articles or 0):,}"),
+                ("OCR'd documents", f"{int(stat.ocr_documents or 0):,}"),
+            ]
+        )
+    return lines
+
+
+def _zim_file(stat: FileStat) -> bool:
+    kind = (stat.file_type or "").casefold()
+    name = (stat.name or stat.source or "").casefold()
+    return kind == "zim" or name.endswith(".zim")
 
 
 def detail_text(stat: FileStat) -> str:
@@ -217,6 +239,15 @@ def _row_from(source: str, item: dict) -> FileStat:
         row.zim_known = True
     if row.measured_eta_seconds is not None:
         row.measured_eta_seconds = int(row.measured_eta_seconds)
+    row.skipped_articles = int(row.skipped_articles or 0)
+    row.bad_articles = int(row.bad_articles or 0)
+    row.ocr_documents = int(row.ocr_documents or 0)
+    if row.counts_at is not None:
+        row.counts_at = float(row.counts_at)
+    if row.inventory_pages is not None:
+        row.inventory_pages = int(row.inventory_pages)
+    if row.inventory_units is not None:
+        row.inventory_units = int(row.inventory_units)
     return row
 
 
@@ -483,6 +514,79 @@ class FileStats:
             measured=True,
             eta_seconds=eta_seconds,
         )
+
+    def note_zim_counts(
+        self,
+        source: str,
+        *,
+        skipped: int,
+        bad: int,
+        ocr_documents: int,
+    ) -> None:
+        """Remember how many articles this ZIM skipped, failed, and OCR'd."""
+        with self._lock:
+            row = self._ensure(source)
+            skipped = int(skipped or 0)
+            bad = int(bad or 0)
+            documents = int(ocr_documents or 0)
+            if (
+                row.skipped_articles == skipped
+                and row.bad_articles == bad
+                and row.ocr_documents == documents
+            ):
+                return
+            row.skipped_articles = skipped
+            row.bad_articles = bad
+            row.ocr_documents = documents
+            row.counts_at = time.time()
+            self._touch(source)
+
+    def note_inventory(
+        self,
+        source: str,
+        *,
+        pages: int | None,
+        units: int | None,
+    ) -> None:
+        """Remember the page and document total Measure found."""
+        with self._lock:
+            row = self._ensure(source)
+            changed = False
+            if pages is not None and row.inventory_pages != int(pages):
+                row.inventory_pages = int(pages)
+                changed = True
+            if units is not None and row.inventory_units != int(units):
+                row.inventory_units = int(units)
+                changed = True
+            if changed:
+                self._touch(source)
+
+    def apply_collection_clock(self, kind: str, epoch: int) -> bool:
+        """Zero per-file skipped, bad, and OCR counts when the collection clock says so.
+
+        Measurements and priority stay. Returns True when a count was cleared.
+        """
+        from datetime import datetime
+
+        from nomad_turbo.logbook import record_survives
+
+        with self._lock:
+            changed = False
+            for row in self._rows.values():
+                if not (row.skipped_articles or row.bad_articles or row.ocr_documents):
+                    continue
+                stamp = datetime.fromtimestamp(row.counts_at) if row.counts_at else None
+                if record_survives(stamp, kind, epoch):
+                    continue
+                row.skipped_articles = 0
+                row.bad_articles = 0
+                row.ocr_documents = 0
+                row.counts_at = None
+                self._touch(row.source)
+                changed = changed or True
+        if changed:
+            self.save()
+        return changed
 
     def note_zim_date(self, source: str, raw: str | None) -> bool:
         value = "" if raw is None else str(raw)

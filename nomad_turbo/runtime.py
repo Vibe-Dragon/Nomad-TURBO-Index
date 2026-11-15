@@ -135,19 +135,42 @@ def gpu_rows() -> list[tuple[int, int, int]]:
     return rows
 
 
+def _container_present(name: str) -> bool:
+    result = subprocess.run(
+        ["docker", "inspect", "-f", "{{.Id}}", name],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return result.returncode == 0
+
+
 def _remove_ours(name: str) -> None:
+    """Remove one of our containers and wait until the name is free.
+
+    A forced remove can outlive the client that asked for it. Starting a
+    replacement while that name is still taken makes `docker run` print its
+    help text and leave no server.
+    """
     if not name.startswith("nomad-turbo-"):
         raise RuntimeError_(f"refusing to remove {name}")
-    try:
-        subprocess.run(
-            ["docker", "rm", "-f", name],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-            timeout=20,
-        )
-    except subprocess.TimeoutExpired:
-        log.warning("timed out removing %s", name)
+    deadline = time.monotonic() + 60
+    while _container_present(name):
+        try:
+            subprocess.run(
+                ["docker", "rm", "-f", name],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=20,
+            )
+        except subprocess.TimeoutExpired:
+            log.warning("timed out removing %s", name)
+        if not _container_present(name):
+            return
+        if time.monotonic() >= deadline:
+            raise RuntimeError_(f"could not remove {name}")
+        time.sleep(1)
 
 
 def release_extract(proc: subprocess.Popen) -> None:
@@ -271,11 +294,21 @@ def start_embedder(
         "--keep",
         "4",
     ]
-    try:
-        subprocess.run(command, check=True, capture_output=True, text=True)
-    except subprocess.CalledProcessError as exc:
-        detail = (exc.stderr or exc.stdout or "").strip().splitlines()
-        raise RuntimeError_("could not start an embed container: " + (detail[-1] if detail else name)) from exc
+    last_detail = name
+    started = False
+    for _attempt in range(3):
+        _remove_ours(name)
+        try:
+            subprocess.run(command, check=True, capture_output=True, text=True)
+            started = True
+            break
+        except subprocess.CalledProcessError as exc:
+            detail = (exc.stderr or exc.stdout or "").strip().splitlines()
+            last_detail = " | ".join(detail[-4:]) if detail else name
+            log.warning("embed container start failed: %s", last_detail)
+            time.sleep(1)
+    if not started:
+        raise RuntimeError_("could not start an embed container: " + last_detail)
     mapping = subprocess.check_output(["docker", "port", name, "11434/tcp"], text=True).strip().splitlines()
     if not mapping:
         raise RuntimeError_(f"{name} did not publish a port")
@@ -309,6 +342,10 @@ class ChunkRejected(RuntimeError_):
         super().__init__(detail)
         self.index = int(index)
         self.detail = detail
+
+
+class ChunkTimedOut(ChunkRejected):
+    """One input did not come back. The rest of the file can continue."""
 
 
 class _BatchRejected(Exception):
@@ -425,11 +462,31 @@ def _post_with_retry(post, texts: list[str], attempts: int, pause) -> list[list[
     raise RuntimeError_(f"embedder {last}")
 
 
+def _reraise_rejected(err: ChunkRejected, shift: int) -> None:
+    """Keep a timeout on its own type. The index is into the call that was split."""
+    kind = ChunkTimedOut if isinstance(err, ChunkTimedOut) else ChunkRejected
+    raise kind(err.index + shift, err.detail) from err
+
+
+def _call_unanswered(exc: BaseException) -> bool:
+    """True when the embedder did not answer, rather than returning a bad vector."""
+    text = str(exc).lower()
+    if "vectors" in text and "returned" in text:
+        return False
+    return (
+        "timed out" in text
+        or "timeout" in text
+        or "connection" in text
+        or "did not answer" in text
+    )
+
+
 def collect_embeddings(post, texts: list[str], attempts: int = 3, pause=time.sleep) -> list[list[float]]:
     """One vector per text. A 400 is split until the bad input is alone.
 
     That input raises ChunkRejected. The caller splits or skips it and continues
-    the file. Timeouts and connection drops are tried again.
+    the file. A call that does not answer is split the same way. One input that
+    still does not answer raises ChunkTimedOut.
     """
     if not texts:
         return []
@@ -438,7 +495,10 @@ def collect_embeddings(post, texts: list[str], attempts: int = 3, pause=time.sle
 
 def _collect(post, texts: list[str], attempts: int, pause) -> list[list[float]]:
     try:
-        return _post_with_retry(post, texts, attempts, pause)
+        # A wide call that does not answer is split on the first miss. Retrying
+        # that same call is what held a file until it was marked failed.
+        tries = 1 if len(texts) > 1 else attempts
+        return _post_with_retry(post, texts, tries, pause)
     except _BatchRejected as exc:
         if len(texts) == 1:
             raise ChunkRejected(0, exc.detail) from exc
@@ -446,15 +506,35 @@ def _collect(post, texts: list[str], attempts: int, pause) -> list[list[float]]:
         try:
             left = _collect(post, texts[:mid], attempts, pause)
         except ChunkRejected as err:
-            raise ChunkRejected(err.index, err.detail) from err
+            _reraise_rejected(err, 0)
         try:
             right = _collect(post, texts[mid:], attempts, pause)
         except ChunkRejected as err:
-            raise ChunkRejected(err.index + mid, err.detail) from err
+            _reraise_rejected(err, mid)
+        return left + right
+    except RuntimeError_ as exc:
+        if not _call_unanswered(exc):
+            raise
+        if len(texts) == 1:
+            raise ChunkTimedOut(0, str(exc)) from exc
+        mid = max(1, len(texts) // 2)
+        try:
+            left = _collect(post, texts[:mid], attempts, pause)
+        except ChunkRejected as err:
+            _reraise_rejected(err, 0)
+        try:
+            right = _collect(post, texts[mid:], attempts, pause)
+        except ChunkRejected as err:
+            _reraise_rejected(err, mid)
         return left + right
 
 
 def embed(base_url: str, model: str, texts: list[str]) -> list[list[float]]:
+    from nomad_turbo.live import Workload
+
+    host = Workload.current()
+    if host is not None and not Workload.inside():
+        return host.call("nomad_turbo.runtime:embed", (base_url, model, texts))
     del model
     if not texts:
         return []
@@ -567,6 +647,10 @@ def start_extract(
     ocr_env: dict[str, str] | None = None,
     ocr_ahead: bool = False,
     ocr_queue: bool = False,
+    zim_documents: bool = False,
+    ocr_every_pdf: bool = False,
+    defer_documents: bool = False,
+    only_path: str | None = None,
 ) -> subprocess.Popen:
     name = "nomad-turbo-extract"
     _remove_ours(name)
@@ -625,6 +709,14 @@ def start_extract(
         command += ["--ocr-ahead"]
     if ocr_queue:
         command += ["--ocr-queue"]
+    if zim_documents:
+        command += ["--zim-documents"]
+    if ocr_every_pdf:
+        command += ["--ocr-every-pdf"]
+    if defer_documents:
+        command += ["--defer-documents"]
+    if only_path:
+        command += ["--only", only_path]
     return subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
 
@@ -660,12 +752,19 @@ def read_visual(
     on_status=None,
     quality: str = "medium",
     ocr_env: dict[str, str] | None = None,
+    ocr_every_pdf: bool = False,
 ) -> dict | None:
     """Pages of one uploaded PDF or picture, using the NOMAD image's OCR libraries.
 
-    The text layer is kept. A page is drawn according to the quality setting.
+    The text layer is kept. A page that already has text is drawn when
+    ocr_every_pdf is set. A page with no text is drawn either way.
     Turbo embeds the result itself and does not write it back into the file.
     """
+    from nomad_turbo.live import Workload
+
+    host = Workload.current()
+    if host is not None and not Workload.inside():
+        return host.read_visual(install, host_path, kind, stop, on_status, quality, ocr_env, ocr_every_pdf)
     if kind not in ("pdf", "image"):
         return None
     if not (TESSDATA / "eng.traineddata.gz").is_file():
@@ -708,6 +807,8 @@ def read_visual(
         "--format",
         "pages",
     ]
+    if ocr_every_pdf:
+        command.append("--ocr-every-pdf")
     try:
         proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     except OSError as exc:

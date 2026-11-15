@@ -29,6 +29,20 @@ from nomad_turbo.slots import (
 log = logging.getLogger("nomad_turbo")
 
 
+def require_embedder(pool) -> None:
+    """Start the embed server again when a restart left none running."""
+    if getattr(pool, "urls", None):
+        return
+    bring_back = getattr(pool, "_start_one", None)
+    if callable(bring_back):
+        try:
+            bring_back()
+        except Exception:
+            log.exception("could not bring the embed server back")
+    if not getattr(pool, "urls", None):
+        raise RuntimeError("the embed server is not running")
+
+
 def should_change_slots(batch_open: bool, active: int, desired: int) -> bool:
     """Older helper. The live indexer does not add or remove servers mid-run."""
     if batch_open:
@@ -164,8 +178,13 @@ class EmbedPool:
         free = max(0, self.total_mib - used)
         return embed_sequences(True, free) == 2
 
-    def note_sequences(self, mean_tokens: int, chunks: int, seconds: float, stop) -> None:
-        """Step to two sequences, or back to one when long calls got slower."""
+    def note_sequences(self, mean_tokens: int, chunks: int, seconds: float, stop, source: str = "") -> None:
+        """Step to two sequences, or back to one when long calls got slower.
+
+        The choice stays for the run. A new file does not reload the server.
+        The source names the file the call came from.
+        """
+        self.pace.begin_file(source)
         self.pace.note(self.sequences, mean_tokens, chunks, seconds)
         if stop is not None and getattr(stop, "is_set", lambda: False)():
             return
@@ -177,6 +196,11 @@ class EmbedPool:
         except Exception as exc:
             log.warning("embed sequences stayed at %s: %s", self.sequences, exc)
             self.pace.locked_at_one = True
+            if not self.urls:
+                try:
+                    self._restore_embedder()
+                except Exception:
+                    log.exception("embed server stayed down after the sequence change")
             return
         self.pace.mark_resized()
         if reason == "slower":
@@ -194,8 +218,24 @@ class EmbedPool:
             self._start_one()
         except Exception:
             self.sequences = previous
-            self._start_one()
+            self._restore_embedder()
             raise
+
+    def _restore_embedder(self) -> None:
+        """Start the width already selected. A failed swap must not leave none."""
+        pause = float(getattr(self, "_restore_pause", 1))
+        last: Exception | None = None
+        for _attempt in range(3):
+            try:
+                self._start_one()
+            except Exception as exc:
+                last = exc
+                if pause:
+                    time.sleep(pause)
+                continue
+            return
+        if last is not None:
+            raise last
 
     def _start_one(self) -> None:
         url, name = start_embedder(

@@ -62,9 +62,13 @@ class Session:
         self._tune_auto = False
         self._ocr_quality = "medium"
         self._parallel_ocr = False
+        self._zim_documents = False
+        self._running_document = None
+        self._ocr_every_pdf = False
         self._embed_queue: list[str] | None = None
         self._ocr_queue: list[str] | None = None
         self._lane_view: dict | None = None
+        self._embedding_file: dict | None = None
         self._index_device = "auto"
         self._ocr_device = "auto"
         self._ocr_activity = ""
@@ -73,6 +77,16 @@ class Session:
     def set_chunks(self, chunks: int) -> None:
         with self._lock:
             self.chunks = clamp_embed_chunks(chunks)
+
+    def try_set_chunks(self, chunks: int) -> bool:
+        """Set the chunk count unless a worker already holds the lock."""
+        if not self._lock.acquire(blocking=False):
+            return False
+        try:
+            self.chunks = clamp_embed_chunks(chunks)
+            return True
+        finally:
+            self._lock.release()
 
     def get_chunks(self) -> int:
         with self._lock:
@@ -270,6 +284,16 @@ class Session:
         with self._lock:
             return self._lane_view
 
+    def set_embedding_file(self, face: dict | None) -> None:
+        """The document the GPU is storing when that document has no library row."""
+        with self._lock:
+            self._embedding_file = None if not face else dict(face)
+
+    def embedding_file(self) -> dict | None:
+        with self._lock:
+            face = self._embedding_file
+            return None if face is None else dict(face)
+
     def set_priority(self, source: str, on: bool) -> None:
         """Mark or clear one file. A new mark is what makes a running file switch."""
         with self._lock:
@@ -443,6 +467,34 @@ class Session:
     def parallel_ocr(self) -> bool:
         with self._lock:
             return self._parallel_ocr
+
+    def set_zim_documents(self, on: bool) -> None:
+        with self._lock:
+            self._zim_documents = bool(on)
+
+    def zim_documents(self) -> bool:
+        with self._lock:
+            return self._zim_documents
+
+    def set_running_document(self, source: str | None, path: str | None = None) -> None:
+        """The inner document being read. The file list reads the same fact from disk."""
+        with self._lock:
+            if not source or not path:
+                self._running_document = None
+                return
+            self._running_document = (str(source), str(path))
+
+    def running_document(self) -> tuple[str, str] | None:
+        with self._lock:
+            return getattr(self, "_running_document", None)
+
+    def set_ocr_every_pdf(self, on: bool) -> None:
+        with self._lock:
+            self._ocr_every_pdf = bool(on)
+
+    def ocr_every_pdf(self) -> bool:
+        with self._lock:
+            return bool(getattr(self, "_ocr_every_pdf", False))
 
     def set_index_device(self, value: str) -> None:
         from nomad_turbo.devices import normalize_device_choice

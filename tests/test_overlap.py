@@ -73,12 +73,17 @@ class OverlapChoiceTest(unittest.TestCase):
         self.assertFalse(parallel_ocr_enabled(True, _assignment("nvidia", "easyocr", ocr_kind="nvidia")))
         self.assertFalse(parallel_ocr_enabled(True, None))
         engine = Path(__file__).resolve().parents[1].joinpath("nomad_turbo", "engine.py").read_text(encoding="utf-8")
-        self.assertEqual(engine.count("parallel_ocr_enabled("), 2)
+        # Parallel OCR starts from this one gate. Documents inside a ZIM wait for the bonus pass.
+        self.assertEqual(engine.count("parallel_ocr_enabled("), 1)
         from nomad_turbo.discover import Install, load_install
         import inspect
 
         self.assertFalse(Install.__dataclass_fields__["parallel_ocr"].default)
         self.assertIn('"parallel_ocr"', inspect.getsource(load_install))
+        self.assertFalse(Install.__dataclass_fields__["zim_documents"].default)
+        self.assertIn('"zim_documents"', inspect.getsource(load_install))
+        self.assertFalse(Install.__dataclass_fields__["ocr_every_pdf"].default)
+        self.assertIn('"ocr_every_pdf"', inspect.getsource(load_install))
 
 
 class VisualReadTest(unittest.TestCase):
@@ -415,7 +420,7 @@ class QueuedZimRowTest(unittest.TestCase):
             chunks=10,
             zim_pass="queued",
             ocr_pending=["a.pdf", "b.pdf"],
-            label="OCR text",
+            label="text",
             phase="ocr-text",
         )
         job = OcrJob(
@@ -435,10 +440,16 @@ class QueuedZimRowTest(unittest.TestCase):
                 return {"drew": True, "pages": [{"text": "page"}]}, None
 
         session = Session()
+        seen = {}
+
+        def embed(*_args, **_kwargs):
+            seen["label"] = work.label
+            return True
+
         with tempfile.TemporaryDirectory() as tmp:
             with mock.patch.dict(os.environ, {"NOMAD_TURBO_STATE": str(tmp)}):
                 with (
-                    mock.patch.object(engine, "_embed_one_article", return_value=True),
+                    mock.patch.object(engine, "_embed_one_article", side_effect=embed),
                     mock.patch.object(engine, "_finish_queued_zim", lambda *_args: None),
                 ):
                     stored = engine._embed_ready_source(
@@ -456,10 +467,37 @@ class QueuedZimRowTest(unittest.TestCase):
                         set(),
                     )
         self.assertTrue(stored)
+        self.assertEqual(seen["label"], "text")
         shown = book.files_for([source])[source]
         self.assertEqual(shown.state, "partial")
-        self.assertEqual(shown.status, "partial")
+        self.assertEqual(shown.status, "Waiting OCR")
         self.assertEqual(work.ocr_pending, ["b.pdf"])
+
+    def test_an_older_book_still_takes_the_report(self):
+        from nomad_turbo import engine
+
+        source = "/app/storage/zim/queued.zim"
+        seen = []
+
+        class OldBook:
+            def update(self, path, **fields):
+                if "waiting_ocr" in fields:
+                    raise TypeError("update() got an unexpected keyword argument 'waiting_ocr'")
+                seen.append((path, fields["state"]))
+
+        class Session:
+            def get_book(self):
+                return OldBook()
+
+        work = engine.FileWork(
+            host=Path("/tmp/queued.zim"),
+            kind="zim",
+            source=source,
+            zim_pass="queued",
+            ocr_pending=["a.pdf"],
+        )
+        engine._report(Session(), work, "partial")
+        self.assertEqual(seen, [(source, "partial")])
 
     def test_a_missing_zim_pdf_is_skipped_once(self):
         import json
@@ -506,3 +544,99 @@ class QueuedZimRowTest(unittest.TestCase):
                 with mock.patch.object(engine.log, "warning", lambda *args: warnings.append(args)):
                     engine._catch_up_exports(Lane(), again)
                 self.assertEqual(len(warnings), 1)
+
+
+class EmbedSlotTest(unittest.TestCase):
+    def _session(self, book):
+        class Session:
+            def get_book(self):
+                return book
+
+            def set_note(self, _note):
+                return None
+
+            def set_ocr_activity(self, _note):
+                return None
+
+            def clear_ocr_activity(self, _name):
+                return None
+
+        return Session()
+
+    def test_a_finished_read_waits_until_the_gpu_stores_it(self):
+        from unittest import mock
+
+        from nomad_turbo import engine
+        from nomad_turbo.catalog import CatalogRow
+        from nomad_turbo.progress import ProgressBook
+
+        source = "/app/storage/kb_uploads/scan.pdf"
+        book = ProgressBook(
+            [CatalogRow(source, "scan.pdf", "upload", "pdf", 10, "pending", chunks=4)]
+        )
+        session = self._session(book)
+        work = engine.FileWork(host=Path("/tmp/scan.pdf"), kind="pdf", source=source)
+        seen = {}
+
+        def read_visual(*_args, **_kwargs):
+            on_status = _args[4]
+            on_status("ocr page 1 of 2 text")
+            seen["during"] = book.file_snap(source).state
+            on_status("ocr page 2 of 2 1700x2200")
+            seen["drawn"] = book.file_snap(source)
+            return {"drew": True, "pages": [{"text": "layer"}, {"text": "scan"}]}
+
+        with (
+            mock.patch.object(engine, "read_visual", side_effect=read_visual),
+            mock.patch.object(engine, "_ocr_container", return_value={}),
+        ):
+            visual = engine._read_plain_visual(None, work, threading.Event(), session, announce=False)
+        self.assertTrue(visual["drew"])
+        self.assertEqual(seen["during"], "pending")
+        self.assertEqual(seen["drawn"].state, "running")
+        self.assertEqual(seen["drawn"].status, "OCR")
+        shown = book.file_snap(source)
+        self.assertEqual(shown.state, "partial")
+        self.assertEqual(shown.status, "partial")
+        self.assertEqual(shown.percent, 0)
+        self.assertEqual(shown.chunks, 4)
+        self.assertEqual(work.label, "text")
+
+    def test_storing_a_finished_pdf_uses_the_text_bar(self):
+        from unittest import mock
+
+        from nomad_turbo import engine
+        from nomad_turbo.catalog import CatalogRow
+        from nomad_turbo.progress import ProgressBook
+
+        source = "/app/storage/kb_uploads/scan.pdf"
+        book = ProgressBook([CatalogRow(source, "scan.pdf", "upload", "pdf", 10, "pending")])
+        book.update(
+            source,
+            articles=0,
+            total=None,
+            chunks=0,
+            state="running",
+            label="OCR text",
+            pass_done=12,
+            pass_total=12,
+        )
+        session = self._session(book)
+        work = engine.FileWork(
+            host=Path("/tmp/scan.pdf"),
+            kind="pdf",
+            source=source,
+            label="OCR text",
+            phase="ocr-text",
+            pass_done=12,
+            pass_total=12,
+        )
+        with mock.patch.object(engine, "_consume_articles", return_value="stopped"):
+            engine._embed_plain_article(
+                None, None, work, threading.Event(), session, None, None, {"text": "page"}
+            )
+        shown = book.file_snap(source)
+        self.assertEqual(shown.state, "running")
+        self.assertEqual(shown.status, "text")
+        self.assertEqual(shown.percent, 0)
+        self.assertEqual(work.pass_total, None)

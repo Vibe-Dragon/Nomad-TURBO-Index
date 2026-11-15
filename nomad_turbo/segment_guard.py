@@ -220,6 +220,33 @@ def report_optimize(stage: str, detail: str) -> str:
     return line
 
 
+@dataclass(frozen=True)
+class OptimizeWatch:
+    """Optimizer code seen on the polls so far, and how many times it repeated."""
+
+    code: str = ""
+    seen: int = 0
+
+
+def optimize_log_due(previous: OptimizeWatch | None, code: str) -> tuple[OptimizeWatch, bool]:
+    """Whether this poll should write a line.
+
+    Alternating codes write nothing. A code that is still the same on the
+    next poll writes one line, not another line on every later poll. An
+    error writes on the poll that first reports it.
+    """
+    previous = previous or OptimizeWatch()
+    text = str(code or "")
+    if text == "error":
+        if previous.code != "error":
+            return OptimizeWatch("error", 1), True
+        return OptimizeWatch("error", previous.seen + 1), False
+    if text != previous.code:
+        return OptimizeWatch(text, 1), False
+    seen = previous.seen + 1
+    return OptimizeWatch(text, seen), seen == 2
+
+
 def optimize_watch_line(code: str, detail: str) -> tuple[int, str]:
     """Level and one log line for a status change.
 

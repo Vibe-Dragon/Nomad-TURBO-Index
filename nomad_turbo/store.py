@@ -136,6 +136,26 @@ def ingest_states(install: Install) -> dict[str, str]:
     return {path: state for path, (state, _chunks) in ingest_details(install).items()}
 
 
+def installed_zim_rows(install: Install) -> list[tuple[str, str, str, str]]:
+    """resource id, installed version, file path, and offered version.
+
+    An empty offered version means no update is waiting. The row is the
+    edition on disk. It does not name a path that was already replaced.
+    """
+    text = _sql(
+        install,
+        "SELECT resource_id, version, file_path, IFNULL(available_update_version, '') "
+        "FROM installed_resources WHERE resource_type='zim';\n",
+    )
+    rows: list[tuple[str, str, str, str]] = []
+    for line in text.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 4 or not parts[2]:
+            continue
+        rows.append((parts[0], parts[1], parts[2], parts[3]))
+    return rows
+
+
 def ingest_details(install: Install) -> dict[str, tuple[str, int]]:
     text = _sql(install, "SELECT file_path, state, chunks_embedded FROM kb_ingest_state;\n")
     out: dict[str, tuple[str, int]] = {}
@@ -233,12 +253,18 @@ def forget_ingest(install: Install, file_path: str) -> None:
 
 
 def mark_pending(install: Install, file_path: str, chunks: int) -> None:
-    """Block backfill_indexed without claiming the file is finished."""
+    """Keep a partial file pending_decision, including a row that already exists.
+
+    An indexed row is not passed here. record_file_finish leaves that state
+    alone. backfill_indexed and any other unfinished state become
+    pending_decision, so a restart does not treat the file as finished.
+    """
     _sql(
         install,
         "INSERT INTO kb_ingest_state (file_path, state, chunks_embedded, created_at, updated_at) "
         f"VALUES ({quote(file_path)}, 'pending_decision', {int(chunks)}, NOW(), NOW()) "
-        "ON DUPLICATE KEY UPDATE chunks_embedded=GREATEST(chunks_embedded, VALUES(chunks_embedded)), "
+        "ON DUPLICATE KEY UPDATE state='pending_decision', "
+        "chunks_embedded=GREATEST(chunks_embedded, VALUES(chunks_embedded)), "
         "updated_at=NOW();\n",
     )
 

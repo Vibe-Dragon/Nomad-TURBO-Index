@@ -82,11 +82,37 @@ class IdleTest(unittest.TestCase):
         self.assertEqual(article_outcome("parse", already_stored=False, stored_chunks=0), "bad")
         self.assertEqual(article_outcome("read", already_stored=False, stored_chunks=0), "bad")
         self.assertEqual(article_outcome("empty", already_stored=False, stored_chunks=0), "skipped")
+        self.assertEqual(article_outcome("language", already_stored=False, stored_chunks=0), "skipped")
         self.assertEqual(article_outcome(None, already_stored=False, stored_chunks=0), "skipped")
         self.assertEqual(article_outcome(None, already_stored=False, stored_chunks=4), "indexed")
         self.assertEqual(article_outcome("parse", already_stored=True, stored_chunks=0), "indexed")
         self.assertEqual(article_outcome("embed", already_stored=False, stored_chunks=0), "bad")
         self.assertEqual(article_outcome("embed", already_stored=True, stored_chunks=0), "indexed")
+
+    def test_a_non_english_read_is_not_prepared_for_embedding(self):
+        from nomad_turbo.engine import FileWork, _article_from_visual, _prepare_article
+
+        work = FileWork(host=Path("guide.pdf"), kind="pdf", source="/app/storage/kb_uploads/guide.pdf")
+        visual = {
+            "pages": [{"page": 1, "layer": "Le guide pour les familles dans la maison", "ocr": ""}],
+            "drew": False,
+            "skip": "language",
+        }
+        article = _article_from_visual(work, visual)
+        self.assertEqual(article.get("skip"), "language")
+        self.assertEqual(article.get("sections"), [])
+        self.assertNotIn("pages", article)
+        kept = _article_from_visual(work, {"pages": [{"page": 1, "layer": "The guide", "ocr": ""}], "drew": False})
+        self.assertNotIn("skip", kept)
+        self.assertEqual(kept["pages"][0]["layer"], "The guide")
+        picture = FileWork(host=Path("scan.jpg"), kind="image", source="/app/storage/kb_uploads/scan.jpg")
+        image = _article_from_visual(picture, {"ocr": "", "drew": True, "pages": [], "skip": "language"})
+        self.assertEqual(image.get("skip"), "language")
+        self.assertNotIn("ocr", image)
+        install = type("Install", (), {"document_prefix": ""})()
+        prepared = _prepare_article(install, work, article, set())
+        self.assertEqual(prepared.inputs, [])
+        self.assertEqual(prepared.article.get("skip"), "language")
 
     def test_a_file_is_failed_only_after_the_same_article_breaks_twice(self):
         seen: set[tuple[str, int]] = set()
@@ -130,6 +156,62 @@ class CatalogTest(unittest.TestCase):
             ),
             "pending",
         )
+
+    def test_a_queued_zim_says_waiting_ocr_and_stays_partial(self):
+        from nomad_turbo.catalog import status_word, waiting_on_ocr
+
+        self.assertEqual(status_word("partial", waiting_ocr=True), "Waiting OCR")
+        self.assertEqual(status_word("partial"), "partial")
+        self.assertEqual(status_word("running", waiting_ocr=True), "indexing")
+        self.assertEqual(status_word("failed", waiting_ocr=True), "failed")
+        self.assertTrue(waiting_on_ocr("partial", kind="zim", phase="queued", done=False))
+        self.assertTrue(waiting_on_ocr("partial", kind="zim", phase="ocr", done=False))
+        self.assertFalse(waiting_on_ocr("partial", kind="zim", phase="html", done=False))
+        self.assertFalse(waiting_on_ocr("partial", kind="pdf", phase="queued", done=False))
+        self.assertFalse(waiting_on_ocr("running", kind="zim", phase="queued", done=False))
+        self.assertFalse(waiting_on_ocr("partial", kind="zim", phase="queued", done=True))
+
+        book = ProgressBook(
+            [
+                CatalogRow(
+                    "shelf.zim", "shelf.zim", "zim", "zim", 10, "partial", 2, 1, waiting_ocr=True
+                ),
+                CatalogRow("wiki.zim", "wiki.zim", "zim", "zim", 10, "partial", 10, 100),
+                CatalogRow("notes.pdf", "notes.pdf", "upload", "pdf", 10, "partial", 1, 1),
+            ]
+        )
+        shown = {item.name: item for item in book.snapshot(now=0).files}
+        self.assertEqual(shown["shelf.zim"].status, "Waiting OCR")
+        self.assertEqual(shown["shelf.zim"].state, "partial")
+        self.assertEqual(shown["shelf.zim"].percent, 100)
+        self.assertEqual(shown["wiki.zim"].status, "partial")
+        self.assertEqual(shown["notes.pdf"].status, "partial")
+        book.update(
+            "shelf.zim",
+            articles=2,
+            total=1,
+            chunks=2,
+            state="running",
+            label="text",
+            waiting_ocr=False,
+            now=1,
+        )
+        running = book.files_for(["shelf.zim"])["shelf.zim"]
+        self.assertEqual(running.status, "text")
+        self.assertEqual(running.state, "running")
+        book.update(
+            "shelf.zim",
+            articles=3,
+            total=1,
+            chunks=3,
+            state="partial",
+            label="",
+            waiting_ocr=True,
+            now=2,
+        )
+        again = book.files_for(["shelf.zim"])["shelf.zim"]
+        self.assertEqual(again.status, "Waiting OCR")
+        self.assertEqual(again.state, "partial")
 
     def test_wipe_needs_the_button_and_the_typed_phrase(self):
         self.assertTrue(wipe_phrase_ok(" DELETE "))
@@ -197,6 +279,8 @@ class ProgressTest(unittest.TestCase):
         self.assertEqual(pulse.chunks_stored, snap.chunks_stored)
         self.assertEqual(pulse.skipped, snap.skipped)
         self.assertEqual([item.source for item in pulse.files], ["b.zim"])
+        opened = [item.source for item in book.open_snaps(now=12)]
+        self.assertEqual(opened, ["b.zim", "c.pdf"])
         self.assertEqual(pulse.files[0].count, snap.files[1].count)
         self.assertEqual(pulse.files[0].eta, snap.files[1].eta)
         empty = ProgressBook([])
@@ -277,7 +361,10 @@ class ProgressTest(unittest.TestCase):
         snap = book.snapshot(now=0)
         by_name = {item.name: item for item in snap.files}
         self.assertEqual(by_name["old.zim"].state, "running")
-        self.assertEqual(by_name["old.zim"].count, "50 / 100")
+        self.assertEqual(by_name["old.zim"].count, "50 / 50")
+        self.assertEqual(by_name["old.zim"].percent, 50)
+        self.assertEqual(by_name["old.zim"].embedded, 500)
+        self.assertEqual(by_name["new.zim"].embedded, -1)
         self.assertEqual(by_name["new.zim"].status, "waiting")
         book.drop("/app/storage/zim/new.zim")
         self.assertNotIn("new.zim", {item.name for item in book.snapshot(now=0).files})
@@ -305,11 +392,14 @@ class ProgressTest(unittest.TestCase):
         self.assertEqual(format_current_file(None)[0], "No file is indexing.")
 
     def test_the_file_bar_shows_a_percent_during_ocr(self):
-        from nomad_turbo.window import pass_percent_text
+        from nomad_turbo.window import dual_percent_text, pass_percent_text
 
         self.assertEqual(pass_percent_text(0), "0%")
         self.assertEqual(pass_percent_text(52), "52%")
         self.assertEqual(pass_percent_text(100), "100%")
+        self.assertEqual(dual_percent_text(0, 1), "0.0% / 0.1%")
+        self.assertEqual(dual_percent_text(50, 560), "50.0% / 56.0%")
+        self.assertEqual(dual_percent_text(41, 412), "41.0% / 41.2%")
 
     def test_ocr_names_the_file_and_counts_pages(self):
         self.assertEqual(ocr_page("ocr page 12 of 317 1450x1925"), (12, 317))
@@ -346,6 +436,7 @@ class ProgressTest(unittest.TestCase):
             COL_ART_MIN,
             COL_CHUNKS,
             COL_ETA,
+            COL_EMBEDDED,
             COL_ETA_SORT,
             COL_PROGRESS,
             COL_STATUS,
@@ -368,6 +459,7 @@ class ProgressTest(unittest.TestCase):
         shown = overlay_ocr_columns(row, ocr_note("book.pdf", 14, 40), ppm)
         self.assertEqual(shown[COL_STATUS], "OCR")
         self.assertEqual(shown[COL_PROGRESS], 35)
+        self.assertEqual(shown[COL_EMBEDDED], -1)
         self.assertEqual(shown[COL_ARTICLES], "14 / 40")
         self.assertEqual(shown[COL_ART_MIN], "60")
         self.assertEqual(shown[COL_CHUNKS], row[COL_CHUNKS])
@@ -381,7 +473,16 @@ class ProgressTest(unittest.TestCase):
         self.assertIsNone(pace.observe(ocr_note("other.pdf", 2, 8), now=11))
 
     def test_one_article_file_shows_chunk_progress_while_it_embeds(self):
-        from nomad_turbo.schedule import COL_ARTICLES, COL_ART_MIN, COL_CHUNKS, COL_CHUNKS_SORT, COL_CHK_S, index_store_row
+        from nomad_turbo.schedule import (
+            COL_ARTICLES,
+            COL_ART_MIN,
+            COL_CHUNKS,
+            COL_CHUNKS_SORT,
+            COL_CHK_S,
+            COL_EMBEDDED,
+            COL_PROGRESS,
+            index_store_row,
+        )
 
         book = ProgressBook([CatalogRow("a.pdf", "a.pdf", "upload", "pdf", 5000, "pending")])
         book.update("a.pdf", articles=0, total=1, chunks=0, state="running", now=0)
@@ -405,18 +506,21 @@ class ProgressTest(unittest.TestCase):
         self.assertEqual(item.count, "0 / 1")
         self.assertEqual(item.chunks, 0)
         self.assertEqual(item.chunks_text, "50")
-        self.assertEqual(item.percent, 25)
+        self.assertEqual(item.percent, 0)
+        self.assertEqual(item.embedded, 250)
         self.assertEqual(item.chk_text, "5")
         self.assertEqual(item.art_text, "—")
         self.assertEqual(item.eta, format_eta(30))
         row = index_store_row(item, priority=False)
         self.assertEqual(row[COL_ARTICLES], "0 / 1")
+        self.assertEqual(row[COL_PROGRESS], 0)
+        self.assertEqual(row[COL_EMBEDDED], 250)
         self.assertEqual(row[COL_ART_MIN], "—")
         self.assertEqual(row[COL_CHUNKS], "50")
         self.assertEqual(row[COL_CHUNKS_SORT], 50)
         self.assertEqual(row[COL_CHK_S], "5")
         _title, fraction, text = format_current_file(book.snapshot(now=10))
-        self.assertAlmostEqual(fraction, 0.25)
+        self.assertAlmostEqual(fraction, 0.0)
         self.assertIn("50 chunks", text)
         self.assertIn("0 / 1 articles", text)
         book.update("a.pdf", articles=1, total=1, chunks=200, state="running", now=12)
@@ -426,6 +530,38 @@ class ProgressTest(unittest.TestCase):
         self.assertEqual(done.chunks_text, "200")
         self.assertEqual(done.percent, 100)
         self.assertEqual(done.count, "1 / 1")
+
+    def test_a_running_zim_shows_saved_and_live_chunk_progress(self):
+        book = ProgressBook(
+            [CatalogRow("b.zim", "b.zim", "zim", "zim", 1000, "pending")]
+        )
+        class _Stats:
+            def __init__(self) -> None:
+                self.notes = 0
+
+            def note_progress(self, *_args, **_kwargs) -> None:
+                self.notes += 1
+
+            def note_rates(self, *_args, **_kwargs) -> None:
+                return None
+
+        stats = _Stats()
+        book.attach_stats(stats)
+        book.update("b.zim", articles=10, total=100, chunks=100, state="running", now=0)
+        book.update("b.zim", articles=10, total=100, chunks=100, state="running", now=30)
+        book.note_live("b.zim", 100, 10, now=0)
+        book.note_live("b.zim", 130, 12, now=0)
+        book.note_live("b.zim", 190, 16, now=10)
+        book.note_live("b.zim", 50, 1, now=10.5)
+        self.assertEqual(stats.notes, 2)
+        item = book.snapshot(now=12).files[0]
+        self.assertEqual(item.percent, 10)
+        self.assertEqual(item.embedded, 190)
+        self.assertEqual(item.count, "10 / 90")
+        self.assertEqual(item.chk_text, "6")
+        self.assertEqual(item.art_text, "24")
+        self.assertEqual(item.chunks_text, "100")
+        self.assertEqual(item.eta, format_eta(225))
 
     def test_column_width_uses_the_longest_text_and_stays_inside_the_limits(self):
         self.assertEqual(format_bytes(0), "—")
@@ -560,7 +696,7 @@ class ProgressTest(unittest.TestCase):
         index.append(row)
         self.assertEqual(index[0][COL_SIZE_SORT], askubuntu)
         self.assertEqual(index[0][COL_TYPE], "zim")
-        self.assertEqual(len(row), 19)
+        self.assertEqual(len(row), 20)
         repair = Gtk.ListStore(*repair_store_types())
         repair.append(("src", "name", "problem", "3e9", 0, -1, "waiting", "0s", "tip", "#4488ff", 3_000_000_000, 0))
         self.assertEqual(repair[0][10], 3_000_000_000)
@@ -1281,11 +1417,17 @@ class AboutAndLayoutTest(unittest.TestCase):
         self.assertIn("Project NOMAD 1.35.1", changelog)
         self.assertIn("shared rows", changelog)
         notes = changelog.split(f"## {__version__}", 1)[1].split("\n## ", 1)[0]
-        self.assertIn("Parallel OCR", notes)
-        self.assertIn("Queue", notes)
-        self.assertIn("half a minute", notes)
-        self.assertIn("partial", notes)
-        self.assertIn("left unread once", notes)
+        self.assertIn("ZIM documents", notes)
+        self.assertIn("OCR every PDF", notes)
+        self.assertIn("OCR workers", notes)
+        self.assertIn("2048", notes)
+        self.assertIn("Waiting OCR", notes)
+        released_121 = changelog.split("## 1.2.1", 1)[1].split("\n## ", 1)[0]
+        self.assertIn("Parallel OCR", released_121)
+        self.assertIn("Queue", released_121)
+        self.assertIn("half a minute", released_121)
+        self.assertIn("partial", released_121)
+        self.assertIn("left unread once", released_121)
         released_120 = changelog.split("## 1.2.0", 1)[1].split("\n## ", 1)[0]
         self.assertIn("Settings", released_120)
         self.assertIn("200 dpi", released_120)
@@ -1317,7 +1459,8 @@ class AboutAndLayoutTest(unittest.TestCase):
         previous_notes = changelog.split("## 1.1.4", 1)[1].split("\n## ", 1)[0]
         self.assertIn("Auto", previous_notes)
         self.assertIn("finished embed calls", previous_notes)
-        self.assertLess(changelog.index(f"## {__version__}"), changelog.index("## 1.2.0"))
+        self.assertLess(changelog.index(f"## {__version__}"), changelog.index("## 1.2.1"))
+        self.assertLess(changelog.index("## 1.2.1"), changelog.index("## 1.2.0"))
         self.assertLess(changelog.index("## 1.2.0"), changelog.index("## 1.1.7"))
         self.assertLess(changelog.index("## 1.1.7"), changelog.index("## 1.1.6"))
         self.assertLess(changelog.index("## 1.1.6"), changelog.index("## 1.1.5"))

@@ -1,9 +1,12 @@
 // Read one uploaded PDF or image with the OCR libraries in the NOMAD image.
 // This does not call NOMAD's embedder. Turbo chunks the text and embeds it.
 //
-// Every PDF page keeps its text layer. Low draws only a page with no text.
-// Medium and High draw every page. OCR words the text layer already covers
-// are not stored again. Pages are read together, one Tesseract worker for each
+// Every English PDF page keeps its text layer. A page that is clearly not
+// English is left out. A file with no English page is not drawn and not
+// returned. A scan with no text layer is judged on its first page. A page
+// that already has text is left as that text unless --ocr-every-pdf is set.
+// A page with no text is drawn either way. OCR words the text layer already
+// covers are not stored again. Pages are read together, one Tesseract worker for each
 // hardware thread after two threads are left free. A worker finishes the page
 // it is on and waits while other programs are using the CPU, then takes a
 // thread back when that work is gone. The process also runs at a lower
@@ -14,12 +17,12 @@
 // pdf2pic draws a page at 768x512 unless it is told the size, so the reader
 // used to ask GraphicsMagick for that size and then draw the page. That read
 // every page twice. The size now comes from the PDF page box, and GraphicsMagick
-// draws each page once from the page box. Low is 200 dpi with a 4000 px cap and
-// skips a page that already has text. Medium is 300 dpi and 8000 px. High is
-// 400 dpi and 12000 px. Only Low still shrinks the width to 2000. sharp then
-// does grayscale, normalize, and sharpen.
-// A picture uses the same quality. The traineddata file is the same
-// one tesseract.js loads for that call. Do not download another at run time.
+// draws each page once from the page box. Low is 200 dpi with a 4000 px cap.
+// Medium is 300 dpi and 8000 px. High is 400 dpi and 12000 px. Only Low still
+// shrinks the width to 2000. sharp then does grayscale, normalize, and sharpen.
+// A picture uses the same quality. A picture that is not English is read
+// once and then left out. The traineddata file is the same one tesseract.js
+// loads for that call. Do not download another at run time.
 import { createRequire } from "node:module";
 import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { connect } from "node:net";
@@ -33,13 +36,15 @@ const gm = require("gm");
 const { PDFParse } = require("pdf-parse");
 const { createWorker, OEM } = require("tesseract.js");
 
-// Medium is the everyday draw. Low skips a page that already has text.
-// High keeps tiny labels. The long side stops so one page cannot fill memory.
-export function qualityProfile(name) {
+// Medium is the everyday draw. High keeps tiny labels. The long side stops
+// so one page cannot fill memory. drawFilled follows --ocr-every-pdf and
+// stays off unless that flag is set, at every quality.
+export function qualityProfile(name, drawFilled = false) {
   const key = String(name || "medium").toLowerCase();
-  if (key === "low") return { name: "low", dpi: 200, cap: 4000, shrink: true, drawFilled: false };
-  if (key === "high") return { name: "high", dpi: 400, cap: 12000, shrink: false, drawFilled: true };
-  return { name: "medium", dpi: 300, cap: 8000, shrink: false, drawFilled: true };
+  const draw = Boolean(drawFilled);
+  if (key === "low") return { name: "low", dpi: 200, cap: 4000, shrink: true, drawFilled: draw };
+  if (key === "high") return { name: "high", dpi: 400, cap: 12000, shrink: false, drawFilled: draw };
+  return { name: "medium", dpi: 300, cap: 8000, shrink: false, drawFilled: draw };
 }
 
 let activeProfile = qualityProfile("medium");
@@ -578,6 +583,90 @@ function renderPage(pdfPath, page, pixels) {
   });
 }
 
+// Function words only. Nothing is downloaded to recognize a language.
+// True is English, false is clearly some other language, and null is too
+// little text to judge. A short caption stays null so it is kept.
+const ENGLISH_WORDS = new Set(
+  "the of and to that for with this from have are was were been which their there would could should about into than then these those what when where who will your they them his her its but not you our has had can may also such only other over after before because while is".split(/\s+/),
+);
+const OTHER_WORDS = new Set(
+  "le la les des une est dans pour que qui pas sur avec sont cette ces aux mais nous vous leur comme aussi etre ete dont donc chez entre apres avant sous sans peut elle ils du au se ne un ce sa ses quand alors bien encore ici tout fait tres tre et ou es il par de und der die das den dem ein eine nicht ist sich auf fur fuer mit von auch nach bei aus wie oder aber wenn nur noch kann wird sind durch gegen ohne zwischen el las del por con una para como mas pero sus este esta entre cuando muy tambien sobre hay son fue estan het van een niet voor naar ook nog wel zijn che sono della degli nella das dass fur uber für über été très où après être".split(/\s+/),
+);
+for (const word of ENGLISH_WORDS) {
+  OTHER_WORDS.delete(word);
+}
+
+export function englishProse(text) {
+  const raw = String(text || "");
+  let letters = 0;
+  let latin = 0;
+  for (const ch of raw) {
+    if (!/\p{L}/u.test(ch)) {
+      continue;
+    }
+    letters += 1;
+    if (/\p{Script=Latin}/u.test(ch)) {
+      latin += 1;
+    }
+  }
+  const nonLatin = letters - latin;
+  if (letters >= 40 && nonLatin >= 12 && nonLatin / letters >= 0.2) {
+    return false;
+  }
+  const words = raw.toLowerCase().match(/[a-zà-ÿœæ]+/gu) || [];
+  if (letters < 40 || words.length < 8) {
+    return null;
+  }
+  let english = 0;
+  let other = 0;
+  let accented = 0;
+  for (const word of words) {
+    if (/[à-ÿœæ]/u.test(word)) {
+      accented += 1;
+    }
+    if (ENGLISH_WORDS.has(word)) {
+      english += 1;
+    } else if (OTHER_WORDS.has(word)) {
+      other += 1;
+    }
+  }
+  if (english >= 4 && english >= other) {
+    return true;
+  }
+  if (english >= 8) {
+    return true;
+  }
+  if (other >= 4 && other > english * 2) {
+    return false;
+  }
+  if (words.length >= 12 && accented >= 4 && accented / words.length >= 0.1 && english <= 1) {
+    return false;
+  }
+  return null;
+}
+
+// keep is the pages to read. sample means the text layer was too thin to
+// judge, so the first kept page has to be read before the rest. skipped is
+// how many pages were clearly not English.
+export function selectEnglishPages(pageNumbers, byNum) {
+  const labels = pageNumbers.map((page) => ({
+    page,
+    verdict: englishProse((byNum && byNum.get(page)) || ""),
+  }));
+  const judged = labels.filter((row) => row.verdict !== null);
+  const english = judged.some((row) => row.verdict === true);
+  const foreign = labels.filter((row) => row.verdict === false);
+  if (judged.length && !english) {
+    return { keep: [], sample: false, skipped: foreign.length };
+  }
+  const drop = new Set(foreign.map((row) => row.page));
+  return {
+    keep: pageNumbers.filter((page) => !drop.has(page)),
+    sample: judged.length === 0 && pageNumbers.length > 0,
+    skipped: foreign.length,
+  };
+}
+
 export async function pdfLayer(buffer) {
   const doc = await pdfDocument(buffer);
   const pages = [];
@@ -594,117 +683,153 @@ export async function readPdf(buffer, profile = activeProfile) {
   const byNum = doc.byNum;
   const layerChars = [...byNum.values()].reduce((sum, text) => sum + text.length, 0);
   const filled = profile.drawFilled ? "every page" : "pages with no text layer";
+  const knownPages = doc.total > 0 ? Array.from({ length: doc.total }, (_, index) => index + 1) : [];
+  if (knownPages.length && !selectEnglishPages(knownPages, byNum).keep.length) {
+    console.error(`pdf text layer ${layerChars} chars, quality ${profile.name}`);
+    console.error("ocr skip, text is not english");
+    return { pages: [], drew: false, skip: "language" };
+  }
   console.error(`pdf text layer ${layerChars} chars, quality ${profile.name}, reading ${filled}`);
   const dir = mkdtempSync(join(tmpdir(), "nomad-turbo-pdf-"));
   const pdfPath = join(dir, "input.pdf");
   try {
     writeFileSync(pdfPath, buffer);
-    let pageNumbers = doc.total > 0 ? Array.from({ length: doc.total }, (_, index) => index + 1) : [];
-    if (!pageNumbers.length) {
-      pageNumbers = (await gmIdentify(pdfPath, "%p "))
+    let foundPages = knownPages;
+    if (!foundPages.length) {
+      foundPages = (await gmIdentify(pdfPath, "%p "))
         .split(/\s+/)
         .map((item) => Number(item))
         .filter((item) => Number.isInteger(item) && item > 0);
     }
-    if (!pageNumbers.length) {
+    if (!foundPages.length) {
       throw new Error("pdf had no pages");
     }
-    const pendingDraw = pageNumbers.filter((page) => profile.drawFilled || !(byNum.get(page) || "").trim());
-    if (!pendingDraw.length) {
-      return {
-        pages: pageNumbers.map((page) => ({ page, layer: byNum.get(page) || "", ocr: "", drawn: false })),
-        drew: false,
-      };
-    }
-    const cpus = Math.max(1, availableParallelism() || 1);
-    const ceiling = Math.max(1, Math.min(pageNumbers.length, ocrSlots(cpus, 0)));
-    const pool = { workers: null, ceiling, gpuFailures: 0 };
-    if (!process.env.NOMAD_TURBO_OCR_SOCKET) {
-      pool.workers = await startWorkers(ceiling);
-    }
-    console.error(poolLine(clampSlots(ceiling, readBudget()), cpus, -1));
-    let slots = ceiling;
-    let notify = () => {};
-    let shown = ceiling;
-    let pending = null;
-    let pendingHits = 0;
-    const stopWatch = watchHostCpu(cpus, ceiling, (next, other) => {
-      next = clampSlots(next, readBudget());
-      if (next === shown) {
+    const choice = selectEnglishPages(foundPages, byNum);
+
+    async function drawListed(listed) {
+      const pageNumbers = listed;
+      const pendingDraw = pageNumbers.filter((page) => profile.drawFilled || !(byNum.get(page) || "").trim());
+      if (!pendingDraw.length) {
+        return {
+          pages: pageNumbers.map((page) => ({ page, layer: byNum.get(page) || "", ocr: "", drawn: false })),
+          drew: false,
+        };
+      }
+      const cpus = Math.max(1, availableParallelism() || 1);
+      const ceiling = Math.max(1, Math.min(pageNumbers.length, ocrSlots(cpus, 0)));
+      const pool = { workers: null, ceiling, gpuFailures: 0 };
+      if (!process.env.NOMAD_TURBO_OCR_SOCKET) {
+        pool.workers = await startWorkers(ceiling);
+      }
+      console.error(poolLine(clampSlots(ceiling, readBudget()), cpus, -1));
+      let slots = ceiling;
+      let notify = () => {};
+      let shown = ceiling;
+      let pending = null;
+      let pendingHits = 0;
+      const stopWatch = watchHostCpu(cpus, ceiling, (next, other) => {
+        next = clampSlots(next, readBudget());
+        if (next === shown) {
+          pending = null;
+          pendingHits = 0;
+          return;
+        }
+        // A one-thread flicker is sampled twice before the pool moves. Giving
+        // up two or more threads happens on the sample that saw it.
+        const sudden = shown - next >= 2;
+        if (next === pending) {
+          pendingHits += 1;
+        } else {
+          pending = next;
+          pendingHits = 1;
+        }
+        if (!sudden && pendingHits < 2) {
+          return;
+        }
         pending = null;
         pendingHits = 0;
-        return;
-      }
-      // A one-thread flicker is sampled twice before the pool moves. Giving
-      // up two or more threads happens on the sample that saw it.
-      const sudden = shown - next >= 2;
-      if (next === pending) {
-        pendingHits += 1;
-      } else {
-        pending = next;
-        pendingHits = 1;
-      }
-      if (!sudden && pendingHits < 2) {
-        return;
-      }
-      pending = null;
-      pendingHits = 0;
-      shown = next;
-      slots = next;
-      console.error(poolLine(next, cpus, other));
-      notify();
-    });
-    try {
-      let done = 0;
-      const rows = await runPool({
-        jobs: pageNumbers.length,
-        runners: pool.ceiling,
-        getSlots: () => clampSlots(slots, readBudget()),
-        wake: (fn) => {
-          notify = fn;
-        },
-        work: async (index, runner) => {
-          const page = pageNumbers[index];
-          const layer = byNum.get(page) || "";
-          if (!profile.drawFilled && layer.trim()) {
-            done += 1;
-            console.error(`ocr page ${done} of ${pageNumbers.length} text`);
-            return { page, layer, ocr: "", drawn: false };
-          }
-          const box = doc.sizes.get(page);
-          // The page box is in points. Drawing at that pixel size is the only
-          // GraphicsMagick read. A page with no box is drawn at the quality's
-          // dpi and scaled down afterwards, still once.
-          const pixels = box ? rasterPixels(box.width, box.height, profile) : null;
-          let rendered = await renderPage(pdfPath, page, pixels);
-          let meta = await sharp(rendered).metadata();
-          let width = meta && meta.width ? meta.width : 0;
-          let height = meta && meta.height ? meta.height : 0;
-          if (!pixels && (width > profile.cap || height > profile.cap)) {
-            const fitted = capPixels(width, height, profile.cap);
-            rendered = await sharp(rendered)
-              .resize({ width: fitted.width, height: fitted.height, fit: "fill" })
-              .toBuffer();
-            width = fitted.width;
-            height = fitted.height;
-          }
-          let seen = "";
-          try {
-            seen = await recognizePrepared(rendered, profile.shrink, runner, pool);
-          } catch (err) {
-            console.error(`ocr page failed ${page}: ${err && err.message ? err.message : err}`);
-          }
-          done += 1;
-          console.error(`ocr page ${done} of ${pageNumbers.length} ${width}x${height}`);
-          return { page, layer, ocr: seen, drawn: true };
-        },
+        shown = next;
+        slots = next;
+        console.error(poolLine(next, cpus, other));
+        notify();
       });
-      const pages = rows.filter(Boolean);
-      return { pages, drew: pages.some((page) => page.drawn) };
-    } finally {
-      stopWatch();
-      await stopWorkers(pool.workers);
+      try {
+        let done = 0;
+        const rows = await runPool({
+          jobs: pageNumbers.length,
+          runners: pool.ceiling,
+          getSlots: () => clampSlots(slots, readBudget()),
+          wake: (fn) => {
+            notify = fn;
+          },
+          work: async (index, runner) => {
+            const page = pageNumbers[index];
+            const layer = byNum.get(page) || "";
+            if (!profile.drawFilled && layer.trim()) {
+              done += 1;
+              console.error(`ocr page ${done} of ${pageNumbers.length} text`);
+              return { page, layer, ocr: "", drawn: false };
+            }
+            const box = doc.sizes.get(page);
+            // The page box is in points. Drawing at that pixel size is the only
+            // GraphicsMagick read. A page with no box is drawn at the quality's
+            // dpi and scaled down afterwards, still once.
+            const pixels = box ? rasterPixels(box.width, box.height, profile) : null;
+            let rendered = await renderPage(pdfPath, page, pixels);
+            let meta = await sharp(rendered).metadata();
+            let width = meta && meta.width ? meta.width : 0;
+            let height = meta && meta.height ? meta.height : 0;
+            if (!pixels && (width > profile.cap || height > profile.cap)) {
+              const fitted = capPixels(width, height, profile.cap);
+              rendered = await sharp(rendered)
+                .resize({ width: fitted.width, height: fitted.height, fit: "fill" })
+                .toBuffer();
+              width = fitted.width;
+              height = fitted.height;
+            }
+            let seen = "";
+            try {
+              seen = await recognizePrepared(rendered, profile.shrink, runner, pool);
+            } catch (err) {
+              console.error(`ocr page failed ${page}: ${err && err.message ? err.message : err}`);
+            }
+            done += 1;
+            console.error(`ocr page ${done} of ${pageNumbers.length} ${width}x${height}`);
+            return { page, layer, ocr: seen, drawn: true };
+          },
+        });
+        const pages = rows.filter(Boolean);
+        return { pages, drew: pages.some((page) => page.drawn) };
+      } finally {
+        stopWatch();
+        await stopWorkers(pool.workers);
+      }
     }
+
+    if (!choice.keep.length) {
+      console.error("ocr skip, text is not english");
+      return { pages: [], drew: false, skip: "language" };
+    }
+    if (choice.skipped) {
+      const noun = choice.skipped === 1 ? "page" : "pages";
+      console.error(`ocr left out ${choice.skipped} ${noun} that are not english`);
+    }
+    if (choice.sample) {
+      const first = await drawListed([choice.keep[0]]);
+      const row = first.pages[0] || {};
+      const sampleText = [row.layer, row.ocr].filter(Boolean).join("\n");
+      if (englishProse(sampleText) === false) {
+        console.error("ocr skip, text is not english");
+        return { pages: [], drew: false, skip: "language" };
+      }
+      if (choice.keep.length === 1) {
+        return first;
+      }
+      const rest = await drawListed(choice.keep.slice(1));
+      const pages = first.pages.concat(rest.pages);
+      return { pages, drew: pages.some((page) => page.drawn) };
+    }
+    return await drawListed(choice.keep);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -752,6 +877,21 @@ function arg(name) {
     return "";
   }
   return process.argv[index + 1];
+}
+
+function testDrawChoice() {
+  const medium = qualityProfile("medium");
+  if (medium.drawFilled || medium.dpi !== 300 || medium.shrink) {
+    throw new Error("medium should leave a page that already has text");
+  }
+  const high = qualityProfile("high", false);
+  if (high.drawFilled || high.cap !== 12000 || high.shrink) {
+    throw new Error("high should leave a page that already has text");
+  }
+  const forced = qualityProfile("low", true);
+  if (!forced.drawFilled || forced.dpi !== 200 || !forced.shrink || forced.cap !== 4000) {
+    throw new Error("ocr every pdf should still draw at the chosen quality");
+  }
 }
 
 function testRaster() {
@@ -921,12 +1061,68 @@ async function testPoolPauses() {
   }
 }
 
+function testLanguage() {
+  const english = "The shelter manual explains water, food, and ventilation for a family of six. This guide is for people who have to stay inside with their children when the weather is bad.";
+  if (englishProse(english) !== true) {
+    throw new Error(`english prose ${englishProse(english)}`);
+  }
+  const french = "Le guide explique comment stocker l'eau et la nourriture pour les familles. Les pages suivantes decrivent les etapes dans la maison et pour les enfants qui sont dans la cuisine avec une lampe.";
+  if (englishProse(french) !== false) {
+    throw new Error(`french prose ${englishProse(french)}`);
+  }
+  const german = "Die Anleitung erklaert wie eine Familie Wasser und Nahrung lagert und sich auf den Winter vorbereitet. Der Text ist nicht fuer den Garten und nicht fuer die Schule und auch nicht fuer das Buero.";
+  if (englishProse(german) !== false) {
+    throw new Error(`german prose ${englishProse(german)}`);
+  }
+  const spanish = "La guia explica como guardar el agua y la comida para una familia. Este texto es para las personas que estan en la casa y para los ninos que viven con sus padres.";
+  if (englishProse(spanish) !== false) {
+    throw new Error(`spanish prose ${englishProse(spanish)}`);
+  }
+  const cjk = "この文書は家族のための水と食料の保管方法を説明します。冬に備えて家の中で準備をする手順です。";
+  if (englishProse(cjk) !== false) {
+    throw new Error(`cjk prose ${englishProse(cjk)}`);
+  }
+  const arabic = "يشرح هذا الدليل كيفية تخزين الماء والطعام للعائلة خلال فصل الشتاء داخل المنزل ومع الأطفال.";
+  if (englishProse(arabic) !== false) {
+    throw new Error(`arabic prose ${englishProse(arabic)}`);
+  }
+  if (englishProse("Fig. 1") !== null) {
+    throw new Error(`figure caption ${englishProse("Fig. 1")}`);
+  }
+  if (englishProse("Pump diagram") !== null) {
+    throw new Error(`short caption ${englishProse("Pump diagram")}`);
+  }
+  if (englishProse(`${english} ${french}`) !== true) {
+    throw new Error("a page with English and another language should stay");
+  }
+  const mixed = selectEnglishPages(
+    [1, 2, 3],
+    new Map([[1, french], [2, english], [3, "Fig. 1"]]),
+  );
+  if (mixed.keep.join(",") !== "2,3" || mixed.sample || mixed.skipped !== 1) {
+    throw new Error(`mixed pages ${JSON.stringify(mixed)}`);
+  }
+  const foreign = selectEnglishPages([1, 2], new Map([[1, french], [2, german]]));
+  if (foreign.keep.length || foreign.sample) {
+    throw new Error(`foreign file ${JSON.stringify(foreign)}`);
+  }
+  const scan = selectEnglishPages([1, 2, 3], new Map([[1, ""], [2, ""], [3, ""]]));
+  if (!scan.sample || scan.keep.join(",") !== "1,2,3") {
+    throw new Error(`scan ${JSON.stringify(scan)}`);
+  }
+  if (englishProse("C6H12O6 NaCl H2O") !== null) {
+    throw new Error(`formula ${englishProse("C6H12O6 NaCl H2O")}`);
+  }
+}
+
 async function main() {
   if (process.argv.includes("--self-test")) {
     testRaster();
+    testDrawChoice();
     testMerge();
     testSlots();
     testCpuMath();
+    testLanguage();
     await testPoolPauses();
     const first = readCpuSample();
     await new Promise((resolve) => setTimeout(resolve, 40));
@@ -955,13 +1151,21 @@ async function main() {
   yieldToHost();
   const file = arg("--file");
   const kind = arg("--kind");
-  const profile = qualityProfile(arg("--quality") || "medium");
+  const profile = qualityProfile(arg("--quality") || "medium", process.argv.includes("--ocr-every-pdf"));
   if (!file || (kind !== "pdf" && kind !== "image")) {
     throw new Error("usage: --file PATH --kind pdf|image");
   }
   const buffer = readFileSync(file);
   if (kind === "image") {
     const text = await readImage(buffer, profile);
+    if (englishProse(text) === false) {
+      console.error("ocr skip, text is not english");
+      if (arg("--format") === "pages") {
+        process.stdout.write(JSON.stringify({ ocr: "", drew: true, pages: [], skip: "language" }));
+        return;
+      }
+      return;
+    }
     if (arg("--format") === "pages") {
       process.stdout.write(JSON.stringify({ ocr: text, drew: true, pages: [] }));
       return;

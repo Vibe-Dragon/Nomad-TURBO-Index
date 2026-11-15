@@ -1,6 +1,8 @@
 """Collection logs stay for the life of the current index. No window is opened."""
 
 import logging
+import os
+import shutil
 import tempfile
 import unittest
 import zipfile
@@ -13,6 +15,7 @@ from nomad_turbo.logbook import (
     DailyLogHandler,
     align_running_logs,
     clear_collection_logs,
+    clear_ocr_queue,
     collection_directory,
     daily_log_path,
     export_logs,
@@ -156,6 +159,116 @@ class CollectionLogTest(unittest.TestCase):
             self.assertNotIn("today", today)
             self.assertNotIn("yesterday", today)
 
+    def test_deleting_the_index_removes_the_ocr_queue(self):
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            queued = directory / "ocr-queue" / "spill"
+            queued.mkdir(parents=True)
+            pdf = queued / "page.pdf"
+            pdf.write_bytes(b"%PDF")
+            os.utime(pdf, (1_700_000_000, 1_700_000_000))
+            clear_collection_logs(directory)
+            self.assertFalse(pdf.exists())
+            self.assertFalse(queued.exists())
+            self.assertTrue((directory / "ocr-queue").is_dir())
+
+    def test_ocr_exports_follow_the_collection_clock(self):
+        born = datetime(2026, 11, 7, 17, 23, 47)
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            old = directory / "ocr-queue" / "old" / "a.pdf"
+            new = directory / "ocr-queue" / "new" / "b.pdf"
+            old.parent.mkdir(parents=True)
+            new.parent.mkdir(parents=True)
+            old.write_bytes(b"old")
+            new.write_bytes(b"new")
+            earlier = born.timestamp() - 60
+            later = born.timestamp() + 60
+            os.utime(old, (earlier, earlier))
+            os.utime(new, (later, later))
+            with patch("nomad_turbo.logbook._read_clock", return_value=_clock(born)):
+                prepare_collection_logs(directory, object())
+            self.assertFalse(old.exists())
+            self.assertFalse(old.parent.exists())
+            self.assertTrue(new.is_file())
+            old.parent.mkdir()
+            old.write_bytes(b"old")
+            os.utime(old, (earlier, earlier))
+            with patch("nomad_turbo.logbook._read_clock", return_value=("unknown", 0)):
+                prepare_collection_logs(directory, object())
+            self.assertTrue(old.is_file())
+            self.assertTrue(new.is_file())
+            with patch("nomad_turbo.logbook._read_clock", return_value=("missing", 0)):
+                prepare_collection_logs(directory, object())
+            self.assertFalse(old.exists())
+            self.assertFalse(new.exists())
+
+    def test_an_export_whose_time_cannot_be_read_stays(self):
+        born = datetime(2026, 11, 7, 17, 23, 47)
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            pdf = directory / "ocr-queue" / "spill" / "stuck.pdf"
+            pdf.parent.mkdir(parents=True)
+            pdf.write_bytes(b"stuck")
+            real_stat = Path.stat
+
+            def stat(self, *args, **kwargs):
+                if self.name == "stuck.pdf":
+                    raise OSError("unread")
+                return real_stat(self, *args, **kwargs)
+
+            with (
+                patch("nomad_turbo.logbook._read_clock", return_value=_clock(born)),
+                patch.object(Path, "stat", stat),
+                self.assertNoLogs("nomad_turbo.logbook", level="ERROR"),
+            ):
+                prepare_collection_logs(directory, object())
+            self.assertTrue(pdf.is_file())
+
+    def test_another_turbo_keeps_the_ocr_queue(self):
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            pdf = directory / "ocr-queue" / "spill" / "page.pdf"
+            pdf.parent.mkdir(parents=True)
+            pdf.write_bytes(b"%PDF")
+            with patch("nomad_turbo.logbook._foreign_indexer", return_value=True):
+                clear_collection_logs(directory)
+                prepare_collection_logs(directory, object())
+            self.assertTrue(pdf.is_file())
+
+    def test_a_root_owned_queue_uses_one_elevated_delete(self):
+        real_rmtree = shutil.rmtree
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            queued = directory / "ocr-queue" / "spill"
+            queued.mkdir(parents=True)
+            pdf = queued / "page.pdf"
+            pdf.write_bytes(b"%PDF")
+            calls = []
+
+            def elevated(command, **kwargs):
+                calls.append(command)
+                self.assertEqual(command[:5], ["sudo", "-n", "rm", "-rf", "--"])
+                root = (directory / "ocr-queue").resolve()
+                for item in command[5:]:
+                    path = Path(item)
+                    self.assertIn(root, path.resolve().parents)
+                    if path.is_dir() and not path.is_symlink():
+                        real_rmtree(path)
+                    else:
+                        path.unlink()
+                return SimpleNamespace(returncode=0)
+
+            with (
+                patch("nomad_turbo.logbook.shutil.rmtree", side_effect=PermissionError("denied")),
+                patch("nomad_turbo.logbook.subprocess.run", side_effect=elevated),
+            ):
+                clear_ocr_queue(directory)
+            self.assertEqual(len(calls), 1)
+            self.assertFalse(pdf.exists())
+            self.assertFalse(queued.exists())
+            self.assertTrue((directory / "ocr-queue").is_dir())
+
     def test_the_collection_directory_follows_nomad_storage(self):
         path = collection_directory("/mnt/nomad/storage", "nomad_knowledge_base")
         self.assertEqual(
@@ -215,6 +328,8 @@ class CollectionLogTest(unittest.TestCase):
         self.assertIn("midnight", text)
         self.assertIn("one zip", text)
         self.assertIn("current copy of the knowledge index", text)
+        self.assertIn("follow those same rules", text)
+        self.assertIn("A timeout leaves the queue in place.", text)
         self.assertNotIn("last session", text.lower())
         self.assertNotIn("Older session logs are deleted", text)
         self.assertIn("Optimize: not running.", text)

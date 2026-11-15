@@ -10,7 +10,15 @@ TIPS: dict[str, str] = {
     "qdrant": (
         "Whether Qdrant is running and the collection is answering. "
         "While a write is still moving, this says so and says not to restart Qdrant or delete the index. "
-        "Ready for changes means the collection answered."
+        "Ready for changes means the collection answered. "
+        "Green means ready. Blue is a pause that is still working. "
+        "Amber means leave Qdrant running. Red needs attention."
+    ),
+    "activity": (
+        "What Turbo is doing when the file list is still. "
+        "Green is indexing or idle. "
+        "Blue is a pause that is still working, such as saving records after Stop. "
+        "Amber means leave Qdrant running. Red needs attention."
     ),
     "qdrant_gate": (
         "Qdrant is not ready for changes yet. This stays off until the collection answers."
@@ -30,12 +38,19 @@ TIPS: dict[str, str] = {
         "The file type: zim, pdf, docx, epub, txt, md, rtf, or an image extension such as jpg or png. "
         "A folder row says folder."
     ),
-    "col_status": "Waiting, HTML, text, OCR, OCR text, indexing, indexed, partial, failed, or needs NOMAD.",
+    "col_status": (
+        "Waiting, Waiting OCR, finding, documents, HTML, text, OCR, indexing, indexed, partial, failed, or needs NOMAD. "
+        "Waiting OCR means the ZIM's pages are stored and PDFs from it are still in the OCR queue. "
+        "Under Internal Zim Documents, finding means that ZIM's list is still growing, and documents means its pages are stored and the bar counts documents stored."
+    ),
     "col_progress": (
-        "How far this file is through its articles. "
-        "A ZIM fills this once for HTML, again for other text, and again for OCR. "
-        "Green is HTML, blue is other text, orange is recognizing a page, and purple is storing that text. "
-        "A file that is one article moves by the chunks of that article while they are embedding."
+        "While a file is being embedded, the faded bar is chunks that already have vectors "
+        "and the solid bar is what is saved in the knowledge base. "
+        "The label is the saved percent, then the processed percent. "
+        "A ZIM fills the solid bar once for HTML, again for other text, and again for OCR. "
+        "Green is HTML, blue is other text, including text stored after a page is recognized, and orange is recognizing a page. "
+        "While OCR is reading, this is one bar for the pages read. "
+        "The bar under Internal Zim Documents is how many of that ZIM's documents are stored."
     ),
     "settings_index": (
         "Where indexing runs. CPU, or an NVIDIA card. "
@@ -66,31 +81,61 @@ TIPS: dict[str, str] = {
         "That overlap is still being worked out. "
         "The choice is saved and applies the next time you start."
     ),
+    "ocr_worker_max": (
+        "How many OCR workers may run at once. "
+        "The slider stops with two threads left free. "
+        "The number is saved and the next page uses it, including a read that is already going. "
+        "Qdrant can still take workers back while it is writing."
+    ),
+    "zim_documents": (
+        "Off, a ZIM indexes its pages. "
+        "PDFs, Word documents, and EPUBs inside it stay unread. "
+        "Uploaded PDFs and pictures are still read. "
+        "On, those files are listed while the pages are indexed, then read after every ZIM's pages and every upload are stored. "
+        "They are listed under Internal Zim Documents. That ZIM's bar there is how many of its documents are stored. "
+        "A PDF is read with OCR. A page that already has text is stored from that text unless OCR every PDF is on. "
+        "The choice is saved and applies the next time you start. "
+        "A ZIM that is already indexed stays as it is."
+    ),
+    "ocr_every_pdf": (
+        "Off, a PDF page that already has text is not drawn. "
+        "A page with no text is still read, and a picture is still read. "
+        "On, every PDF page is drawn, including a page that already has text. "
+        "The text layer is kept either way. "
+        "The choice is saved. The next PDF uses it. "
+        "A ZIM already being read keeps going until the next time you start."
+    ),
     "ocr_quality": (
         "How hard a PDF page or a picture is read. "
-        "Low is 200 dpi and skips a page that already has text. "
-        "Medium is 300 dpi and reads every page. "
-        "High is 400 dpi for small print. "
+        "Low is 200 dpi. Medium is 300 dpi. High is 400 dpi for small print. "
+        "A page that already has text is drawn when OCR every PDF is on. "
+        "A PDF or picture that is not English is left out. "
         "The choice is saved and applies to the next file."
     ),
     "col_articles": (
-        "Articles stored so far, and the total when it is known. "
-        "During a ZIM's text or OCR pass, this is how far that pass is. "
+        "While a file is being indexed, articles saved in the knowledge base, and how many are left. "
+        "During a ZIM's text or OCR pass, the right number is how many that pass still has left. "
+        "Other rows show articles stored and the total when it is known. "
         "While OCR is reading a file, this is pages read and pages in the file."
     ),
     "col_art_min": (
-        "Articles per minute for the file being indexed. "
+        "Articles per minute whose vectors have come back, for the file being indexed. "
+        "This moves before those articles are saved. "
         "While OCR is reading, this is pages per minute. "
         "Other rows stay blank."
     ),
     "col_chunks": (
         "Embedded pieces stored for this file. A long page is many chunks. "
-        "While that article is still embedding, this counts chunks embedded so far."
+        "While one article is still embedding, this counts chunks embedded so far."
     ),
-    "col_chk_s": "Chunks per second for the file being indexed. This pace stays steadier than articles per minute.",
+    "col_chk_s": (
+        "Chunks per second that have received vectors, for the file being indexed. "
+        "This moves while an embed call is still running."
+    ),
     "col_size": "Size of the file on disk.",
     "col_eta": (
-        "Time left for this file. The file being indexed uses its recent article rate. "
+        "Time left for this file. The file being indexed uses its recent saved article rate. "
+        "When nothing has been saved yet, it uses articles whose vectors have come back. "
         "A file that is one article uses its chunk pace while that article is embedding. "
         "While OCR is reading, this is the time left at the recent page rate. "
         "After Measure, a file with a known article count keeps the ETA from its sample."
@@ -111,6 +156,8 @@ TIPS: dict[str, str] = {
         "The file already being read or indexed stays put and keeps its progress. "
         "Index now still comes first. "
         "A saved queue is used before priority and before the Order menu. "
+        "Prioritized files come before text that has finished OCR. "
+        "That finished text comes before the other files. "
         "Changing Order clears that arrangement. "
         "Files that show up later follow that queue."
     ),

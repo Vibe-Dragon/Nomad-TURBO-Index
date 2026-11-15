@@ -95,46 +95,109 @@ class SequencePace:
     """When a second sequence may stay.
 
     Long calls have to be at least as fast as they were with one sequence.
-    Short calls may use the second sequence once a few calls have been seen.
+    Three long calls at two sequences, and none at one, ask once for a
+    one-sequence baseline. When both widths have three long calls, the faster
+    width is kept for the rest of the run. Later files do not rebuild the
+    server. Rebuilding reloads the model, and llama-server answers 503 until
+    that load finishes.
     """
 
     def __init__(self) -> None:
         self.one_long: list[float] = []
         self.many_long: list[float] = []
+        self.one_short: list[float] = []
+        self.many_short: list[float] = []
         self.calls_at_width = 0
         self.locked_at_one = False
         self.tried_two = False
+        self._need_baseline = False
+        self._asked_baseline = False
+        self._asked_up = False
+        self._asked_slower = False
+        self._held: int | None = None
+        self._file: str | None = None
+
+    def begin_file(self, source: str) -> None:
+        """Remember this file. A new file keeps the measurement already underway.
+
+        Wiping it on every file reloaded llama-server twice per document.
+        Each reload answers 503 until the model is back, and a short file
+        ends before the comparison can finish, so the next file starts it again.
+        """
+        self._file = str(source or "")
 
     def note(self, sequences: int, mean_tokens: int, chunks: int, seconds: float) -> None:
         self.calls_at_width += 1
-        if seconds <= 0 or chunks <= 0 or int(mean_tokens) < LONG_CALL_TOKENS:
+        if seconds <= 0 or chunks <= 0:
             return
         pace = float(chunks) / float(seconds)
-        if int(sequences) <= 1:
-            self.one_long.append(pace)
+        long = int(mean_tokens) >= LONG_CALL_TOKENS
+        if long:
+            bucket = self.one_long if int(sequences) <= 1 else self.many_long
         else:
-            self.many_long.append(pace)
+            bucket = self.one_short if int(sequences) <= 1 else self.many_short
+        bucket.append(pace)
 
     def mark_resized(self) -> None:
         self.calls_at_width = 0
+        self._asked_baseline = False
+        self._asked_up = False
+        self._asked_slower = False
 
     def decision(self, current: int, fits: bool) -> tuple[int, str]:
-        if self.locked_at_one or (int(current) <= 1 and self.tried_two):
+        # A failed restart sets this. Leave the server where it is.
+        if self.locked_at_one:
             return 1, ""
-        if int(current) <= 1:
-            if fits and self.calls_at_width >= SEQUENCE_SAMPLES:
+        current_n = int(current)
+        if len(self.one_long) >= LONG_CALL_SAMPLES:
+            self._need_baseline = False
+        if (
+            current_n >= 2
+            and len(self.many_long) >= LONG_CALL_SAMPLES
+            and len(self.one_long) < LONG_CALL_SAMPLES
+        ):
+            self._need_baseline = True
+            if not self._asked_baseline:
+                self._asked_baseline = True
+                return 1, "baseline"
+            return current_n, ""
+        if self._need_baseline and len(self.one_long) < LONG_CALL_SAMPLES:
+            return 1, ""
+        self._freeze()
+        if self._held is not None:
+            return self._held_decision(current_n, fits)
+        if current_n <= 1:
+            if fits and self.calls_at_width >= SEQUENCE_SAMPLES and not self._asked_up:
+                self._asked_up = True
                 self.tried_two = True
                 return 2, "up"
             return 1, ""
-        # A long call with no one-sequence sample stays on two sequences.
-        # Reloading to measure it made the server restart on every mix of lengths.
-        if len(self.one_long) >= LONG_CALL_SAMPLES and len(self.many_long) >= LONG_CALL_SAMPLES:
-            one = sum(self.one_long) / len(self.one_long)
-            many = sum(self.many_long) / len(self.many_long)
-            if many < one:
-                self.locked_at_one = True
+        return current_n, ""
+
+    def _freeze(self) -> None:
+        """Keep the faster long-call width once both widths have three samples."""
+        if self._held is not None:
+            return
+        if len(self.one_long) < LONG_CALL_SAMPLES or len(self.many_long) < LONG_CALL_SAMPLES:
+            return
+        one = sum(self.one_long[:LONG_CALL_SAMPLES]) / LONG_CALL_SAMPLES
+        many = sum(self.many_long[:LONG_CALL_SAMPLES]) / LONG_CALL_SAMPLES
+        self._held = 1 if many < one else 2
+
+    def _held_decision(self, current_n: int, fits: bool) -> tuple[int, str]:
+        held = int(self._held or 1)
+        if current_n >= 2 and held == 1:
+            if not self._asked_slower:
+                self._asked_slower = True
                 return 1, "slower"
-        return int(current), ""
+            return 1, ""
+        if current_n <= 1 and held == 2:
+            if fits and not self._asked_up:
+                self._asked_up = True
+                self.tried_two = True
+                return 2, "up"
+            return 1, ""
+        return current_n, ""
 
 
 def gpu_overhead_mib(total_mib: int) -> int:

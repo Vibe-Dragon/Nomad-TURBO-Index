@@ -260,6 +260,107 @@ class BudgetTest(unittest.TestCase):
             0,
         )
 
+    def test_a_long_zim_publishes_a_lower_ocr_cap_and_keeps_the_page(self):
+        from nomad_turbo.ocr_budget import (
+            arm,
+            current_cap,
+            embedding_file_is_long_zim,
+            note_long_zim,
+            ocr_worker_limit,
+            set_runtime,
+        )
+        from nomad_turbo.passes import classify_entry, merge_page, normalize_ocr_quality
+
+        reset_pressure()
+        folder = tempfile.TemporaryDirectory(prefix="nomad-turbo-ocr-long-")
+        try:
+            path = Path(folder.name) / "ocr-budget"
+            set_runtime(share=False, index_cpu=False, cpus=12)
+            arm(path, 12)
+            allowance = ocr_worker_limit(12)
+            self.assertEqual(current_cap(), allowance)
+            self.assertEqual(path.read_text(encoding="utf-8").strip(), str(allowance))
+            note_long_zim(True)
+            capped = int(path.read_text(encoding="utf-8").strip())
+            self.assertEqual(current_cap(), capped)
+            self.assertLess(capped, allowance)
+            note_long_zim(False)
+            self.assertEqual(current_cap(), allowance)
+            self.assertEqual(path.read_text(encoding="utf-8").strip(), str(allowance))
+            self.assertEqual(normalize_ocr_quality("high"), "high")
+            self.assertTrue(embedding_file_is_long_zim("zim", 256))
+            self.assertFalse(embedding_file_is_long_zim("zim", 40))
+            self.assertFalse(embedding_file_is_long_zim("pdf", 400))
+            self.assertFalse(embedding_file_is_long_zim("image", 400))
+            kept = merge_page("The text layer stays.", "The text layer stays. extra", set())
+            self.assertTrue(kept.startswith("The text layer stays."))
+            self.assertEqual(classify_entry("application/pdf", "book.pdf"), "ocr")
+            self.assertEqual(classify_entry("text/html", "A/article.html"), "html")
+        finally:
+            disarm()
+            reset_pressure()
+            folder.cleanup()
+
+    def test_one_long_call_does_not_pin_ocr_on_a_short_zim(self):
+        from nomad_turbo.ocr_budget import (
+            arm,
+            current_cap,
+            note_long_zim,
+            note_zim_embed_call,
+            ocr_worker_limit,
+            set_runtime,
+        )
+        from nomad_turbo.slots import LONG_CALL_SAMPLES, LONG_CALL_TOKENS
+
+        reset_pressure()
+        folder = tempfile.TemporaryDirectory(prefix="nomad-turbo-ocr-run-")
+        try:
+            path = Path(folder.name) / "ocr-budget"
+            set_runtime(share=False, index_cpu=False, cpus=12)
+            arm(path, 12)
+            allowance = ocr_worker_limit(12)
+            short = LONG_CALL_TOKENS - 1
+            long = LONG_CALL_TOKENS
+            self.assertEqual(current_cap(), allowance)
+
+            for _ in range(LONG_CALL_SAMPLES):
+                note_zim_embed_call("zim", short)
+            self.assertEqual(current_cap(), allowance)
+            self.assertEqual(path.read_text(encoding="utf-8").strip(), str(allowance))
+
+            for _ in range(LONG_CALL_SAMPLES - 1):
+                note_zim_embed_call("zim", long)
+                self.assertEqual(current_cap(), allowance)
+            note_zim_embed_call("zim", long)
+            capped = int(path.read_text(encoding="utf-8").strip())
+            self.assertEqual(current_cap(), capped)
+            self.assertLess(capped, allowance)
+
+            for _ in range(LONG_CALL_SAMPLES - 1):
+                note_zim_embed_call("zim", short)
+                self.assertEqual(current_cap(), capped)
+            note_zim_embed_call("zim", short)
+            self.assertEqual(current_cap(), allowance)
+            self.assertEqual(path.read_text(encoding="utf-8").strip(), str(allowance))
+
+            for _ in range(LONG_CALL_SAMPLES):
+                note_zim_embed_call("pdf", long)
+            self.assertEqual(current_cap(), allowance)
+            self.assertEqual(path.read_text(encoding="utf-8").strip(), str(allowance))
+
+            for _ in range(LONG_CALL_SAMPLES):
+                note_zim_embed_call("zim", long)
+            self.assertLess(current_cap(), allowance)
+            note_long_zim(False)
+            self.assertEqual(current_cap(), allowance)
+            self.assertEqual(path.read_text(encoding="utf-8").strip(), str(allowance))
+            note_zim_embed_call("zim", long)
+            self.assertEqual(current_cap(), allowance)
+        finally:
+            disarm()
+            reset_pressure()
+            folder.cleanup()
+
     def test_a_refused_write_is_noticed_and_cleared(self):
         from nomad_turbo.ocr_budget import current_cap, note_qdrant_fault, set_runtime
 
@@ -273,6 +374,103 @@ class BudgetTest(unittest.TestCase):
         finally:
             disarm()
             reset_pressure()
+
+    def test_the_worker_maximum_stops_two_threads_short(self):
+        import inspect
+
+        from nomad_turbo.discover import load_install
+        from nomad_turbo.ocr_budget import (
+            arm,
+            clamp_ocr_worker_max,
+            current_cap,
+            note_qdrant_fault,
+            ocr_worker_limit,
+            set_worker_max,
+            shown_worker_max,
+            stored_worker_max,
+        )
+
+        self.assertEqual(ocr_worker_limit(12), 10)
+        self.assertEqual(ocr_worker_limit(12), 12 - 2)
+        self.assertEqual(ocr_worker_limit(4), 2)
+        self.assertEqual(ocr_worker_limit(3), 1)
+        self.assertEqual(ocr_worker_limit(2), 1)
+        self.assertEqual(ocr_worker_limit(1), 1)
+        self.assertEqual(
+            cpu_ocr_cap(12, share=False, embed=False, upserts=False, ready=True, status="green", stalled=False, index_cpu=False),
+            ocr_worker_limit(12),
+        )
+        self.assertEqual(clamp_ocr_worker_max(12, 12), 10)
+        self.assertEqual(clamp_ocr_worker_max(11, 12), 10)
+        self.assertEqual(clamp_ocr_worker_max(4, 12), 4)
+        self.assertEqual(clamp_ocr_worker_max(0, 12), 1)
+        self.assertEqual(clamp_ocr_worker_max("nope", 12), 10)
+        self.assertEqual(shown_worker_max(None, 12), 10)
+        self.assertEqual(shown_worker_max(4, 12), 4)
+        self.assertIsNone(stored_worker_max(10, 12))
+        self.assertEqual(stored_worker_max(4, 12), 4)
+        self.assertIsNone(Install.__dataclass_fields__["ocr_worker_max"].default)
+        self.assertIn('"ocr_worker_max"', inspect.getsource(load_install))
+        saved = Install(
+            admin_container="a",
+            admin_image="i",
+            network="n",
+            redis_host="r",
+            redis_port=1,
+            redis_container="rc",
+            mysql_container="m",
+            qdrant_url="q",
+            ollama_image="o",
+            ollama_container="oc",
+            models_dir="md",
+            storage_host="s",
+            ocr_worker_max=4,
+        )
+        self.assertEqual(Install.from_json(saved.to_json()).ocr_worker_max, 4)
+        reset_pressure()
+        folder = tempfile.TemporaryDirectory(prefix="nomad-turbo-ocr-budget-")
+        try:
+            path = Path(folder.name) / "ocr-budget"
+            self.assertEqual(set_worker_max(4, cpus=12), 4)
+            arm(path, 12)
+            self.assertEqual(path.read_text(encoding="utf-8").strip(), "4")
+            self.assertEqual(current_cap(), 4)
+            note_upsert(True)
+            self.assertEqual(path.read_text(encoding="utf-8").strip(), "2")
+            note_upsert(False)
+            self.assertEqual(path.read_text(encoding="utf-8").strip(), "4")
+            note_qdrant_fault("qdrant 429: overloaded")
+            self.assertEqual(current_cap(), 0)
+            self.assertEqual(path.read_text(encoding="utf-8").strip(), "0")
+            reset_pressure()
+            set_worker_max(12, cpus=12)
+            arm(path, 12)
+            self.assertEqual(current_cap(), 10)
+            self.assertEqual(path.read_text(encoding="utf-8").strip(), "10")
+            set_worker_max(None, cpus=12)
+            self.assertEqual(current_cap(), 10)
+        finally:
+            disarm()
+            reset_pressure()
+            folder.cleanup()
+
+    def test_a_start_publishes_the_saved_worker_maximum(self):
+        engine = Path(__file__).resolve().parents[1].joinpath("nomad_turbo", "engine.py").read_text(encoding="utf-8")
+        window = Path(__file__).resolve().parents[1].joinpath("nomad_turbo", "window.py").read_text(encoding="utf-8")
+        before_arm = engine.split("ocr_budget.arm(state_dir()", 1)[0]
+        self.assertIn("importlib.reload(ocr_budget)", before_arm)
+        self.assertLess(before_arm.rindex("importlib.reload(ocr_budget)"), before_arm.rindex("set_worker_max("))
+        # Parallel OCR starts from this one gate. Documents inside a ZIM wait for the bonus pass.
+        self.assertEqual(engine.count("parallel_ocr_enabled("), 1)
+        reload = window.split("def _reload_indexer", 1)[1].split("\n    def ", 1)[0]
+        self.assertLess(reload.index("reload(ocr_budget)"), reload.index("reload(engine)"))
+        self.assertIn('TIPS["ocr_worker_max"]', window)
+        self.assertIn("self.ocr_worker_scale = gtk.Scale(", window)
+        self.assertIn("self.ocr_worker_entry = gtk.Entry()", window)
+        settings = window.split("self.settings_toggles.pack_start(self.parallel_ocr", 1)[1].split(
+            "inner.pack_start(self.settings_toggles", 1
+        )[0]
+        self.assertLess(settings.index("self.ocr_worker_row"), settings.index("self.zim_documents"))
 
 
 class PageTextTest(unittest.TestCase):

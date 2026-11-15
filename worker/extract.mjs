@@ -1,6 +1,10 @@
 // Read a ZIM from a resume point and print article sections as JSON lines.
 // Uses the NOMAD image only for libzim and htmlparser2. It does not call NOMAD code.
 //
+// A ZIM's pages are indexed on their own. PDFs, Word documents, and EPUBs
+// inside it are listed when --zim-documents is set. --defer-documents records
+// those paths and leaves them unread until a later --pass document --only.
+// Uploaded files are not read here.
 // The meat of a page is indexed no matter how long the page is. Navigation,
 // scripts, author boxes, and similar chrome are left out. A long page is
 // parsed in slices so one book cannot force a giant DOM into memory. The
@@ -728,7 +732,17 @@ async function selfTest() {
       throw new Error("reading the lookahead budget changed the cache cap");
     }
   }
+  if (keepZimDocument("html", true) || keepZimDocument("ocr", false) || keepZimDocument("text", false)) {
+    throw new Error("files inside a ZIM should stay unread until that setting is on");
+  }
+  if (!keepZimDocument("ocr", true) || !keepZimDocument("text", true)) {
+    throw new Error("files inside a ZIM should be read when that setting is on");
+  }
   console.error("self-test ok");
+}
+
+function keepZimDocument(kind, enabled) {
+  return Boolean(enabled) && (kind === "text" || kind === "ocr");
 }
 
 function spillPaths(spillId) {
@@ -772,6 +786,70 @@ function textSections(kind, path, bytes) {
 
 async function emitArticle(emit, article) {
   await emit(`${JSON.stringify(article)}\n`);
+}
+
+function documentTitle(title, entryPath) {
+  const raw = String(title == null ? "" : title).trim();
+  if (raw && !/^(null|none|undefined)$/i.test(raw)) return raw;
+  const parts = String(entryPath || "").split(/[/\\]/);
+  return parts[parts.length - 1] || raw || "document";
+}
+
+async function emitOneDocument(archive, onlyPath, emit, quality, drawFilled, lists) {
+  // One inner file, opened by path. The page walk is not started.
+  const path = String(onlyPath || "");
+  let title = documentTitle("", path);
+  const index = 1;
+  try {
+    const got = await readLaterEntry(archive, path);
+    title = documentTitle(got.title, path);
+    const kind = classifyEntry(got.mime, path, got.bytes ? got.bytes.length : 0);
+    if (kind === "text") {
+      const textKind = got.mime.includes("epub") ? "epub" : got.mime.includes("wordprocessingml") ? "docx" : "";
+      const sections = textSections(textKind, path, got.bytes);
+      await emitArticle(emit, { type: "phase", phase: "text" });
+      const article = { type: "article", index, path, title, sections };
+      if (!sections.length) article.skip = "empty";
+      await emitArticle(emit, article);
+      return;
+    }
+    if (kind !== "ocr") {
+      await emitArticle(emit, { type: "phase", phase: "text" });
+      await emitArticle(emit, { type: "article", index, path, title, sections: [], skip: "empty" });
+      return;
+    }
+    const ocr = await import("/app/nomad-turbo-ocr.mjs");
+    const profile = ocr.qualityProfile(quality, drawFilled);
+    const isPdf = got.mime.includes("pdf") || path.toLowerCase().endsWith(".pdf");
+    if (!isPdf) {
+      await emitArticle(emit, { type: "phase", phase: "text" });
+      await emitArticle(emit, { type: "article", index, path, title, sections: [], skip: "empty" });
+      return;
+    }
+    const layer = await ocr.pdfLayer(got.bytes);
+    const plain = (layer.pages || []).map((page) => page.text || "").join("\n");
+    const prints = lists ? loadPrints(lists.prints) : [];
+    if (matchesPrint(plain, prints)) {
+      await emitArticle(emit, { type: "phase", phase: "text" });
+      await emitArticle(emit, { type: "article", index, path, title, sections: [], skip: "duplicate" });
+      return;
+    }
+    const willDraw = profile.drawFilled || (layer.pages || []).some((page) => !String(page.text || "").trim());
+    await emitArticle(emit, { type: "phase", phase: willDraw ? "ocr" : "text" });
+    const parts = await ocr.readPdf(got.bytes, profile);
+    await emitArticle(emit, {
+      type: "article",
+      index,
+      path,
+      title,
+      kind: "pdf",
+      pages: parts.pages || [],
+      sections: [],
+    });
+  } catch (error) {
+    console.error(`skip read ${path}: ${error && error.message ? error.message : error}`);
+    await emitArticle(emit, { type: "article", index, path, title, sections: [], skip: "read" });
+  }
 }
 
 async function readLaterEntry(archive, path) {
@@ -865,9 +943,9 @@ function emitCachedOcr(cached, index, path) {
   };
 }
 
-async function runOcrPass(archive, list, resumePath, index, emit, quality, prints, spillId, ahead) {
+async function runOcrPass(archive, list, resumePath, index, emit, quality, prints, spillId, ahead, drawFilled = false) {
   const ocr = await import("/app/nomad-turbo-ocr.mjs");
-  const profile = ocr.qualityProfile(quality);
+  const profile = ocr.qualityProfile(quality, drawFilled);
   const start = passStart(list, resumePath, "ocr");
   await emitArticle(emit, { type: "pass", pass: "ocr", total: list.length, done: start });
   for (const path of list.slice(start)) {
@@ -975,6 +1053,15 @@ async function main() {
   if (process.argv.includes("--meta-only")) {
     return;
   }
+  if ((arg("--pass", "html") || "html") === "document" && arg("--only")) {
+    const quality = arg("--quality", "medium") || "medium";
+    const drawFilled = process.argv.includes("--ocr-every-pdf");
+    const spillId = arg("--spill-id");
+    const lists = spillId ? spillPaths(spillId) : null;
+    await emitOneDocument(archive, arg("--only"), emit, quality, drawFilled, lists);
+    await emit(JSON.stringify({ type: "done", articles: 1 }) + "\n");
+    return;
+  }
 
   const workers = startWorkers();
   let lookahead = null;
@@ -988,11 +1075,14 @@ async function main() {
   let emitted = 0;
   let articleSeq = 0;
   const wantedPass = arg("--pass", "html") || "html";
+  const zimDocuments = process.argv.includes("--zim-documents");
   const spillId = arg("--spill-id");
   const resumeLater = arg("--resume-path");
   const quality = arg("--quality", "medium") || "medium";
+  const drawFilled = process.argv.includes("--ocr-every-pdf");
   const lists = spillId ? spillPaths(spillId) : null;
   const queueOutside = process.argv.includes("--ocr-queue") && Boolean(lists) && wantedPass === "html";
+  const deferDocuments = process.argv.includes("--defer-documents");
   if (lists && wantedPass === "html" && !afterPath) {
     resetList(lists.text);
     resetList(lists.ocr);
@@ -1019,6 +1109,13 @@ async function main() {
   let ocrCount = 0;
   const resumeSkip = !afterPath && skip > 0;
 
+  function shownTitle(title, entryPath) {
+    const raw = String(title == null ? "" : title).trim();
+    if (raw && !/^(null|none|undefined)$/i.test(raw)) return raw;
+    const parts = String(entryPath || "").split(/[/\\]/);
+    return parts[parts.length - 1] || raw || "pdf";
+  }
+
   async function enqueueZimPdf(entry, entryPath) {
     // The walk's archive is free on this turn. Copy the PDF out and let the
     // OCR queue read it. This walk keeps emitting pages.
@@ -1034,6 +1131,7 @@ async function main() {
         title = got.title || entryPath;
         got.entry = null;
       }
+      title = shownTitle(title, entryPath);
       if (!bytes || !bytes.length) {
         console.error(`ocr enqueue skip ${entryPath}: empty`);
         return;
@@ -1103,7 +1201,7 @@ async function main() {
     try {
       if (!ahead.ocr) ahead.ocr = import("/app/nomad-turbo-ocr.mjs");
       const ocr = await ahead.ocr;
-      const profile = ocr.qualityProfile(quality);
+      const profile = ocr.qualityProfile(quality, drawFilled);
       if (isPdf) {
         const layer = await ocr.pdfLayer(bytes);
         const plain = (layer.pages || []).map((page) => page.text || "").join("\n");
@@ -1152,17 +1250,17 @@ async function main() {
   try {
     if (wantedPass === "html") {
       await emitArticle(emit, { type: "phase", phase: "html" });
-      if (lists) {
+      if (lists && zimDocuments) {
         const known = readList(lists.ocr);
         ocrCount = known.length;
         if (ocrCount) {
           await emitArticle(emit, { type: "ocr-tally", total: ocrCount });
         }
-        if (queueOutside) {
+        if (!deferDocuments && queueOutside) {
           for (const entryPath of known) {
             await enqueueZimPdf(null, entryPath);
           }
-        } else if (ahead.enabled) {
+        } else if (!deferDocuments && ahead.enabled) {
           for (const entryPath of known) {
             if (!readAhead(spillId, entryPath)) queueOcrAhead(entryPath);
           }
@@ -1184,6 +1282,9 @@ async function main() {
         continue;
       }
       const earlyKind = earlyRedirect ? "skip" : classifyEntry(earlyMime, earlyPath, earlySize);
+      if ((earlyKind === "text" || earlyKind === "ocr") && !keepZimDocument(earlyKind, zimDocuments)) {
+        continue;
+      }
       if (earlyKind === "text" && lists) {
         appendPath(lists.text, earlyPath);
         continue;
@@ -1192,8 +1293,8 @@ async function main() {
         appendPath(lists.ocr, earlyPath);
         ocrCount += 1;
         await emitArticle(emit, { type: "ocr-tally", total: ocrCount });
-        if (queueOutside) await enqueueZimPdf(entry, earlyPath);
-        else if (ahead.enabled) queueOcrAhead(earlyPath);
+        if (!deferDocuments && queueOutside) await enqueueZimPdf(entry, earlyPath);
+        else if (!deferDocuments && ahead.enabled) queueOcrAhead(earlyPath);
         continue;
       }
       if (earlyKind !== "html") continue;
@@ -1249,7 +1350,7 @@ async function main() {
       if (limit && emitted >= limit) break;
     }
     while (flight.length && !(limit && emitted >= limit)) await flushOne();
-    if (lists && !limit) {
+    if (lists && !limit && zimDocuments) {
       if (wantedPass === "html") {
         await emitArticle(emit, {
           type: "ocr-tally",
@@ -1257,38 +1358,45 @@ async function main() {
           complete: true,
         });
       }
-      const resumeText = wantedPass === "text" ? resumeLater : "";
-      const resumeOcr = wantedPass === "ocr" ? resumeLater : "";
-      if (wantedPass === "html" || wantedPass === "text") {
+      if (deferDocuments && wantedPass === "html") {
         const textRows = readList(lists.text);
-        if (textRows.length) {
-          index = await runTextPass(archive, textRows, resumeText, index, emit);
-        }
-      }
-      if (wantedPass !== "done" && queueOutside) {
-        const queued = readList(lists.ocr).length;
-        if (queued) {
-          console.error(
-            `${queued} PDF${queued === 1 ? "" : "s"} from this ZIM went to the front of the OCR queue`,
-          );
-        }
-      } else if (wantedPass !== "done") {
         const ocrRows = readList(lists.ocr);
-        if (ocrRows.length) {
-          clearGo(lists.go);
-          await emitArticle(emit, { type: "hold", pass: "ocr" });
-          await waitForGo(lists.go);
-          index = await runOcrPass(
-            archive,
-            ocrRows,
-            resumeOcr,
-            index,
-            emit,
-            quality,
-            loadPrints(lists.prints),
-            spillId,
-            ahead,
-          );
+        await emitArticle(emit, { type: "documents", closed: true, text: textRows.length, ocr: ocrRows.length });
+      } else {
+        const resumeText = wantedPass === "text" ? resumeLater : "";
+        const resumeOcr = wantedPass === "ocr" ? resumeLater : "";
+        if (wantedPass === "html" || wantedPass === "text") {
+          const textRows = readList(lists.text);
+          if (textRows.length) {
+            index = await runTextPass(archive, textRows, resumeText, index, emit);
+          }
+        }
+        if (wantedPass !== "done" && queueOutside) {
+          const queued = readList(lists.ocr).length;
+          if (queued) {
+            console.error(
+              `${queued} PDF${queued === 1 ? "" : "s"} from this ZIM went to the front of the OCR queue`,
+            );
+          }
+        } else if (wantedPass !== "done") {
+          const ocrRows = readList(lists.ocr);
+          if (ocrRows.length) {
+            clearGo(lists.go);
+            await emitArticle(emit, { type: "hold", pass: "ocr" });
+            await waitForGo(lists.go);
+            index = await runOcrPass(
+              archive,
+              ocrRows,
+              resumeOcr,
+              index,
+              emit,
+              quality,
+              loadPrints(lists.prints),
+              spillId,
+              ahead,
+              drawFilled,
+            );
+          }
         }
       }
     }

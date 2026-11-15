@@ -193,6 +193,31 @@ class ArticleFeed:
         self._claim = claim
         return chosen
 
+    def span_article_size(self, width: int) -> int:
+        """Median chunk count of the articles the next `width` inputs belong to.
+
+        This does not claim those inputs. The tune sample for a sliced call
+        uses the same article length one full-width call would have used.
+        """
+        limit = max(1, int(width))
+        seen = 0
+        indexes: set[int] = set()
+        for item_index, _prepared in enumerate(self._open):
+            for vector in self._vectors[item_index]:
+                if vector is not None:
+                    continue
+                indexes.add(item_index)
+                seen += 1
+                if seen >= limit:
+                    break
+            if seen >= limit:
+                break
+        sizes = [len(self._open[index].inputs) for index in indexes]
+        if not sizes:
+            return 0
+        sizes.sort()
+        return sizes[len(sizes) // 2]
+
     def call_article_size(self) -> int:
         """Median chunk count of the articles in the open call. Zero when none are claimed."""
         if not self._claim:
@@ -228,16 +253,7 @@ class ArticleFeed:
             prefix = DOCUMENT_PREFIX
         halves = halve_text(payload)
         if halves is None:
-            del prepared.inputs[input_index]
-            del prepared.section_for_input[input_index]
-            del section.payloads[payload_pos]
-            del self._vectors[item_index][input_index]
-            self._claim = []
-            self._remember_progress()
-            if not prepared.inputs and (prepared.article.get("skip") or "").strip() not in ("read", "parse"):
-                prepared.article["skip"] = "embed"
-                return "dropped-last", path
-            return "dropped", path
+            return self.drop_claimed(index)
         left, right = halves
         prepared.inputs[input_index] = prefix + left
         prepared.inputs.insert(input_index + 1, prefix + right)
@@ -248,6 +264,27 @@ class ArticleFeed:
         self._claim = []
         self._remember_progress()
         return "split", path
+
+    def drop_claimed(self, index: int) -> tuple[str, str]:
+        """Drop one claimed input. The article is bad when nothing remains."""
+        if not self._claim or not 0 <= index < len(self._claim):
+            self._claim = []
+            raise RuntimeError("embedder rejected a chunk that is not in this batch")
+        item_index, input_index = self._claim[index]
+        prepared = self._open[item_index]
+        path = str(prepared.article.get("path") or "")
+        owner, payload_pos = _payload_slot(prepared, input_index)
+        section = prepared.sections[owner]
+        del prepared.inputs[input_index]
+        del prepared.section_for_input[input_index]
+        del section.payloads[payload_pos]
+        del self._vectors[item_index][input_index]
+        self._claim = []
+        self._remember_progress()
+        if not prepared.inputs and (prepared.article.get("skip") or "").strip() not in ("read", "parse"):
+            prepared.article["skip"] = "embed"
+            return "dropped-last", path
+        return "dropped", path
 
     def push_vectors(self, vectors: list[list[float]]) -> list[tuple[PreparedArticle, list[list[float]]]]:
         if len(vectors) != len(self._claim):

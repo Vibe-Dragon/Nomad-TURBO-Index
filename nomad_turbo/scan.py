@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from nomad_turbo.catalog import CatalogRow, catalog_state, origin_for
+from nomad_turbo.catalog import CatalogRow, catalog_state, origin_for, waiting_on_ocr
 from nomad_turbo.decisions import choose_resume
 from nomad_turbo.discover import Install
 
@@ -50,6 +50,7 @@ def scan_library(install: Install) -> ScanResult:
             checkpoint_done=bool(checkpoint.get("done")),
             has_continuation=bool(entries),
         )
+        phase = str(checkpoint.get("pass") or "")
         chunks = max(int(checkpoint.get("chunks") or 0), int(ingest_chunks or 0))
         size = item.size
         mtime = item.mtime
@@ -66,6 +67,12 @@ def scan_library(install: Install) -> ScanResult:
                 chunks=chunks,
                 mtime=mtime,
                 walk_index=walk_index,
+                waiting_ocr=waiting_on_ocr(
+                    state,
+                    kind=kind,
+                    phase=phase,
+                    done=bool(checkpoint.get("done")),
+                ),
             )
         )
     order = {"running": 0, "partial": 1, "pending": 2, "failed": 3, "deferred": 4, "indexed": 5}

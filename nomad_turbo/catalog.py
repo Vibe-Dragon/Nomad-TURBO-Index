@@ -27,6 +27,9 @@ class CatalogRow:
     chunks: int = 0
     mtime: float | None = None
     walk_index: int = 0
+    # Pages are stored and PDFs from this ZIM are still queued. The stored
+    # state stays partial, so Hide finished does not drop the row.
+    waiting_ocr: bool = False
 
 
 def origin_for(source: str) -> str:
@@ -61,7 +64,22 @@ def row_color(origin: str, state: str) -> str:
     return ZIM_DONE_COLOR if done else ZIM_COLOR
 
 
-def status_word(state: str) -> str:
+def waiting_on_ocr(state: str, *, kind: str = "", phase: str = "", done: bool = False) -> bool:
+    """A ZIM whose pages are stored while its PDFs are still queued.
+
+    The file list keeps the stored state. This only changes the status word.
+    A file still being read, and one that failed, keep their own words.
+    """
+    if done or state in ("running", "indexed", "failed", "deferred", "pending"):
+        return False
+    if kind != "zim":
+        return False
+    return phase in ("queued", "ocr")
+
+
+def status_word(state: str, *, waiting_ocr: bool = False) -> str:
+    if waiting_ocr and state not in ("running", "indexed", "failed", "deferred"):
+        return "Waiting OCR"
     return {
         "indexed": "indexed",
         "partial": "partial",

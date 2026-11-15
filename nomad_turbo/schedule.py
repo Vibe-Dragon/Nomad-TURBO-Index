@@ -47,6 +47,8 @@ COL_ART_MIN_SORT = 15
 COL_CHUNKS_SORT = 16
 COL_CHK_SORT = 17
 COL_ETA_SORT = 18
+# Tenths of the chunks-processed percent while a file is embedding. -1 is one bar.
+COL_EMBEDDED = 19
 
 PRIORITY_MARK = "*"
 PRIORITY_COLOR = "#c0392b"
@@ -108,6 +110,14 @@ def priority_mark(priority: bool) -> str:
     return PRIORITY_MARK if priority else ""
 
 
+def gtk_foreground(value: object) -> str | None:
+    """Color Gtk may apply. An empty cell omits the attribute instead of ''."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    return text
+
+
 # Drawn in the folder-tree mark cell. Status text is not this mark.
 INDEXING_MARK = "▶"
 INDEXING_COLOR = "#0e6b3c"
@@ -146,7 +156,10 @@ ZIM_ROOT = "zim"
 
 @dataclass(frozen=True)
 class TreeFolder:
-    """One directory in the library list. files are source paths, in name order."""
+    """One directory in the library list. files are source paths, in name order.
+
+    The document branch sets the later fields. A library folder leaves them empty.
+    """
 
     key: str
     name: str
@@ -155,6 +168,11 @@ class TreeFolder:
     size_bytes: int
     folders: tuple["TreeFolder", ...]
     files: tuple[str, ...]
+    status_text: str = ""
+    articles_text: str = ""
+    progress: int = 0
+    show_bar: bool = False
+    doc_source: str = ""
 
 
 def library_place(source: str, name: str, origin: str = "") -> tuple[str, tuple[str, ...]]:
@@ -190,11 +208,12 @@ def _freeze_folder(key: str, name: str, root: str, node) -> TreeFolder:
     return TreeFolder(key, name, root, count, size, tuple(folders), files)
 
 
-def library_tree(items, *, hide_finished: bool = False) -> tuple[TreeFolder, ...]:
+def library_tree(items, *, hide_finished: bool = False, documents=()) -> tuple[TreeFolder, ...]:
     """kb_uploads, then zim. Indexed files stay out when hide_finished is set.
 
     Folders and files are sorted by name. A folder with nothing left to show
-    is left out. This does not follow the indexing order.
+    is left out. This does not follow the indexing order. Document groups, when
+    the caller passes them, are pinned last under zim.
     """
 
     class _Dir:
@@ -226,7 +245,9 @@ def library_tree(items, *, hide_finished: bool = False) -> tuple[TreeFolder, ...
         folder = _freeze_folder(root, root, root, roots[root])
         if folder.file_count:
             built.append(folder)
-    return tuple(built)
+    from nomad_turbo.zimdocs import place_document_branch
+
+    return place_document_branch(tuple(built), documents, hide_finished)
 
 
 def folder_store_row(folder: TreeFolder) -> tuple:
@@ -237,15 +258,24 @@ def folder_store_row(folder: TreeFolder) -> tuple:
     color = ZIM_COLOR if folder.root == ZIM_ROOT else UPLOAD_COLOR
     count = int(folder.file_count)
     label = "1 file" if count == 1 else f"{count} files"
+    file_type = FOLDER
+    status = label
+    progress = 0
+    articles = EM_DASH
+    if folder.doc_source:
+        file_type = "zim"
+        status = folder.status_text or label
+        articles = folder.articles_text or EM_DASH
+        progress = int(folder.progress or 0) if folder.show_bar else 0
     return (
         folder.key,
         "",
         folder.name,
-        FOLDER,
+        file_type,
         format_bytes(int(folder.size_bytes)),
-        label,
-        0,
-        EM_DASH,
+        status,
+        progress,
+        articles,
         EM_DASH,
         EM_DASH,
         EM_DASH,
@@ -257,6 +287,7 @@ def folder_store_row(folder: TreeFolder) -> tuple:
         0,
         0,
         UNKNOWN_ETA_SECONDS,
+        -1,
     )
 
 
@@ -284,6 +315,7 @@ def hold_store_row() -> tuple:
         0,
         0,
         UNKNOWN_ETA_SECONDS,
+        -1,
     )
 
 
@@ -322,6 +354,7 @@ def index_store_row(item, *, priority: bool) -> tuple:
         shown_chunks,
         int(round(chk or 0)),
         UNKNOWN_ETA_SECONDS if eta_seconds is None else int(eta_seconds),
+        int(getattr(item, "embedded", -1)),
     )
 
 
@@ -624,6 +657,91 @@ def pick_next(
     return Pick(target, True, reason)
 
 
+def rank_embed_waiting(program: list[str], ready: list[str], priorities: set[str]) -> list[str]:
+    """Priority, then text that has finished OCR, then the remaining files.
+
+    `program` is the selected order. Prioritized files keep that relative
+    order. `ready` is finished OCR in the order those reads finished. A
+    prioritized file that has finished OCR stays with the other prioritized
+    files, not with the rest of the finished reads.
+    """
+    pri = {source for source in priorities if source}
+    ready_list: list[str] = []
+    seen_ready: set[str] = set()
+    for source in ready:
+        if source and source not in seen_ready:
+            seen_ready.add(source)
+            ready_list.append(source)
+    seen: set[str] = set()
+    out: list[str] = []
+
+    def add(source: str) -> None:
+        if source and source not in seen:
+            seen.add(source)
+            out.append(source)
+
+    for source in program:
+        if source in pri:
+            add(source)
+    for source in ready_list:
+        if source in pri:
+            add(source)
+    for source in ready_list:
+        add(source)
+    for source in program:
+        if source not in seen_ready:
+            add(source)
+    return out
+
+
+def choose_embed_source(
+    rows: list[OrderFile],
+    ready,
+    *,
+    choice: str,
+    index_now: str | None,
+    manual: list[str] | None,
+) -> tuple[str | None, str]:
+    """The next file to embed when finished OCR is waiting.
+
+    Index now wins. A saved queue wins over priority. Otherwise prioritized
+    files come first, finished OCR comes next, and the selected order follows.
+    `rows` are library files that can be stored now, including a PDF whose
+    text is already read. `ready` also names a PDF inside a ZIM.
+    """
+    picked = pick_next(
+        list(rows),
+        choice=choice,
+        current=None,
+        index_now=index_now,
+        manual=manual,
+    )
+    if picked.reason in ("now", "queue") and picked.target:
+        return picked.target, picked.reason
+    priorities = {
+        item.source
+        for item in rows
+        if item.priority and item.state not in ("indexed", "deferred")
+    }
+    open_rows = [item for item in rows if item.state not in ("indexed", "deferred")]
+    program = [item.source for item in ordered_files(open_rows, choice)]
+    ranked = rank_embed_waiting(program, list(ready or ()), priorities)
+    by_source = {item.source: item for item in rows}
+    ready_set = {source for source in (ready or ()) if source}
+    for source in ranked:
+        item = by_source.get(source)
+        if item is not None and item.state in ("indexed", "deferred"):
+            continue
+        if item is None and source not in ready_set:
+            continue
+        if item is not None and item.priority:
+            return source, "priority"
+        if source in ready_set:
+            return source, "ocr"
+        return source, "order"
+    return None, "none"
+
+
 def row_menu_labels(*, priority: bool) -> tuple[str, str, str]:
     """Right-click actions. The second one sets or clears priority."""
     return ("Index now", "Clear priority" if priority else "Set priority", "Details")
@@ -757,7 +875,13 @@ def engine_switch_reason(
         return None
     target = open_index_now(session, files)
     if session.index_now() and target is None:
-        session.clear_index_now()
+        from nomad_turbo.discover import state_dir
+        from nomad_turbo.zimdocs import source_has_pending_documents
+
+        # Pages of this ZIM are already stored. Index now still means its
+        # documents go first, once the page and upload list is empty.
+        if not source_has_pending_documents(state_dir(), session.index_now()):
+            session.clear_index_now()
     if target and target != source:
         return "now"
     wants = getattr(session, "wants_priority_switch", None)
@@ -840,16 +964,21 @@ def file_eta_view(
     total: int | None,
     live_rate: float | None,
     measured_rate: float | None,
+    inventory_units: int | None = None,
 ) -> tuple[str, int | None]:
     """ETA text and seconds.
 
     A measured article rate is used even when another file is current,
-    as long as this file's remaining article count is known.
+    as long as this file's remaining article count is known. A file that
+    is not running uses the Measure inventory (pages and documents) when
+    the article total is not what the timing should follow.
     """
     from nomad_turbo.progress import format_eta
 
     if state == "indexed":
         return "", 0
+    if state != "running" and inventory_units:
+        total = int(inventory_units)
     rate = live_rate if state == "running" and live_rate else None
     if rate is None:
         rate = measured_rate

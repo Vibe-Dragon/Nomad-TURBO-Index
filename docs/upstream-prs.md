@@ -33,14 +33,14 @@ Turbo does not use pdf2pic for the draw. `worker/ocr.mjs` reads the page box fro
 
 What we did not copy: the pdf2pic flags, the 1700 px floor on both axes, and the method rename. A non-letter page stays its own shape.
 
-Follow-up, shipped with the OCR quality control. 200 dpi is enough for body text and too low once the page is shrunk for Tesseract. `preprocess` used to resize OCR input to a width of 2000 px. A letter page drawn at 200 dpi is 1700×2200 and was scaled up slightly. A 17-inch-wide sheet drawn at 200 dpi was then scaled to 2000 px across, about 118 dpi, which dropped the small labels on a schematic. Medium, the saved default, draws at 300 dpi with an 8000 px cap and does not shrink the width. High is 400 dpi and 12000 px. Low keeps the old 200 dpi draw, the 4000 px cap, and the width-2000 shrink, and it skips a page that already has a text layer. Grayscale, normalize, and sharpen stay. A letter page at 300 dpi is 2550×3300. Text rotated on the drawing, or sitting on a wire, can still be missed. Density does not fix that. The control is the OCR group on the Index page, between Measure and the embed batch.
+Follow-up, shipped with the OCR quality control. 200 dpi is enough for body text and too low once the page is shrunk for Tesseract. `preprocess` used to resize OCR input to a width of 2000 px. A letter page drawn at 200 dpi is 1700×2200 and was scaled up slightly. A 17-inch-wide sheet drawn at 200 dpi was then scaled to 2000 px across, about 118 dpi, which dropped the small labels on a schematic. Medium, the saved default, draws at 300 dpi with an 8000 px cap and does not shrink the width. High is 400 dpi and 12000 px. Low keeps the old 200 dpi draw, the 4000 px cap, and the width-2000 shrink. Which pages are drawn follows **OCR every PDF** on the Settings page. That switch stays off, so a page that already has text is not drawn. A page with no text is still read. On draws every page at the chosen quality. Grayscale, normalize, and sharpen stay. A letter page at 300 dpi is 2550×3300. Text rotated on the drawing, or sitting on a wire, can still be missed. Density does not fix that. The control is the OCR group on the Index page, between Measure and the embed batch.
 
 ## 1536 — index the PDFs inside ZIM files
 
 - Pull request: https://github.com/Crosstalk-Solutions/project-nomad/pull/1536
 - Issue: https://github.com/Crosstalk-Solutions/project-nomad/issues/1445
 - Author: YordiLorenzo. Draft, opened 2026-11-03. The ZIM PDF commit is `db6e6ab`. It also carries #1460 (per-page OCR, `ef54af2`) and #1464 (bundled English traineddata, `8fb0d69`).
-- Status: **shipped**. One forward walk writes text and OCR paths to disk, then a text pass and an OCR pass open those paths with `getEntryByPath`. HTML is embedded during the walk. The file bar restarts for each pass: green HTML, blue text, orange while a page is recognized, purple while that text is stored. OCR quality, the spelling rules, and the duplicate checks below are what the code does. A short ZIM picture is dropped after it is read. An uploaded picture is kept. OCR text is not written back into the file or the ZIM.
+- Status: **shipped**, and off until **ZIM documents** on the Settings page is turned on. Off, the walk indexes the ZIM's pages. PDFs, Word documents, and EPUBs inside it stay unread. Uploaded PDFs and pictures are still read. On, the page walk records those paths and does not copy them out. They are read after every ZIM's pages and every upload are stored, one document at a time, by `--pass document --only`. The page walk passes `--defer-documents`. The file list shows them under Internal Zim Documents. A ZIM whose pages are stored is indexed, so stock NOMAD does not walk those pages again. OCR quality, the spelling rules, and the duplicate checks below are what the code does. Pictures inside a ZIM are left out. An uploaded picture is kept. OCR text is not written back into the file or the ZIM. A ZIM already marked indexed stays as it is until it is walked again.
 
 Stock ZIM extraction reads HTML only, so a PDF-shelf ZIM (zimgit, Medicine Essentials, FAS Military Medicine) stored one or two chunks. The pull request reads each `application/pdf` entry with the same reader as an uploaded PDF: per-page text, OCR only on a page whose text layer is empty, then joins pages into passages of about 3000 characters labelled `page 4` or `pages 5-7`. A PDF that cannot be read is skipped with a warning. The rest of the ZIM continues. The pull request's own check: `fas-military-medicine_en_2025-06.zim` went from 1 chunk to 5,615 (26 articles, 1,134 pages OCR'd, about 53 minutes, almost all of it extraction on one core). `zimgit-medicine_en_2024-08.zim` went from 2 chunks to 3,034 in 75 seconds. libzim counts that second file as 1 article, so the progress bar sat near the start until the end. `section_title` is the page range. `article_title` is the entry path. Duplicate copies of one PDF inside a ZIM are left as duplicates (that is #1441). A tesseract.js recognize failure can still escape and take the queue down. That is not fixed in the pull request.
 
@@ -50,7 +50,7 @@ The gap is `worker/extract.mjs`. `isArticle` keeps `text/html` and `application/
 
 ### Plan
 
-Index every text-bearing entry in the ZIM, not only HTML and not only PDFs. Decided while reviewing this pull request: EPUBs and other readable entries are in scope. Video, audio, fonts, scripts, stylesheets, and map tiles are not. Later, pictures inside a ZIM were left out, and so was plain text inside a ZIM. HTML, PDFs, EPUBs, and Word documents remain. Uploaded pictures are unchanged. When CPU OCR overlaps GPU indexing, a PDF found in a ZIM goes to the front of the OCR queue. The GPU finishes that ZIM's pages, embeds OCR text that is already ready, then the next ZIM.
+Index every text-bearing entry in the ZIM, not only HTML and not only PDFs. Decided while reviewing this pull request: EPUBs and other readable entries are in scope. Video, audio, fonts, scripts, stylesheets, and map tiles are not. Later, pictures inside a ZIM were left out, and so was plain text inside a ZIM. HTML stays. PDFs, EPUBs, and Word documents inside a ZIM are read when **ZIM documents** is on, after every ZIM's pages and every upload are stored. Uploaded pictures are unchanged. A PDF inside a ZIM is not copied to the front of the OCR queue.
 
 1. In `worker/extract.mjs`, keep an entry when it can yield text:
    - HTML and XHTML, as today.
@@ -62,7 +62,7 @@ Index every text-bearing entry in the ZIM, not only HTML and not only PDFs. Deci
 2. Skip what is not readable text. Map tiles (a path containing `tiles/`) are the important case: a map ZIM can hold tens of millions of them, and OCR on a tile is noise. Also skip an image under about 8 KB (icons and spacers) and an image whose OCR comes back with fewer than 8 words of 3 or more characters (a photo). Video, audio, fonts, CSS, and JavaScript stay skipped. A file named README, LICENSE, CHANGELOG, NOTICE, CONTRIBUTING, or CODE_OF_CONDUCT is skipped when its body is under about 200 words. A long one is the manual, and it is indexed.
 3. Read PDF and picture bytes with libzim. Do not run them through the HTML parser, and do not decode a PDF as UTF-8 slices.
 4. Call the existing reader from `worker/ocr.mjs` inside the extract container. `start_extract` bind-mounts `ocr.mjs` and `worker/tessdata` the same way the OCR container already does. Network stays off. One entry does not start its own container.
-5. A PDF page keeps its text layer. The page image is also read. Merge and spelling follow the rules below. The same rules run for uploads and for ZIM PDFs. How hard the page is drawn follows the OCR quality setting.
+5. A PDF page keeps its text layer. The page is drawn when it has no text, or when OCR every PDF is on. Merge and spelling follow the rules below. The same rules run for uploads and for ZIM PDFs. How hard the page is drawn follows the OCR quality setting.
 6. Join PDF page texts into sections of about 3000 characters. The section heading is `page N` or `pages N-M`. Emit the same article JSON the HTML path already emits: `title` is the entry title or path, `sections[].heading` is the page range. `packing.py` already stores that heading as `section_title`, so a hit can say where in the PDF it came from. An EPUB's chapters stay headings from its HTML. A picture is one article, titled by its entry path.
 7. A page whose recognize call throws is logged and stored as an empty page. The next page continues. An entry that cannot be opened is emitted with `skip` set, the same way a bad HTML page is skipped today, and the ZIM continues.
 8. The lookahead thread keeps its one-byte touch. It does not pull a PDF or a picture into the prefetch worker.
@@ -79,7 +79,7 @@ One forward walk of the ZIM. HTML is read and embedded during that walk, at toda
 
 Then the text pass: EPUB, plain text, markdown, captions, docx, SVG text. Short READMEs and the other boilerplate names above are dropped. Anything that matches an HTML article already stored is dropped. The rest is embedded.
 
-Then the OCR pass: PDFs and pictures. A PDF's text layer is read first. When that layer already matches an article from an earlier pass, the page is not drawn. Otherwise the quality setting runs, and the merged text is embedded if it is real content. Pictures are read here. A photo that comes back with fewer than 8 words is dropped after the read.
+Then the OCR pass: PDFs and pictures. A PDF's text layer is read first. When that layer already matches an article from an earlier pass, the page is not drawn. Otherwise a page with no text is drawn, and every page is drawn when OCR every PDF is on. The merged text is embedded if it is real content. Pictures are read here. A photo that comes back with fewer than 8 words is dropped after the read.
 
 OCR can run while HTML is still embedding when the two are on different devices. CPU OCR then keeps a couple of cores while Qdrant is writing, one while Qdrant is optimizing, and none when Qdrant refuses a write. A quiet collection gives those cores back. The same device does not do both at once, so OCR waits until that device is between writes.
 
@@ -92,17 +92,19 @@ The file's progress bar is painted per pass, because the stock bar has one theme
 | Recognizing a page or a picture | orange | OCR |
 | Storing the words that recognition produced | purple | OCR text |
 
-A pass with nothing in its list is skipped. Orange and purple trade places on each PDF and each picture: orange while that entry is read, purple while its chunks are embedded, then orange again for the next one. An uploaded PDF or picture does the same. A PDF whose text layer already matches an indexed article, or whose quality setting never draws the page, stays on blue and then the normal embed color for text. It does not turn orange.
+A pass with nothing in its list is skipped. Orange and purple trade places on each PDF and each picture: orange while that entry is read, purple while its chunks are embedded, then orange again for the next one. An uploaded PDF or picture does the same. A PDF whose text layer already matches an indexed article, or whose pages are not drawn, stays on blue and then the normal embed color for text. It does not turn orange.
 
 ### OCR quality
 
 One saved setting, default medium. It applies to PDF pages and pictures, in uploads and in ZIMs. The page is still drawn once from its page box, with aspect ratio kept. Grayscale, normalize, and sharpen stay.
 
-| Setting | Draw | Long side | Which pages |
+| Setting | Draw | Long side | Width |
 | --- | --- | --- | --- |
-| Low | 200 dpi | 4000 px | A page that already has a text layer is not drawn. An empty page is read. |
-| Medium | 300 dpi | 8000 px | Every page is drawn. The width-2000 shrink stays off. |
-| High | 400 dpi | 12000 px | Every page is drawn. The width-2000 shrink stays off. |
+| Low | 200 dpi | 4000 px | Shrinks to 2000. |
+| Medium | 300 dpi | 8000 px | The width-2000 shrink stays off. |
+| High | 400 dpi | 12000 px | The width-2000 shrink stays off. |
+
+Which pages are drawn is **OCR every PDF** on the Settings page, off unless it is turned on. Off, a page that already has text is not drawn, and a page with no text is read. On, every page is drawn at the quality above. A picture is read at that quality either way.
 
 Medium is the everyday setting, including small print. High is for schematics and tiny labels. A 17-inch sheet at 400 dpi is about 6800 px and stays under the high cap. High reads about 1.8 times as many pixels as medium, so it is slower. Vertical lettering and type drawn on a wire can still be missed at every setting.
 
@@ -148,6 +150,6 @@ Checked against the open and merged Project NOMAD pull requests on 2026-11-07. T
 - #763 (https://github.com/Crosstalk-Solutions/project-nomad/pull/763), #890 (https://github.com/Crosstalk-Solutions/project-nomad/pull/890), and #994 (https://github.com/Crosstalk-Solutions/project-nomad/pull/994), all merged. Keep a dense chunk inside the embedder's context, and do not retry a bad call 30 times. Status: **covered** by splitting. A chunk that would pass 2048 tokens is split before the call, and the stored words are kept. A failed call is tried 3 times. A 400 splits that input instead of retrying it. Turbo does not send `num_ctx: 8192`.
 - #352 (https://github.com/Crosstalk-Solutions/project-nomad/pull/352), merged. Do not retry an embed job 30 times when Ollama is not installed. Status: **covered** by the same retry cap. Turbo does not queue stock `file-embeddings` jobs for its own work.
 - #1135 (https://github.com/Crosstalk-Solutions/project-nomad/pull/1135), merged. Do not create the Qdrant payload indexes again on every document. Status: **covered**. Turbo checks the collection when a run needs it. An index that already exists is left alone.
-- #257 (https://github.com/Crosstalk-Solutions/project-nomad/pull/257), merged. Index EPUB uploads. Status: **covered** for uploads and for EPUB entries inside a ZIM. Turbo reads the HTML inside the archive. It does not follow the OPF spine order.
-- #1100 (https://github.com/Crosstalk-Solutions/project-nomad/pull/1100), merged. Read a `.docx` as text instead of as a zip of XML. Status: **covered**. Uploads read `word/document.xml` word by word. A `.docx` inside a ZIM uses the same file with the tags stripped. Turbo does not use mammoth.
+- #257 (https://github.com/Crosstalk-Solutions/project-nomad/pull/257), merged. Index EPUB uploads. Status: **covered** for uploads, and for EPUB entries inside a ZIM when **ZIM documents** is on. Turbo reads the HTML inside the archive. It does not follow the OPF spine order.
+- #1100 (https://github.com/Crosstalk-Solutions/project-nomad/pull/1100), merged. Read a `.docx` as text instead of as a zip of XML. Status: **covered**. Uploads read `word/document.xml` word by word. A `.docx` inside a ZIM uses the same file with the tags stripped when **ZIM documents** is on. Turbo does not use mammoth.
 - #1227 (https://github.com/Crosstalk-Solutions/project-nomad/pull/1227), merged. Delete Qdrant points when the file is gone. Status: **covered** by Complete repair. That scan lists the sources in the index and deletes points for a library file that is no longer on disk. It does not run by itself during indexing. A file that is still on disk is left in place.

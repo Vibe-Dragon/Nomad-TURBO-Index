@@ -45,6 +45,7 @@ from nomad_turbo.schedule import (
     file_type_label,
     files_for_list_order,
     folder_store_row,
+    gtk_foreground,
     hold_store_row,
     index_store_row,
     library_place,
@@ -162,7 +163,7 @@ class ColumnCellsTest(unittest.TestCase):
         running = index_store_row(by_name["wiki.zim"], priority=True)
         waiting = index_store_row(by_name["notes.pdf"], priority=False)
         photo = index_store_row(by_name["photo.JPEG"], priority=False)
-        self.assertEqual(len(running), 19)
+        self.assertEqual(len(running), 20)
         self.assertEqual(running[COL_NAME], "wiki.zim")
         self.assertEqual(running[COL_MARK], PRIORITY_MARK)
         self.assertNotIn("*", running[COL_NAME])
@@ -1914,7 +1915,7 @@ class LibraryTreeTest(unittest.TestCase):
         self.assertEqual(biology.files, (items[0].source,))
         self.assertEqual(zims.files, ("notes.zim", "/app/storage/zim/wikipedia_en.zim"))
         row = folder_store_row(uploads)
-        self.assertEqual(len(row), 19)
+        self.assertEqual(len(row), 20)
         self.assertEqual(row[COL_TYPE], FOLDER)
         self.assertEqual(row[COL_NAME], "kb_uploads")
         self.assertEqual(row[COL_STATUS], "3 files")
@@ -1924,9 +1925,16 @@ class LibraryTreeTest(unittest.TestCase):
         self.assertEqual([folder.name for folder in hidden[0].folders], ["ca-federal-law"])
         self.assertNotIn("textbooks", [folder.name for folder in hidden[0].folders])
         held = hold_store_row()
-        self.assertEqual(len(held), 19)
+        self.assertEqual(len(held), 20)
         self.assertEqual(held[0], FOLDER_HOLD)
         self.assertEqual(held[COL_TYPE], FOLDER)
+        self.assertIsNone(gtk_foreground(""))
+        self.assertIsNone(gtk_foreground(held[12]))
+        self.assertEqual(gtk_foreground("#1d4e89"), "#1d4e89")
+        self.assertNotEqual(gtk_foreground("#1d4e89"), "")
+        window = (ROOT / "nomad_turbo" / "window.py").read_text(encoding="utf-8")
+        self.assertNotIn('add_attribute(name_cell, "foreground", COL_COLOR)', window)
+        self.assertIn("gtk_foreground", window)
 
 
 class IndexPageControlsTest(unittest.TestCase):
@@ -1965,8 +1973,10 @@ class IndexPageControlsTest(unittest.TestCase):
         os.environ["NOMAD_TURBO_CONFIG"] = str(Path(state.name) / "config.json")
         app = None
         try:
+            from nomad_turbo.ocr_budget import ocr_worker_limit, reset_pressure
             from nomad_turbo.window import _MemoryLog
 
+            reset_pressure()
             app = _Window(_install(state.name), Session(55), _MemoryLog(), Path(state.name) / "session.log", Gtk, GLib)
             titles = [column.get_title() for column in app.file_tree.get_columns()]
             self.assertEqual(titles, list(INDEX_HEADERS))
@@ -2002,7 +2012,42 @@ class IndexPageControlsTest(unittest.TestCase):
             )
             self.assertFalse(app.parallel_ocr.get_active())
             self.assertIn("Experimental", app.parallel_ocr.get_tooltip_text())
-            self.assertIn(app.parallel_ocr, app.ocr_group.get_children())
+            self.assertNotIn(app.parallel_ocr, app.ocr_group.get_children())
+            settings = app.settings_toggles.get_children()
+            self.assertIn(app.parallel_ocr, settings)
+            self.assertFalse(app.zim_documents.get_active())
+            self.assertIn(app.zim_documents, settings)
+            self.assertIn("pages", app.zim_documents.get_tooltip_text().lower())
+            self.assertLess(settings.index(app.parallel_ocr), settings.index(app.zim_documents))
+            self.assertFalse(app.ocr_every_pdf.get_active())
+            self.assertIn(app.ocr_every_pdf, settings)
+            self.assertIn("already has text", app.ocr_every_pdf.get_tooltip_text().lower())
+            self.assertLess(settings.index(app.zim_documents), settings.index(app.ocr_every_pdf))
+            limit = ocr_worker_limit(app.cpu_count)
+            self.assertIn(app.ocr_worker_row, settings)
+            self.assertLess(settings.index(app.parallel_ocr), settings.index(app.ocr_worker_row))
+            self.assertLess(settings.index(app.ocr_worker_row), settings.index(app.zim_documents))
+            self.assertEqual(int(app.ocr_worker_scale.get_adjustment().get_lower()), 1)
+            self.assertEqual(int(app.ocr_worker_scale.get_adjustment().get_upper()), limit)
+            self.assertLessEqual(limit, app.cpu_count)
+            if app.cpu_count >= 3:
+                self.assertEqual(limit, app.cpu_count - 2)
+            self.assertEqual(app.ocr_worker_entry.get_text(), str(limit))
+            self.assertEqual(int(round(app.ocr_worker_scale.get_value())), limit)
+            self.assertIn("two threads", app.ocr_worker_scale.get_tooltip_text().lower())
+            self.assertIn("next page", app.ocr_worker_entry.get_tooltip_text().lower())
+            app.ocr_worker_entry.set_text(str(app.cpu_count + 5))
+            self.assertEqual(app.ocr_worker_entry.get_text(), str(limit))
+            self.assertEqual(int(round(app.ocr_worker_scale.get_value())), limit)
+            app.ocr_worker_scale.set_value(1)
+            self.assertEqual(app.ocr_worker_entry.get_text(), "1")
+            if limit > 1:
+                self.assertEqual(app.install.ocr_worker_max, 1)
+                app.ocr_worker_entry.set_text(str(limit))
+                self.assertIsNone(app.install.ocr_worker_max)
+                self.assertEqual(int(round(app.ocr_worker_scale.get_value())), limit)
+            else:
+                self.assertIsNone(app.install.ocr_worker_max)
             self.assertEqual(app.queue_button.get_label(), "Queue")
             self.assertIn("priority", app.queue_button.get_tooltip_text().lower())
             self.assertNotIn(app.queue_button, app.run_group.get_children())
@@ -2014,6 +2059,8 @@ class IndexPageControlsTest(unittest.TestCase):
             app.on_queue()
             self.assertEqual(app.queue_window.get_title(), "Queue")
             self.assertFalse(app.queue_window.get_modal())
+            self.assertEqual(app.queue_embed_caption.get_text(), "Embedding")
+            self.assertEqual(app.queue_ocr_caption.get_text(), "OCR")
             self.assertEqual(
                 [column.get_title() for column in app.queue_embed_tree.get_columns()],
                 ["File", "File type", "Status", "Progress", "Articles", "art/min", "Chunks", "ETA"],
@@ -2031,6 +2078,8 @@ class IndexPageControlsTest(unittest.TestCase):
                 app.hide_finished,
                 app.keep_check,
                 app.parallel_ocr,
+                app.zim_documents,
+                app.ocr_every_pdf,
                 app.tune_auto,
                 app.error_check,
                 app.info_check,
@@ -2157,6 +2206,60 @@ class IndexPageControlsTest(unittest.TestCase):
             self.assertEqual(app.now_store[1][COL_STATUS], "OCR")
             self.assertEqual(app.now_store[1][COL_ARTICLES], "4 / 10")
             self.assertNotEqual(app.now_store[0][COL_STATUS], "OCR")
+            reading = "big.zim\nfiles/Traditional Ways (2).pdf"
+            app.session.set_lane_view(
+                {
+                    "reading": {
+                        "source": reading,
+                        "title": "null",
+                        "article_path": "files/Traditional Ways (2).pdf",
+                        "kind": "pdf",
+                        "articles": 42,
+                        "total_articles": 383,
+                    },
+                    "queued": [],
+                    "ready": [],
+                }
+            )
+            app.session.set_ocr_activity("Reading Traditional Ways (2).pdf with OCR. Page 42 of 383.")
+            app.refresh_rows()
+            self.assertEqual([app.now_store[i][0] for i in range(len(app.now_store))], ["now.pdf", reading])
+            self.assertEqual(app.now_store[1][COL_NAME], "Traditional Ways (2).pdf")
+            self.assertEqual(app.now_store[1][COL_STATUS], "OCR")
+            self.assertEqual(app.now_store[1][COL_ARTICLES], "42 / 383")
+            self.assertNotEqual(app.now_store[0][COL_STATUS], "OCR")
+            app.session.set_embedding_file(
+                {
+                    "source": "big.zim\nfiles/Being stored.pdf",
+                    "title": "Being stored.pdf",
+                    "article_path": "files/Being stored.pdf",
+                    "kind": "pdf",
+                    "status": "text",
+                    "chunks": 12,
+                }
+            )
+            app.refresh_rows()
+            self.assertEqual(app.now_store[0][COL_NAME], "Being stored.pdf")
+            self.assertEqual(app.now_store[0][COL_STATUS], "text")
+            self.assertEqual(app.now_store[0][COL_CHUNKS], "12")
+            self.assertEqual(app.now_store[1][COL_NAME], "Traditional Ways (2).pdf")
+            self.assertEqual(app.now_store[1][COL_STATUS], "OCR")
+            app.session.set_embedding_file(None)
+            app.refresh_rows()
+            self.assertEqual(app.now_store[0][COL_NAME], "now.pdf")
+            self.assertEqual(
+                _tree_keys(app.store),
+                [
+                    ("kb_uploads", [(FOLDER_HOLD, [])]),
+                    ("zim", [(FOLDER_HOLD, [])]),
+                ],
+            )
+            app.session.set_lane_view(None)
+            app.session.set_ocr_activity("Reading mid.pdf with OCR. Page 4 of 10.")
+            app.refresh_rows()
+            self.assertEqual([app.now_store[i][0] for i in range(len(app.now_store))], ["now.pdf", "mid.pdf"])
+            self.assertEqual(app.now_store[1][COL_STATUS], "OCR")
+            self.assertEqual(app.now_store[1][COL_ARTICLES], "4 / 10")
             both.update("mid.pdf", articles=0, total=None, chunks=0, state="pending", now=2)
             app.session.clear_ocr_activity("mid.pdf")
             app.refresh_rows()
@@ -2191,8 +2294,8 @@ class IndexPageControlsTest(unittest.TestCase):
             now_row = app.store.iter_children(app.store.get_iter_first())
             now_row = app.store.iter_next(now_row)
             self.assertEqual(app.store.get_value(now_row, 0), "now.pdf")
-            self.assertEqual(app.store.get_value(now_row, COL_ARTICLES), "4 / 10")
-            self.assertEqual(app.now_store[0][COL_ARTICLES], "4 / 10")
+            self.assertEqual(app.store.get_value(now_row, COL_ARTICLES), "4 / 6")
+            self.assertEqual(app.now_store[0][COL_ARTICLES], "4 / 6")
             self.assertIn(INDEXING_MARK, app.store.get_value(now_row, COL_MARK))
             self.assertNotIn(INDEXING_MARK, str(app.now_store[0][COL_MARK] or ""))
             pending = app.store.iter_children(app.store.get_iter_first())
@@ -2292,6 +2395,9 @@ class IndexPageControlsTest(unittest.TestCase):
             self.assertEqual(app.file_tree.get_columns()[2].get_fixed_width(), 130)
             self.assertEqual(starts(app.now_tree), starts(app.file_tree))
         finally:
+            from nomad_turbo.ocr_budget import reset_pressure
+
+            reset_pressure()
             if app is not None:
                 app.window.destroy()
             if previous_state is None:

@@ -11,7 +11,12 @@ import json
 
 from nomad_turbo.decisions import file_is_embeddable
 from nomad_turbo.discover import state_dir
-from nomad_turbo.schedule import files_for_list_order, ordered_files
+from nomad_turbo.schedule import (
+    choose_embed_source,
+    files_for_list_order,
+    ordered_files,
+    rank_embed_waiting,
+)
 
 
 def apply_manual(default: list[str], manual: list[str] | None) -> list[str]:
@@ -83,6 +88,114 @@ def rewrite_side(order: list[str], side: set[str] | list[str], new_side: list[st
     return result
 
 
+# The Queue window paints this many rows per column. The saved order is the full list.
+QUEUE_SHOW = 200
+
+_MISSING_TITLE = frozenset({"", "null", "none", "undefined"})
+
+
+def display_title(title: str, *fallbacks: str) -> str:
+    """Name to show. A ZIM entry titled null is the file name."""
+    raw = str(title or "").strip()
+    if raw.casefold() not in _MISSING_TITLE:
+        return raw
+    for candidate in fallbacks:
+        text = str(candidate or "").replace("\\", "/").strip()
+        leaf = text.replace("\n", "/").rsplit("/", 1)[-1].strip()
+        if leaf.casefold() not in _MISSING_TITLE:
+            return leaf
+    return raw or "pdf"
+
+
+def shown_slots(slots, limit: int = QUEUE_SHOW):
+    """The in-progress row and the files after it, capped for the window.
+
+    The running row is already first. A drag of this slice is merged back
+    into the full waiting list, so the rows past the cap stay in order.
+    """
+    rows = tuple(slots)
+    if len(rows) <= limit:
+        return rows
+    return rows[:limit]
+
+
+def queue_caption(title: str, shown: int, total: int) -> str:
+    """Column heading. The count appears when some of the queue is not listed."""
+    if total > shown:
+        return f"{title} · {shown} of {total}"
+    return title
+
+
+def embedding_file_view(job, *, status: str = "text", chunks: int = 0) -> dict | None:
+    """The document the GPU is storing when the row above the tree is not that file.
+
+    A document inside a ZIM also has a row under Internal Zim Documents.
+    This pinned row is the one being read or stored. An upload is already
+    the library row above the tree, so this stays empty for an upload.
+    """
+    source = str(getattr(job, "source", "") or "")
+    if "\n" not in source:
+        return None
+    article = str(getattr(job, "article_path", "") or "")
+    title = display_title(str(getattr(job, "title", "") or ""), article, source)
+    return {
+        "source": source,
+        "title": title,
+        "article_path": article,
+        "kind": str(getattr(job, "kind", "") or "") or "pdf",
+        "status": status or "text",
+        "chunks": max(0, int(chunks or 0)),
+        "articles": 0,
+        "total_articles": None,
+    }
+
+
+def _stored_face(embedding):
+    """The pinned row for a document that is being embedded. None when unset."""
+    if not isinstance(embedding, dict) or not embedding.get("source"):
+        return None
+    item = _face_for(embedding, locked=True)
+    item.status = str(embedding.get("status") or "text")
+    item.state = "running"
+    chunks = max(0, int(embedding.get("chunks") or 0))
+    item.chunks = chunks
+    item.chunks_text = f"{chunks:,}" if chunks else "—"
+    return item
+
+
+def pinned_files(running, lane, embedding=None) -> list:
+    """Rows above the folder tree.
+
+    The file the GPU is storing stays first. That is a document inside a ZIM
+    when `embedding` names one. The document OCR is reading stays second,
+    including a PDF inside a ZIM. A library file that is already that read
+    is not listed twice. Library order must not put the read in the embedding row.
+    """
+    rows = [item for item in (running or []) if getattr(item, "state", "") == "running"]
+    embedding_row = next((item for item in rows if running_column(item) == "embed"), None)
+    reading_row = next((item for item in rows if running_column(item) == "ocr"), None)
+    lead = embedding_row or reading_row or (rows[0] if rows else None)
+    stored = _stored_face(embedding)
+    if stored is not None and not any(getattr(item, "source", "") == stored.source for item in rows):
+        lead = stored
+    reading = lane.get("reading") if isinstance(lane, dict) else None
+    source = str(reading.get("source") or "") if isinstance(reading, dict) else ""
+    pinned = [lead] if lead is not None else []
+    if not source:
+        for item in rows:
+            if lead is None or getattr(item, "source", "") != getattr(lead, "source", ""):
+                pinned.append(item)
+                break
+        return pinned[:2]
+    if any(getattr(item, "source", "") == source for item in pinned):
+        return pinned[:2]
+    match = next((item for item in rows if getattr(item, "source", "") == source), None)
+    second = match if match is not None else _face_for(reading, locked=True)
+    if not pinned or getattr(pinned[0], "source", "") == getattr(second, "source", ""):
+        return [second]
+    return [pinned[0], second]
+
+
 def is_visual_name(name: str, file_type: str = "") -> bool:
     """True for a PDF or a picture. Those wait on the OCR side."""
     kind = file_is_embeddable(name or "")
@@ -94,8 +207,8 @@ def is_visual_name(name: str, file_type: str = "") -> bool:
 def running_column(item) -> str | None:
     """Which column holds a file that is already being processed.
 
-    Status that starts with OCR, and is not OCR text, is the read. OCR text
-    and every other running file are being embedded.
+    Recognizing a page is the OCR column. Storing text, including text that
+    was just recognized, is the embedding column.
     """
     if getattr(item, "state", "") != "running":
         return None
@@ -285,10 +398,7 @@ def _slot(source: str, locked: bool, item) -> QueueSlot:
 def _face_for(job: dict, *, locked: bool):
     source = str(job.get("source") or "")
     article = str(job.get("article_path") or "")
-    title = str(job.get("title") or "")
-    if not title:
-        leaf = article or source
-        title = leaf.replace("\\", "/").rsplit("/", 1)[-1] or leaf
+    title = display_title(str(job.get("title") or ""), article, source)
     kind = str(job.get("kind") or "")
     if kind not in ("pdf", "image"):
         kind = "pdf" if is_visual_name(title, kind) or not kind else kind
@@ -325,6 +435,18 @@ def _jobs(lane: dict, key: str) -> list[dict]:
     return found
 
 
+def _with_embedding(boards: QueueBoards, embedding) -> QueueBoards:
+    """Keep the document being stored at the top of the embed column."""
+    item = _stored_face(embedding)
+    if item is None:
+        return boards
+    embed = [slot for slot in boards.embed if slot.source != item.source]
+    embed.insert(0, _slot(item.source, True, item))
+    boards.embed = tuple(embed)
+    boards.embed_waiting = tuple(source for source in boards.embed_waiting if source != item.source)
+    return boards
+
+
 def build_queue(
     files,
     *,
@@ -334,19 +456,24 @@ def build_queue(
     embed_order: list[str] | None = None,
     ocr_order: list[str] | None = None,
     lane: dict | None = None,
+    embedding=None,
 ) -> QueueBoards:
     """Left column, right column, and the waiting sequence a drag rewrites.
 
     With no OCR lane, both columns are one sequence: PDFs and pictures on
     the right, everything else on the left. With a lane, the right column is
-    that lane, including a PDF inside a ZIM, and finished reads wait on the left.
+    that lane, including a PDF inside a ZIM. On the left, prioritized files
+    come first, text that has finished OCR comes next, and the selected
+    order follows. A saved queue still comes before that.
     """
     marks = set(priorities or ())
     opened = _open_items(files)
     snaps = _by_source(opened)
     if lane is not None:
-        return _parallel_boards(opened, snaps, choice, marks, dates, embed_order, ocr_order, lane)
-    return _sequential_boards(opened, snaps, choice, marks, dates, embed_order, ocr_order)
+        boards = _parallel_boards(opened, snaps, choice, marks, dates, embed_order, ocr_order, lane)
+    else:
+        boards = _sequential_boards(opened, snaps, choice, marks, dates, embed_order, ocr_order)
+    return _with_embedding(boards, embedding)
 
 
 def _sequential_boards(opened, snaps, choice, priorities, dates, embed_order, ocr_order) -> QueueBoards:
@@ -409,16 +536,25 @@ def _parallel_boards(opened, snaps, choice, priorities, dates, embed_order, ocr_
             reading_source = item.source
             reading = {"source": item.source, "title": getattr(item, "name", "")}
 
-    non_visual = []
+    ready_set = set(ready_ids)
+    embeddable = []
     for item in opened:
-        if item.source in lane_ids or running_column(item):
+        if running_column(item):
             continue
-        if is_visual_name(getattr(item, "name", ""), getattr(item, "file_type", "")):
+        if item.source in lane_ids and item.source not in ready_set:
             continue
-        non_visual.append(item)
-    ranked = [item.source for item in _rank_waiting(non_visual, choice, priorities, dates)]
-    embed_default = [source for source in ready_ids if source not in {item.source for item in running_embed}]
-    embed_default.extend(source for source in ranked if source not in embed_default)
+        visual = is_visual_name(getattr(item, "name", ""), getattr(item, "file_type", ""))
+        if visual and item.source not in ready_set:
+            continue
+        embeddable.append(item)
+    program = [item.source for item in _rank_waiting(embeddable, choice, priorities, dates)]
+    embed_seen = {item.source for item in running_embed}
+    embed_default = []
+    for source in rank_embed_waiting(program, ready_ids, priorities):
+        if source in embed_seen:
+            continue
+        embed_seen.add(source)
+        embed_default.append(source)
     embed_waiting = apply_manual(embed_default, embed_order)
     ocr_waiting = apply_manual(queued_ids, ocr_order)
 
@@ -428,9 +564,11 @@ def _parallel_boards(opened, snaps, choice, priorities, dates, embed_order, ocr_
         by_job[str(reading.get("source") or "")] = reading
 
     embed = [_slot(item.source, True, item) for item in running_embed]
+    embed_placed = {slot.source for slot in embed}
     for source in embed_waiting:
-        if any(slot.source == source for slot in embed):
+        if source in embed_placed:
             continue
+        embed_placed.add(source)
         embed.append(_slot(source, False, _item_for(source, snaps, by_job.get(source), locked=False)))
 
     ocr: list[QueueSlot] = []

@@ -1,5 +1,36 @@
 # Changelog
 
+## 1.3.0
+
+### Major
+
+- **ZIM documents** on the Settings page stays off until it is turned on. Off, a ZIM indexes its pages. PDFs, Word documents, and EPUBs inside it stay unread. Uploaded PDFs and pictures are still read. On, the page walk records those inner files and does not copy them out. They are read after every ZIM's pages and every upload are stored. A new ZIM or a new upload is indexed before the next inner document. The file list shows them under zim, in Internal Zim Documents, then the ZIM name, then the path inside the ZIM. That ZIM's bar is how many of its documents are stored. While the list is still growing, the row shows how many have been found. Pictures and plain text inside a ZIM stay unread. A ZIM that is already indexed stays as it is until it is walked again. The choice is saved and applies the next time indexing starts. Reopen Turbo once so the open window shows the button.
+
+### Moderate
+
+- **OCR every PDF** on the Settings page stays off until it is turned on. Off, a PDF page that already has text is not drawn. A page with no text is still read, and a picture is still read. On, every PDF page is drawn at the OCR quality already chosen. The text layer is kept either way. The choice is saved. The next PDF uses it. A ZIM already being read keeps going until the next time indexing starts. Reopen Turbo once so the open window shows the button.
+- **OCR workers** on the Settings page, under Parallel OCR, is a slider and a number for how many workers OCR may use. The top leaves two threads free. That top is the usual amount. A lower number is saved and the next page uses it, including a read that is already going. Qdrant can still take workers back while it is writing. Reopen Turbo once so the open window shows the control.
+- A PDF or picture that is not English is left out of OCR and embedding. The text layer is checked before a page is drawn. A scan with no text layer is read for one page, and the rest is left unread when that page is not English. A page too short to judge is kept. An English page in a mixed file is still read. Web pages and markdown are still embedded.
+- Each embed request sends 2048 chunks, then the file row moves. The next articles are read while that request is running. The next request can be embedded while the chunks already embedded are stored. A further embed waits for that store. The tuned batch size is unchanged. The next time indexing starts uses this.
+- An embed call that times out is cut in half until one chunk is left. That chunk counts as bad, and the file continues. The file is not marked failed for that timeout. Three such chunks in a row, with nothing embedded between them, means the embedder is not answering. The file stays unfinished and is tried again. A chunk the embedder refuses is cut in half and the text is kept. The log names the token count and the limit. A chunk that can no longer be cut counts as bad. The next time indexing starts uses this.
+- While a file is being embedded, the faded bar is chunks that already have vectors and the solid bar is what is saved. The label is the saved percent, then the processed percent. chk/s and art/min count that work as the vectors come back, including during a long embed call. The stats line still counts chunks after they are saved. Reopen Turbo once so the open window shows the bars.
+- Plain-text files of about 256 KiB or less share one embed pass, up to about 1 MiB of text. Each file is still stored under its own path and is finished only when its own text is stored. A ZIM, a PDF, a picture, and a larger text file stay alone.
+- Measure reads a PDF page count from the file, and a ZIM's document sizes and PDF page counts from its directory. It does not draw a page to do that. A file that has not been started can keep an ETA from that count. A count that cannot be read stays unknown.
+- The Index page keeps painting while embed and OCR are working. That work runs in its own process, so a stall there does not freeze the window. Stop still updates the knowledge-base records before the file list moves, and the status line says so. Reopen Turbo once so the open window uses this.
+- A second embed sequence stays when long calls are at least as fast as one sequence. Three long calls at each width keep the faster width for the rest of the run. A later file does not reload the model to measure again. A restart that fails leaves the server on one sequence.
+- A later copy of a long article that is almost the same text is not stored again. A clearly different article is still stored.
+- When a newer edition of a file replaces an older one, points for the old path are deleted. The new file is indexed on its own. Other files stay.
+
+### Minor
+
+- **Parallel OCR** is on the Settings page, with **OCR workers** and **ZIM documents**. It is still experimental and off until it is turned on. Reopen Turbo once so the open window shows it there.
+- The Qdrant line under the page switch is colored, and the line under it says what Turbo is doing when the file list is still. Green is indexing or idle. Blue is a pause that is still working, including Stop while it updates the knowledge-base records. Amber means leave Qdrant running. Red needs attention. Reopen Turbo once so the open window shows the lines.
+- Text that has finished OCR no longer jumps ahead of a prioritized file. Prioritized files stay first, in the selected order. Finished OCR comes next. The other files follow the Order menu. Index now, and a queue you dragged, still come first. A finished OCR read also waits while a ZIM still has pages coming and a prioritized file is next.
+- A ZIM whose pages are stored and whose PDFs are still waiting says Waiting OCR. The stored state stays partial, so it stays in the list. It is purple only while one of those PDFs is being stored. Reopen Turbo once so the open window shows that word.
+- The stats line shows Skipped and Bad while a run is going. Those totals stay for the current knowledge index and are cleared with the log files. Details for a ZIM also shows skipped articles, bad articles, and how many of its documents were read with OCR. Reopen Turbo once so the open window shows them.
+- Each side of **Queue** shows the next 200 waiting files, and the caption says how many are waiting in all. A drag still applies to the files past that window. Reopen Turbo once so the open window shows the shorter list.
+- Deleting the knowledge index clears the OCR export queue, the same way it clears the log files. A confirmed missing collection clears that queue too. An export older than the current collection is cleared when Turbo starts. A Qdrant timeout leaves the queue in place.
+
 ## 1.2.1
 
 ### Moderate

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -24,10 +26,11 @@ from nomad_turbo.passes import (
     join_pages,
     merge_page,
     normalize_ocr_quality,
+    pass_label,
     same_work,
 )
 from nomad_turbo.progress import ProgressBook
-from nomad_turbo.runtime import start_extract, visual_pages
+from nomad_turbo.runtime import read_visual, start_extract, visual_pages
 
 
 def _install(storage: str) -> Install:
@@ -58,7 +61,8 @@ class QualityTest(unittest.TestCase):
         self.assertEqual(bar_color("HTML"), "#2f9e44")
         self.assertEqual(bar_color("text"), "#1c7ed6")
         self.assertEqual(bar_color("OCR"), "#e8590c")
-        self.assertEqual(bar_color("OCR text"), "#7048e8")
+        self.assertEqual(pass_label("ocr-text"), "text")
+        self.assertEqual(bar_color("OCR text"), bar_color("text"))
         self.assertEqual(bar_color("indexing"), "")
 
 
@@ -176,6 +180,73 @@ class DedupeTest(unittest.TestCase):
             self.assertTrue(ledger.seen("  Catheter  " * 80))
             ledger.close()
 
+    def test_a_close_copy_is_the_same_article_and_a_long_list_loads_quickly(self):
+        long = " ".join(f"word{index}" for index in range(220))
+        hashed, count = fingerprint(long)
+        spread = hashed ^ (1 << 0) ^ (1 << 16) ^ (1 << 32)
+        packed = hashed ^ (1 << 48) ^ (1 << 49) ^ (1 << 50)
+        distant = hashed ^ (1 << 0) ^ (1 << 16) ^ (1 << 32) ^ (1 << 48)
+        self.assertTrue(same_work((hashed, count), (spread, count)))
+        self.assertTrue(same_work((hashed, count), (packed, count)))
+        self.assertFalse(same_work((hashed, count), (distant, count)))
+        self.assertFalse(same_work((hashed, count), (hashed, count * 2)))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "prints"
+            lines = [f"{hashed:016x} {count}"]
+            rng = random.Random(1)
+            for _ in range(8000):
+                lines.append(f"{rng.randrange(1 << 64):016x} {count}")
+            lines.append(f"{spread:016x} {count}")
+            lines.append(f"{packed:016x} {count}")
+            lines.append(f"{distant:016x} {count}")
+            lines.append(f"{hashed:016x} {count * 2}")
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            prints = ArticlePrints()
+            started = time.perf_counter()
+            prints.merge_file(path)
+            self.assertLess(time.perf_counter() - started, 2.0)
+            self.assertTrue(prints.duplicate(long))
+            self.assertFalse(prints.duplicate(" ".join(f"other{index}" for index in range(220))))
+            out = Path(tmp) / "kept"
+            prints.write(out)
+            stored = out.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(stored), 8003)
+            self.assertIn(f"{hashed:016x} {count}", stored)
+            self.assertIn(f"{distant:016x} {count}", stored)
+            self.assertIn(f"{hashed:016x} {count * 2}", stored)
+            self.assertNotIn(f"{spread:016x} {count}", stored)
+            self.assertNotIn(f"{packed:016x} {count}", stored)
+            prints.close()
+
+    def test_the_index_keeps_the_same_articles_as_checking_every_print(self):
+        rng = random.Random(2)
+        rows = [(rng.randrange(1 << 64), 220 + rng.randrange(80)) for _ in range(500)]
+        base, count = rows[0]
+        rows.extend(
+            [
+                (base ^ 0b1, count),
+                (base ^ 0b11, count),
+                (base ^ ((1 << 10) | (1 << 40) | (1 << 41)), count),
+                (base ^ 0b1111, count),
+                (base, count * 2),
+            ]
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "prints"
+            path.write_text(
+                "".join(f"{hashed:016x} {words}\n" for hashed, words in rows),
+                encoding="utf-8",
+            )
+            prints = ArticlePrints()
+            prints.merge_file(path)
+            kept = []
+            for row in rows:
+                if any(same_work(row, old) for old in kept):
+                    continue
+                kept.append(row)
+            self.assertEqual(list(prints._rows), kept)
+            prints.close()
+
 
 class PassProgressTest(unittest.TestCase):
     def test_a_later_pass_restarts_the_file_bar_without_resetting_articles(self):
@@ -217,7 +288,8 @@ class PassProgressTest(unittest.TestCase):
         second = book.snapshot(now=2).files[0]
         self.assertEqual(second.status, "text")
         self.assertEqual(second.percent, 0)
-        self.assertEqual(second.count, "0 / 5")
+        self.assertEqual(second.count, "10 / 5")
+        self.assertEqual(second.embedded, 0)
         self.assertEqual(second.articles, 10)
         book.update(
             "medicine.zim",
@@ -275,6 +347,8 @@ class ExtractLaunchTest(unittest.TestCase):
             self.assertIn("/tessdata", mounted)
             self.assertIn("/turbo-state", mounted)
             self.assertNotIn("--ocr-ahead", argv)
+            self.assertNotIn("--zim-documents", argv)
+            self.assertNotIn("--ocr-every-pdf", argv)
 
     def test_html_overlap_asks_the_extractor_to_read_zim_files_ahead(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -318,21 +392,92 @@ class ExtractLaunchTest(unittest.TestCase):
             queued_argv = queued.call_args.args[0]
             self.assertIn("--ocr-queue", queued_argv)
             self.assertNotIn("--ocr-ahead", queued_argv)
+            self.assertNotIn("--zim-documents", queued_argv)
+            with mock.patch("nomad_turbo.runtime._remove_ours"), mock.patch(
+                "nomad_turbo.runtime.subprocess.Popen",
+                return_value=mock.Mock(),
+            ) as documents:
+                start_extract(
+                    install,
+                    str(zim),
+                    0,
+                    None,
+                    0,
+                    spill_id="abc123",
+                    zim_pass="html",
+                    ocr_queue=True,
+                    zim_documents=True,
+                )
+            document_argv = documents.call_args.args[0]
+            self.assertIn("--zim-documents", document_argv)
+            self.assertIn("--ocr-queue", document_argv)
+            self.assertNotIn("--ocr-every-pdf", document_argv)
+
+    def test_ocr_every_pdf_is_off_until_the_switch_is_on(self):
+        from nomad_turbo.engine import _wants_ocr_every_pdf
+        from nomad_turbo.session import Session
+
+        install = _install("/tmp")
+        self.assertFalse(_wants_ocr_every_pdf(None, install))
+        session = Session(1)
+        self.assertFalse(_wants_ocr_every_pdf(session, install))
+        session.set_ocr_every_pdf(True)
+        self.assertTrue(_wants_ocr_every_pdf(session, install))
+        install.ocr_every_pdf = True
+        self.assertTrue(_wants_ocr_every_pdf(None, install))
+        engine = Path(__file__).resolve().parents[1].joinpath("nomad_turbo", "engine.py").read_text(encoding="utf-8")
+        self.assertEqual(engine.count("ocr_every_pdf=_wants_ocr_every_pdf"), 2)
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Path(tmp)
+            zim = storage / "zim" / "medicine.zim"
+            zim.parent.mkdir()
+            zim.write_bytes(b"zim")
+            pdf = storage / "kb_uploads" / "scan.pdf"
+            pdf.parent.mkdir()
+            pdf.write_bytes(b"%PDF")
+            boxed = _install(str(storage))
+            with mock.patch("nomad_turbo.runtime._remove_ours"), mock.patch(
+                "nomad_turbo.runtime.subprocess.Popen",
+                return_value=mock.Mock(),
+            ) as popen:
+                start_extract(boxed, str(zim), 0, None, 0, quality="medium", ocr_every_pdf=True)
+            argv = popen.call_args.args[0]
+            self.assertIn("--ocr-every-pdf", argv)
+            self.assertEqual(argv[argv.index("--quality") + 1], "medium")
+            proc = mock.Mock()
+            proc.poll.return_value = 0
+            proc.returncode = 0
+            proc.stdout.read.return_value = '{"pages": [], "drew": false}'
+            proc.stderr = []
+            with mock.patch("nomad_turbo.runtime._remove_ours"), mock.patch(
+                "nomad_turbo.runtime.subprocess.Popen",
+                return_value=proc,
+            ) as reader:
+                quiet = read_visual(boxed, str(pdf), "pdf", quality="high")
+                drawn = read_visual(boxed, str(pdf), "pdf", quality="low", ocr_every_pdf=True)
+            self.assertFalse(quiet["drew"])
+            self.assertFalse(drawn["drew"])
+            quiet_argv = reader.call_args_list[0].args[0]
+            drawn_argv = reader.call_args_list[1].args[0]
+            self.assertNotIn("--ocr-every-pdf", quiet_argv)
+            self.assertEqual(quiet_argv[quiet_argv.index("--quality") + 1], "high")
+            self.assertIn("--ocr-every-pdf", drawn_argv)
+            self.assertEqual(drawn_argv[drawn_argv.index("--quality") + 1], "low")
 
     def test_zim_ocr_tally_names_one_file_and_many(self):
         from nomad_turbo.engine import _ocr_tally_note
 
         self.assertEqual(
             _ocr_tally_note(1),
-            "Indexing. 1 file in this ZIM is waiting for OCR.",
+            "Indexing. 1 document in this ZIM is listed for later.",
         )
         self.assertEqual(
             _ocr_tally_note(4),
-            "Indexing. 4 files in this ZIM are waiting for OCR.",
+            "Indexing. 4 documents in this ZIM are listed for later.",
         )
         self.assertEqual(
             _ocr_tally_note(4).removeprefix("Indexing. "),
-            "4 files in this ZIM are waiting for OCR.",
+            "4 documents in this ZIM are listed for later.",
         )
 
     def test_pages_json_and_a_checkpoint_remember_the_pass(self):
@@ -355,6 +500,47 @@ class ExtractLaunchTest(unittest.TestCase):
                     os.environ["NOMAD_TURBO_STATE"] = previous
         self.assertEqual(saved["pass"], "text")
         self.assertEqual(saved["path"], "book.epub")
+
+    def test_files_inside_a_zim_stay_unread_until_the_setting_is_on(self):
+        from nomad_turbo.engine import _index_zim, _wants_zim_documents
+        from nomad_turbo.session import Session
+
+        install = _install("/tmp")
+        self.assertFalse(_wants_zim_documents(None, install))
+        session = Session(1)
+        self.assertFalse(_wants_zim_documents(session, install))
+        session.set_zim_documents(True)
+        self.assertTrue(_wants_zim_documents(session, install))
+        install.zim_documents = True
+        self.assertTrue(_wants_zim_documents(None, install))
+
+        previous = os.environ.get("NOMAD_TURBO_STATE")
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["NOMAD_TURBO_STATE"] = tmp
+            try:
+                quiet = _install(tmp)
+                work = FileWork(host=Path(tmp) / "a.zim", kind="zim", source="/app/storage/zim/a.zim")
+                work.zim_pass = "ocr"
+                work.ocr_pending = ["shelf/book.pdf"]
+                with mock.patch("nomad_turbo.engine.source_active", return_value=True), mock.patch(
+                    "nomad_turbo.engine.count_source", return_value=3
+                ), mock.patch("nomad_turbo.engine.existing_paths", return_value=set()), mock.patch(
+                    "nomad_turbo.engine.start_extract"
+                ) as started:
+                    _index_zim(quiet, None, work, None, None)
+                started.assert_not_called()
+                self.assertTrue(work.done)
+                self.assertEqual(work.zim_pass, "done")
+                self.assertEqual(work.ocr_pending, [])
+                saved = json.loads(next(Path(tmp).joinpath("checkpoints").glob("*.json")).read_text())
+                self.assertTrue(saved["done"])
+                self.assertEqual(saved["pass"], "done")
+                self.assertEqual(saved["ocr_pending"], [])
+            finally:
+                if previous is None:
+                    os.environ.pop("NOMAD_TURBO_STATE", None)
+                else:
+                    os.environ["NOMAD_TURBO_STATE"] = previous
 
 
 if __name__ == "__main__":

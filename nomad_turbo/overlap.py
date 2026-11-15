@@ -2,7 +2,8 @@
 
 Uploaded PDFs and pictures start in the OCR queue. A PDF found in a ZIM
 goes to the front. The file already being read finishes first. Finished
-text waits, and the GPU embeds it after the ZIM it is on. GPU OCR stays
+text waits. Prioritized files are embedded first, then that finished text,
+then the other files. The GPU finishes the file it is on. GPU OCR stays
 one file: that reader uses the indexing card. Finished text stays in
 memory until it reaches about a quarter of system memory. Further finished
 reads wait in a temporary file.
@@ -385,12 +386,18 @@ class VisualLane:
     def view(self) -> dict:
         """Reading file, queued reads, and finished text that is not stored yet."""
         with self._lock:
+            from nomad_turbo.queue_view import display_title
+
             def face(source: str) -> dict:
                 job = self._meta.get(source)
                 total = getattr(job, "total_articles", None)
                 return {
                     "source": source,
-                    "title": getattr(job, "title", "") or source,
+                    "title": display_title(
+                        getattr(job, "title", "") or "",
+                        getattr(job, "article_path", "") or "",
+                        source,
+                    ),
                     "owner": getattr(job, "owner", "") or source,
                     "article_path": getattr(job, "article_path", "") or "",
                     "articles": int(getattr(job, "articles", 0) or 0),

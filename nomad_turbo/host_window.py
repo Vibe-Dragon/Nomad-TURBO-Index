@@ -16,6 +16,7 @@ from nomad_turbo.host import (
     plot_segments,
     ram_caption,
     rate_ceiling,
+    shown_history,
     vram_caption,
 )
 from nomad_turbo.tips import TIPS
@@ -99,6 +100,7 @@ class HostPanel:
         self._disk_rows: dict = {}
         self._disk_labels: tuple[str, ...] = ()
         self._disk_series: dict = {}
+        self._staged = None
         self._rebuild_disks(())
         self.cpu_area.connect("draw", self._draw_cpu)
         self.ram_area.connect("draw", self._draw_ram)
@@ -202,10 +204,22 @@ class HostPanel:
     def _size(self, widget) -> tuple[int, int]:
         return int(widget.get_allocated_width() or 0), int(widget.get_allocated_height() or 0)
 
-    def _refresh(self) -> bool:
-        if self._timer is None:
-            return False
-        self._points = self.sampler.snapshot()
+    def stage(self, points) -> None:
+        """Keep a reading's history. An empty reading does not clear the graphs."""
+        if points:
+            self._staged = tuple(points)
+
+    def paint(self, points=None) -> None:
+        """Draw an already-copied history. This does not sample the host.
+
+        With no history passed in, the sampler's latest reading wins. A saved
+        reading is only the fallback, so the pane does not sit on an old picture
+        until the file list publishes again.
+        """
+        points = shown_history(points, self._staged, getattr(self.sampler, "published", ()))
+        if not points:
+            return
+        self._points = list(points)
         latest = self._latest()
         self.cpu_label.set_text(cpu_caption(latest))
         self.ram_label.set_text(ram_caption(latest))
@@ -225,4 +239,9 @@ class HostPanel:
             area.queue_draw()
         for area in (self.cpu_area, self.ram_area, self.gpu_area, self.vram_area):
             area.queue_draw()
+
+    def _refresh(self) -> bool:
+        if self._timer is None:
+            return False
+        self.paint()
         return True

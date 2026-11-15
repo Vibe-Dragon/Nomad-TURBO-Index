@@ -34,6 +34,7 @@ ROOT = Path(__file__).resolve().parents[1]
 # Controls on the Index and Repair pages. The window sets these tooltips.
 PAGE_TIPS = (
     "qdrant",
+    "activity",
     "slider",
     "recommend",
     "tune",
@@ -55,6 +56,9 @@ PAGE_TIPS = (
     "then_index",
     "ocr_quality",
     "parallel_ocr",
+    "ocr_worker_max",
+    "zim_documents",
+    "ocr_every_pdf",
     "settings_index",
     "settings_ocr",
     "settings_engine",
@@ -248,12 +252,14 @@ class HardwareBudgetTest(unittest.TestCase):
 
     def test_the_window_is_a_chunk_field_not_a_percent_scale(self):
         window = (ROOT / "nomad_turbo" / "window.py").read_text(encoding="utf-8")
+        embed = window.split("self.embed_group = self._flow(", 1)[1].split("self.index_buttons", 1)[0]
         self.assertIn("gtk.Entry()", window)
         self.assertIn('label="Recommended"', window)
         self.assertIn('label="Auto"', window)
-        self.assertNotIn("gtk.Scale", window)
+        self.assertNotIn("gtk.Scale", embed)
         self.assertNotIn("MAX_BOOST_PERCENT", window)
         self.assertNotIn("self.scale", window)
+        self.assertIn("self.ocr_worker_scale = gtk.Scale(", window)
 
 
 class TooltipTest(unittest.TestCase):

@@ -27,8 +27,12 @@ from nomad_turbo.decisions import (
     hold_queue_on_exit,
     offsets_are_safe,
     parse_io_pressure,
+    delete_replaced_edition,
+    edition_offered_only,
     partial_row_state,
     policy_after_stop,
+    previous_edition_path,
+    record_file_finish,
     qdrant_write_held,
     remembered_policy,
     stock_should_continue,
@@ -157,6 +161,304 @@ class DecisionsTest(unittest.TestCase):
         self.assertEqual(partial_row_state(None), "pending_decision")
         self.assertIsNone(partial_row_state("indexed"))
 
+    def test_a_finished_file_is_indexed_and_a_replacement_deletes_only_the_old_path(self):
+        class StandIn:
+            def __init__(self):
+                self.rows = {}
+                self.deleted = []
+
+            def mark_indexed(self, path, chunks):
+                self.rows[path] = ("indexed", chunks)
+
+            def mark_pending(self, path, chunks):
+                self.rows[path] = ("pending_decision", chunks)
+
+            def delete_source_points(self, path):
+                self.deleted.append(path)
+
+        new = "/app/storage/zim/based.cooking_en_all_2026-11.zim"
+        old = "/app/storage/zim/based.cooking_en_all_2026-08.zim"
+        installed = "/app/storage/zim/wiktionary_en_all_nopic_2026-08.zim"
+        store = StandIn()
+        state = record_file_finish(store, new, done=False, chunks=12, existing_state=None)
+        self.assertEqual(state, "pending_decision")
+        self.assertEqual(store.rows[new], ("pending_decision", 12))
+        state = record_file_finish(
+            store, new, done=False, chunks=20, existing_state=store.rows[new][0]
+        )
+        self.assertEqual(store.rows[new], ("pending_decision", 20))
+        state = record_file_finish(store, new, done=True, chunks=40, existing_state="pending_decision")
+        self.assertEqual(state, "indexed")
+        self.assertEqual(store.rows[new], ("indexed", 40))
+        self.assertIsNone(
+            record_file_finish(store, new, done=False, chunks=41, existing_state="indexed")
+        )
+        self.assertEqual(store.rows[new], ("indexed", 40))
+
+        self.assertEqual(previous_edition_path(new, [new, old, installed]), old)
+        pending = StandIn()
+        pending.rows[old] = ("pending_decision", 5)
+        target = delete_replaced_edition(
+            pending,
+            new_path=new,
+            previous_path=old,
+            previous_on_disk=False,
+            previous_state="pending_decision",
+            upsert_in_flight=False,
+            offered_only=False,
+        )
+        self.assertEqual(target, old)
+        self.assertEqual(pending.deleted, [old])
+        self.assertNotIn(new, pending.deleted)
+
+        missing = StandIn()
+        target = delete_replaced_edition(
+            missing,
+            new_path=new,
+            previous_path=old,
+            previous_on_disk=False,
+            previous_state=None,
+            upsert_in_flight=False,
+            offered_only=False,
+        )
+        self.assertEqual(target, old)
+        self.assertEqual(missing.deleted, [old])
+
+        busy = StandIn()
+        busy.rows[old] = ("pending_decision", 5)
+        self.assertIsNone(
+            delete_replaced_edition(
+                busy,
+                new_path=new,
+                previous_path=old,
+                previous_on_disk=False,
+                previous_state="pending_decision",
+                upsert_in_flight=True,
+                offered_only=False,
+            )
+        )
+        self.assertEqual(busy.deleted, [])
+
+        self.assertTrue(edition_offered_only(installed, "2026-11", False))
+        offered = StandIn()
+        offered.rows[installed] = ("pending_decision", 76826)
+        self.assertIsNone(
+            delete_replaced_edition(
+                offered,
+                new_path=installed,
+                previous_path=installed,
+                previous_on_disk=True,
+                previous_state="pending_decision",
+                upsert_in_flight=False,
+                offered_only=True,
+            )
+        )
+        self.assertEqual(offered.deleted, [])
+        self.assertEqual(offered.rows[installed][0], "pending_decision")
+
+    def test_a_queued_zim_and_a_bundled_sibling_are_indexed_when_they_finish(self):
+        import threading
+        from types import SimpleNamespace
+
+        import nomad_turbo.engine as engine
+        import nomad_turbo.store as store
+        from nomad_turbo.discover import Install
+
+        statements: list[str] = []
+
+        def capture_sql(_install, statement):
+            statements.append(statement)
+            return ""
+
+        install = Install(
+            admin_container="nomad-turbo-test",
+            admin_image="none",
+            network="none",
+            redis_host="127.0.0.1",
+            redis_port=1,
+            redis_container="none",
+            mysql_container="none",
+            qdrant_url="http://127.0.0.1:9",
+            ollama_image="none",
+            ollama_container="none",
+            models_dir="/tmp",
+            storage_host="/tmp",
+            dimension=768,
+        )
+        originals = {
+            "sql": store._sql,
+            "embed": engine.embed,
+            "upsert": engine.upsert,
+            "count": engine.count_source,
+            "wait": engine._wait_to_write,
+            "status": engine._status,
+        }
+        checkpoints: list[Path] = []
+        store._sql = capture_sql
+        try:
+            store.mark_pending(install, "/app/storage/zim/partial.zim", 4)
+            update = statements[-1].split("ON DUPLICATE KEY UPDATE", 1)[1]
+            self.assertIn("state='pending_decision'", update)
+            statements.clear()
+            state = record_file_finish(
+                engine._LiveIngest(install),
+                "/app/storage/zim/partial.zim",
+                done=False,
+                chunks=9,
+                existing_state="backfill_indexed",
+            )
+            self.assertEqual(state, "pending_decision")
+            update = statements[-1].split("ON DUPLICATE KEY UPDATE", 1)[1]
+            self.assertIn("state='pending_decision'", update)
+            self.assertNotIn("'indexed'", statements[-1])
+
+            class Lane:
+                def owner_busy(self, _owner):
+                    return False
+
+            queued_source = "/app/storage/zim/nomad_turbo_finish_probe_2026-11.zim"
+            queued = engine.FileWork(
+                host=Path("/tmp/nomad-turbo-finish-probe.zim"),
+                kind="zim",
+                source=queued_source,
+                chunks=17,
+                zim_pass="queued",
+            )
+            checkpoints.append(engine._checkpoint_file(queued_source))
+            finished: set[str] = set()
+            statements.clear()
+            engine._finish_queued_zim(install, queued, Lane(), None, finished)
+            self.assertTrue(queued.done)
+            self.assertIn(queued_source, finished)
+            indexed = [
+                item
+                for item in statements
+                if "INSERT INTO kb_ingest_state" in item and "'indexed'" in item and queued_source in item
+            ]
+            self.assertEqual(len(indexed), 1)
+            self.assertIn(", 17,", indexed[0])
+
+            waiting = engine.FileWork(
+                host=Path("/tmp/nomad-turbo-finish-waiting.zim"),
+                kind="zim",
+                source="/app/storage/zim/nomad_turbo_finish_waiting_2026-11.zim",
+                chunks=3,
+                zim_pass="queued",
+                ocr_pending=["A/book.pdf"],
+            )
+            statements.clear()
+            still: set[str] = set()
+            engine._finish_queued_zim(install, waiting, Lane(), None, still)
+            self.assertFalse(waiting.done)
+            self.assertEqual(still, set())
+            self.assertFalse(any("'indexed'" in item for item in statements))
+
+            folder = tempfile.TemporaryDirectory(prefix="nomad-turbo-bundle-")
+            try:
+                root = Path(folder.name)
+                primary_host = root / "a.txt"
+                sibling_host = root / "b.txt"
+                primary_host.write_text("Alpha note about mitochondria and ATP.\n", encoding="utf-8")
+                sibling_host.write_text("Beta note about the same cell.\n", encoding="utf-8")
+                primary_source = "/app/storage/kb_uploads/nomad-turbo-bundle-a.txt"
+                sibling_source = "/app/storage/kb_uploads/nomad-turbo-bundle-b.txt"
+                primary = engine.FileWork(host=primary_host, kind="text", source=primary_source)
+                sibling = engine.FileWork(host=sibling_host, kind="text", source=sibling_source)
+                checkpoints.append(engine._checkpoint_file(primary_source))
+                checkpoints.append(engine._checkpoint_file(sibling_source))
+                engine.embed = lambda _url, _model, texts: [[0.01] * 768 for _text in texts]
+                engine.upsert = lambda _install, _points: None
+                engine.count_source = lambda _install, _source: None
+                engine._wait_to_write = lambda *_args, **_kwargs: True
+                bundled: set[str] = set()
+                statements.clear()
+                stored = engine._index_text_bundle(
+                    install,
+                    SimpleNamespace(urls=["http://127.0.0.1:9"], use_gpu=False),
+                    primary,
+                    threading.Event(),
+                    None,
+                    None,
+                    None,
+                    [primary, sibling],
+                    bundled,
+                    [],
+                )
+                self.assertTrue(stored)
+                self.assertTrue(sibling.done)
+                self.assertIn(sibling_source, bundled)
+                sibling_rows = [
+                    item
+                    for item in statements
+                    if "INSERT INTO kb_ingest_state" in item and "'indexed'" in item and sibling_source in item
+                ]
+                self.assertEqual(len(sibling_rows), 1)
+                self.assertIn(f", {int(sibling.chunks)},", sibling_rows[0])
+                self.assertGreater(int(sibling.chunks), 0)
+            finally:
+                folder.cleanup()
+
+            rejected = tempfile.TemporaryDirectory(prefix="nomad-turbo-bundle-reject-")
+            try:
+                root = Path(rejected.name)
+                primary_host = root / "c.txt"
+                sibling_host = root / "d.txt"
+                primary_host.write_text("Gamma note about mitochondria and ATP.\n", encoding="utf-8")
+                sibling_host.write_text("Delta note about the same cell.\n", encoding="utf-8")
+                primary_source = "/app/storage/kb_uploads/nomad-turbo-bundle-c.txt"
+                sibling_source = "/app/storage/kb_uploads/nomad-turbo-bundle-d.txt"
+                primary = engine.FileWork(host=primary_host, kind="text", source=primary_source)
+                sibling = engine.FileWork(host=sibling_host, kind="text", source=sibling_source)
+                checkpoints.append(engine._checkpoint_file(primary_source))
+                checkpoints.append(engine._checkpoint_file(sibling_source))
+                calls = {"n": 0}
+
+                def rejecting(_url, _model, texts):
+                    calls["n"] += 1
+                    if calls["n"] == 1:
+                        raise ChunkRejected(0, "bundle did not fit")
+                    return [[0.01] * 768 for _text in texts]
+
+                engine.embed = rejecting
+                engine._status = lambda **_fields: None
+                rejected_done: set[str] = set()
+                statements.clear()
+                stored = engine._index_text_bundle(
+                    install,
+                    SimpleNamespace(urls=["http://127.0.0.1:9"], use_gpu=False),
+                    primary,
+                    threading.Event(),
+                    None,
+                    None,
+                    None,
+                    [primary, sibling],
+                    rejected_done,
+                    [],
+                )
+                self.assertTrue(stored)
+                self.assertGreater(calls["n"], 1)
+                self.assertTrue(sibling.done)
+                self.assertIn(sibling_source, rejected_done)
+                sibling_rows = [
+                    item
+                    for item in statements
+                    if "INSERT INTO kb_ingest_state" in item and "'indexed'" in item and sibling_source in item
+                ]
+                self.assertEqual(len(sibling_rows), 1)
+                self.assertIn(f", {int(sibling.chunks)},", sibling_rows[0])
+                self.assertGreater(int(sibling.chunks), 0)
+            finally:
+                rejected.cleanup()
+        finally:
+            store._sql = originals["sql"]
+            engine.embed = originals["embed"]
+            engine.upsert = originals["upsert"]
+            engine.count_source = originals["count"]
+            engine._wait_to_write = originals["wait"]
+            engine._status = originals["status"]
+            for path in checkpoints:
+                path.unlink(missing_ok=True)
+
     def test_resume_uses_the_later_offset(self):
         self.assertEqual(choose_resume([500, 1000], 750), 1000)
         self.assertEqual(choose_resume([500], 900), 900)
@@ -204,6 +506,106 @@ class SlotsTest(unittest.TestCase):
             once.note(1, 40, 8, 0.1)
         self.assertEqual(once.decision(1, True), (2, "up"))
         self.assertEqual(once.decision(1, True), (1, ""))
+
+    def test_three_long_calls_take_one_baseline_then_keep_the_faster_width(self):
+        self.assertEqual(embed_server_shape(1), (1, 2048))
+        self.assertEqual(embed_server_shape(2), (2, 4096))
+        baseline = SequencePace()
+        for _ in range(3):
+            baseline.note(2, 400, 8, 1.0)
+        self.assertEqual(baseline.decision(2, True), (1, "baseline"))
+        self.assertEqual(baseline.decision(2, True), (2, ""))
+        baseline.mark_resized()
+        for _ in range(3):
+            baseline.note(1, 400, 8, 2.0)
+        self.assertEqual(baseline.decision(1, True), (2, "up"))
+        self.assertEqual(baseline.decision(1, True), (1, ""))
+        baseline.mark_resized()
+        for _ in range(3):
+            baseline.note(2, 400, 8, 5.0)
+        self.assertEqual(baseline.decision(2, True), (2, ""))
+        slower = SequencePace()
+        for _ in range(3):
+            slower.note(2, 400, 8, 2.0)
+        self.assertEqual(slower.decision(2, True), (1, "baseline"))
+        slower.mark_resized()
+        for _ in range(3):
+            slower.note(1, 400, 8, 1.0)
+        self.assertEqual(slower.decision(1, True), (1, ""))
+        self.assertEqual(slower.decision(1, True), (1, ""))
+        for _ in range(3):
+            slower.note(1, 40, 8, 1.0)
+            slower.note(2, 40, 8, 0.5)
+        self.assertEqual(slower.decision(1, True), (1, ""))
+        slower.begin_file("appropedia.zim")
+        self.assertEqual(slower.decision(1, True), (1, ""))
+        slower.begin_file("appropedia.zim")
+        self.assertEqual(slower.decision(1, True), (1, ""))
+        slower.begin_file("next.zim")
+        self.assertEqual(slower.decision(1, True), (1, ""))
+        for _ in range(6):
+            slower.note(1, 40, 8, 0.1)
+        # The width that already won stays. A new file must not reload the server.
+        self.assertEqual(slower.decision(1, True), (1, ""))
+        self.assertEqual(slower.decision(1, True), (1, ""))
+
+    def test_a_file_change_during_the_baseline_does_not_reload_the_server(self):
+        pace = SequencePace()
+        pace.begin_file("a.pdf")
+        for _ in range(3):
+            pace.note(2, 400, 8, 2.0)
+        self.assertEqual(pace.decision(2, True), (1, "baseline"))
+        pace.mark_resized()
+        pace.begin_file("b.pdf")
+        self.assertEqual(pace.decision(1, True), (1, ""))
+        for _ in range(6):
+            pace.note(1, 40, 8, 0.1)
+        self.assertEqual(pace.decision(1, True), (1, ""))
+        for _ in range(3):
+            pace.note(1, 400, 8, 1.0)
+        self.assertEqual(pace.decision(1, True), (1, ""))
+
+    def test_a_failed_sequence_restart_restores_the_embedder(self):
+        from nomad_turbo.pool import EmbedPool, require_embedder
+
+        pool = EmbedPool.__new__(EmbedPool)
+        pool.sequences = 2
+        pool.urls = ["http://old"]
+        pool.names = ["old"]
+        pool._restore_pause = 0
+        seen = []
+
+        def stop_all():
+            pool.urls.clear()
+            pool.names.clear()
+
+        def start_one():
+            seen.append(pool.sequences)
+            if len(seen) < 3:
+                raise RuntimeError("not up yet")
+            pool.urls.append("http://back")
+            pool.names.append("nomad-turbo-embed")
+
+        pool.stop_all = stop_all
+        pool._start_one = start_one
+        with self.assertRaises(RuntimeError):
+            pool.restart_sequences(1)
+        self.assertEqual(seen, [1, 2, 2])
+        self.assertEqual(pool.sequences, 2)
+        self.assertEqual(pool.urls, ["http://back"])
+
+        empty = EmbedPool.__new__(EmbedPool)
+        empty.urls = []
+
+        def bring_back():
+            empty.urls.append("http://back")
+
+        empty._start_one = bring_back
+        require_embedder(empty)
+        self.assertEqual(empty.urls, ["http://back"])
+        still = type("Down", (), {"urls": [], "_start_one": lambda self: (_ for _ in ()).throw(RuntimeError("down"))})()
+        with self.assertRaises(RuntimeError):
+            require_embedder(still)
 
     def test_an_older_session_still_records_the_embed_call(self):
         from nomad_turbo.engine import _note_embed_call
@@ -510,6 +912,34 @@ class ChunkTest(unittest.TestCase):
             self.assertNotIn("Couscous", payload)
             self.assertNotIn("search_document:", payload)
 
+    def test_a_timed_out_article_is_left_unread(self):
+        from nomad_turbo.engine import embed_timeout_hold
+
+        prepared = prepare_article(
+            {
+                "title": "Novel",
+                "path": "A/book",
+                "index": 1,
+                "sections": [{"heading": "", "text": "Once upon a time.", "level": 2}],
+            },
+            "/app/storage/zim/a.zim",
+            {},
+            "doc",
+        )
+        feed = ArticleFeed()
+        feed.add(prepared)
+        self.assertEqual(len(feed.next_inputs(4)), 1)
+        kind, path = feed.drop_claimed(0)
+        self.assertEqual((kind, path), ("dropped-last", "A/book"))
+        self.assertEqual(prepared.article.get("skip"), "embed")
+        self.assertEqual(prepared.inputs, [])
+        ready = feed.drain_ready()
+        self.assertEqual(len(ready), 1)
+        self.assertEqual(ready[0][1], [])
+        self.assertFalse(embed_timeout_hold(1))
+        self.assertFalse(embed_timeout_hold(2))
+        self.assertTrue(embed_timeout_hold(3))
+
 
 class CollectionTest(unittest.TestCase):
     def test_a_timeout_on_a_live_qdrant_keeps_the_collection(self):
@@ -790,15 +1220,19 @@ class SpeedTest(unittest.TestCase):
         self.assertEqual(feed.pending(), 0)
         self.assertEqual(feed.vector_progress(), (2, 2))
 
-    def test_chunk_progress_is_published_for_a_pdf_and_not_a_zim(self):
+    def test_chunk_progress_is_published_for_a_pdf_and_a_zim(self):
         from nomad_turbo.engine import _publish_flight
 
         class _Book:
             def __init__(self) -> None:
                 self.notes = []
+                self.live = []
 
             def note_flight(self, source, done, total, now=None) -> None:
                 self.notes.append((source, done, total))
+
+            def note_live(self, source, chunks, articles, now=None) -> None:
+                self.live.append((source, chunks, articles))
 
         class _Session:
             def __init__(self, book) -> None:
@@ -825,8 +1259,178 @@ class SpeedTest(unittest.TestCase):
         session = _Session(book)
         _publish_flight(session, _Work("zim", "a.zim"), feed)
         self.assertEqual(book.notes, [])
+        self.assertEqual(book.live, [("a.zim", 0, 0)])
         _publish_flight(session, _Work("pdf", "a.pdf"), feed)
         self.assertEqual(book.notes, [("a.pdf", 0, 2)])
+        self.assertEqual(book.live, [("a.zim", 0, 0)])
+
+    def test_a_wide_embed_is_one_tune_sample_and_a_rejected_slice_keeps_earlier_vectors(self):
+        import threading
+        from unittest import mock
+
+        from nomad_turbo.chunking import DOCUMENT_PREFIX
+        from nomad_turbo.engine import EMBED_SLICE, FileWork, _embed_width
+        from nomad_turbo.packing import SectionDraft
+
+        def prepared(index: int) -> PreparedArticle:
+            payload = f"chunk {index} has enough words to cut in half"
+            return PreparedArticle(
+                article={"index": index + 1, "path": f"A/{index}"},
+                sections=[SectionDraft(meta={}, payloads=[payload])],
+                inputs=[DOCUMENT_PREFIX + payload],
+                section_for_input=[0],
+            )
+
+        width = EMBED_SLICE * 2 + 2
+        feed = ArticleFeed()
+        for index in range(width):
+            feed.add(prepared(index))
+        sizes: list[int] = []
+
+        def fake_embed(_url, _model, texts):
+            sizes.append(len(texts))
+            return [[0.1] for _text in texts]
+
+        install = mock.Mock()
+        install.embed_model = "nomic"
+        pool = mock.Mock()
+        pool.urls = ["http://embed"]
+        session = mock.Mock()
+        session.get_book.return_value = None
+        work = FileWork(host=Path("a.zim"), kind="zim", source="/app/storage/zim/a.zim")
+        pipe = mock.Mock()
+        with mock.patch("nomad_turbo.engine.embed", fake_embed), mock.patch(
+            "nomad_turbo.ocr_budget.note_embed"
+        ), mock.patch("nomad_turbo.ocr_budget.note_zim_embed_call") as zim_note:
+            _embed_width(
+                install,
+                pool,
+                work,
+                session,
+                feed,
+                pipe,
+                set(),
+                threading.Event(),
+                None,
+                None,
+                width,
+            )
+        self.assertEqual(sizes, [EMBED_SLICE, EMBED_SLICE, 2])
+        self.assertEqual(work.live_chunks, width)
+        self.assertEqual(work.live_articles, width)
+        self.assertEqual(zim_note.call_count, 1)
+        session.note_embed_call.assert_called_once()
+        noted = session.note_embed_call.call_args.args
+        self.assertEqual(noted[0], width)
+        self.assertEqual(noted[1], width)
+        self.assertTrue(noted[3])
+        pool.note_sequences.assert_called_once()
+        self.assertEqual(pipe.submit.call_count, 3)
+
+        rejected = ArticleFeed()
+        for index in range(EMBED_SLICE + 1):
+            rejected.add(prepared(index))
+        rejected_sizes: list[int] = []
+
+        def reject_embed(_url, _model, texts):
+            rejected_sizes.append(len(texts))
+            if len(rejected_sizes) == 2:
+                raise ChunkRejected(0, "input (2177 tokens) is larger than the max context size (2048 tokens)")
+            return [[0.1] for _text in texts]
+
+        rejected_work = FileWork(host=Path("a.zim"), kind="zim", source="/app/storage/zim/a.zim")
+        rejected_session = mock.Mock()
+        rejected_session.get_book.return_value = None
+        rejected_pipe = mock.Mock()
+        with mock.patch("nomad_turbo.engine.embed", reject_embed), mock.patch(
+            "nomad_turbo.ocr_budget.note_embed"
+        ), mock.patch("nomad_turbo.ocr_budget.note_zim_embed_call"):
+            _embed_width(
+                install,
+                pool,
+                rejected_work,
+                rejected_session,
+                rejected,
+                rejected_pipe,
+                set(),
+                threading.Event(),
+                None,
+                None,
+                width,
+            )
+        self.assertEqual(rejected_sizes, [EMBED_SLICE, 1])
+        self.assertEqual(rejected_work.live_chunks, EMBED_SLICE)
+        self.assertEqual(rejected_work.live_articles, EMBED_SLICE)
+        rejected_session.note_embed_call.assert_not_called()
+        self.assertEqual(rejected_pipe.submit.call_count, 1)
+        self.assertEqual(rejected.pending(), 2)
+
+    def test_the_next_article_is_read_while_the_request_runs(self):
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+        from unittest import mock
+
+        from nomad_turbo.chunking import DOCUMENT_PREFIX
+        from nomad_turbo.engine import FileWork, _Ahead, _embed_width
+        from nomad_turbo.packing import SectionDraft
+
+        feed = ArticleFeed()
+        feed.add(
+            PreparedArticle(
+                article={"index": 1, "path": "A"},
+                sections=[SectionDraft(meta={}, payloads=["alpha"])],
+                inputs=[DOCUMENT_PREFIX + "alpha"],
+                section_for_input=[0],
+            )
+        )
+        entered = threading.Event()
+        release = threading.Event()
+
+        def fake_embed(_url, _model, texts):
+            entered.set()
+            self.assertTrue(release.wait(2))
+            return [[0.1] for _text in texts]
+
+        def pull(_timeout):
+            release.set()
+            return {
+                "title": "Next",
+                "path": "B",
+                "index": 2,
+                "sections": [{"heading": "", "text": "beta words", "level": 2}],
+            }
+
+        install = mock.Mock()
+        install.document_prefix = DOCUMENT_PREFIX
+        install.embed_model = "nomic"
+        pool = mock.Mock()
+        pool.urls = ["http://embed"]
+        work = FileWork(host=Path("a.zim"), kind="zim", source="/app/storage/zim/a.zim")
+        executor = ThreadPoolExecutor(max_workers=1)
+        ahead = _Ahead(pull, install, work, set(), None, threading.Event(), None, None, executor)
+        try:
+            with mock.patch("nomad_turbo.engine.embed", fake_embed), mock.patch(
+                "nomad_turbo.ocr_budget.note_embed"
+            ), mock.patch("nomad_turbo.ocr_budget.note_zim_embed_call"):
+                _embed_width(
+                    install,
+                    pool,
+                    work,
+                    None,
+                    feed,
+                    mock.Mock(),
+                    set(),
+                    threading.Event(),
+                    None,
+                    None,
+                    1,
+                    ahead,
+                )
+        finally:
+            executor.shutdown(wait=True, cancel_futures=False)
+        self.assertTrue(entered.is_set())
+        self.assertEqual(feed.pending(), 1)
+        self.assertEqual(ahead.items, [])
 
     def test_upsert_sends_128_points_at_a_time(self):
         install = Install(
@@ -1039,6 +1643,19 @@ class EmbedRetryTest(unittest.TestCase):
             collect_embeddings(post, ["a", "b", "bad", "c"], pause=lambda _seconds: None)
         self.assertEqual(caught.exception.index, 2)
         self.assertIn("2048", caught.exception.detail)
+        from nomad_turbo.engine import chunk_cut_log
+
+        line = chunk_cut_log("a.zim", "Guide/page", caught.exception.detail)
+        self.assertEqual(
+            line,
+            "cutting one chunk of a.zim (Guide/page) in half so it fits the embedder. "
+            "It was 2177 tokens and the limit is 2048.",
+        )
+        self.assertNotIn("skipping", line)
+        self.assertEqual(
+            chunk_cut_log("a.zim", "Guide/page", "too long"),
+            "cutting one chunk of a.zim (Guide/page) in half so it fits the embedder.",
+        )
 
     def test_one_bad_input_is_not_retried(self):
         calls = []
@@ -1062,6 +1679,51 @@ class EmbedRetryTest(unittest.TestCase):
 
         self.assertEqual(collect_embeddings(post, ["ok"], pause=lambda _seconds: None), [[0.5]])
         self.assertEqual(len(calls), 2)
+
+    def test_a_timeout_in_a_batch_points_at_the_one_chunk(self):
+        from nomad_turbo.runtime import ChunkTimedOut
+
+        calls = []
+
+        def post(texts):
+            calls.append(list(texts))
+            if "bad" in texts:
+                raise TimeoutError("timed out")
+            return [[0.5] for _text in texts]
+
+        with self.assertRaises(ChunkTimedOut) as caught:
+            collect_embeddings(post, ["a", "bad", "c"], pause=lambda _seconds: None)
+        self.assertEqual(caught.exception.index, 1)
+        self.assertIn("timed out", caught.exception.detail)
+        self.assertEqual(sum(1 for batch in calls if batch == ["bad"]), 3)
+        self.assertTrue(any("a" in batch and "bad" not in batch for batch in calls))
+
+    def test_a_wide_timeout_keeps_the_halves_that_answer(self):
+        def post(texts):
+            if len(texts) > 2:
+                raise TimeoutError("timed out")
+            return [[float(len(text))] for text in texts]
+
+        self.assertEqual(
+            collect_embeddings(post, ["aa", "bb", "cc", "dd"], pause=lambda _seconds: None),
+            [[2.0], [2.0], [2.0], [2.0]],
+        )
+
+    def test_a_timeout_split_keeps_a_later_rejection_index(self):
+        from nomad_turbo.runtime import ChunkTimedOut
+
+        def post(texts):
+            if len(texts) > 2:
+                raise TimeoutError("timed out")
+            if "bad" in texts:
+                raise self._reject("input (2177 tokens) is larger than the max context size (2048 tokens)")
+            return [[0.5] for _text in texts]
+
+        with self.assertRaises(ChunkRejected) as caught:
+            collect_embeddings(post, ["a", "b", "bad", "c"], pause=lambda _seconds: None)
+        self.assertNotIsInstance(caught.exception, ChunkTimedOut)
+        self.assertEqual(caught.exception.index, 2)
+        self.assertIn("2048", caught.exception.detail)
 
 
 class _Node:

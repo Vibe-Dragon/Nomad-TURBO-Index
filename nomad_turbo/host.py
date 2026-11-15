@@ -21,6 +21,17 @@ from nomad_turbo.slots import pick_gpu
 log = logging.getLogger("nomad_turbo")
 
 HISTORY = 180
+
+
+def shown_history(explicit, staged, published):
+    """History to draw. A live sample beats a saved reading. Empty does not clear."""
+    if explicit:
+        return tuple(explicit)
+    if published:
+        return tuple(published)
+    return tuple(staged or ())
+
+
 _GPU_QUERY = (
     "nvidia-smi",
     "--query-gpu=index,utilization.gpu,temperature.gpu,memory.total,memory.used",
@@ -559,6 +570,8 @@ class HostSampler:
         self._cpu: tuple[int, int] | None = None
         self._sectors: dict[str, tuple[int, int]] = {}
         self._stamp: float | None = None
+        # Assigned after the lock is released. The pane reads this pointer.
+        self.published: tuple[HostPoint, ...] = ()
 
     def start(self) -> None:
         self._stop.clear()
@@ -626,3 +639,5 @@ class HostSampler:
         )
         with self._lock:
             self.history.append(point)
+            published = tuple(self.history)
+        self.published = published

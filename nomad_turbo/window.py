@@ -35,8 +35,26 @@ from nomad_turbo.progress import (
     embed_server_text,
 )
 from nomad_turbo.qdrant_status import changes_allowed, delete_allowed
-from nomad_turbo.queue_view import build_queue, load_queues, locked_moved, rewrite_side, save_queues
-from nomad_turbo.repair import format_repair_current
+from nomad_turbo.queue_view import (
+    build_queue,
+    load_queues,
+    locked_moved,
+    pinned_files,
+    queue_caption,
+    running_column,
+    rewrite_side,
+    save_queues,
+    shown_slots,
+)
+from nomad_turbo.live import (
+    LiveBoard,
+    button_facts,
+    control_senses,
+    tray_indicator_label,
+    tray_status_text,
+    tray_stop_label,
+)
+from nomad_turbo.repair import format_repair_current, repair_store_values
 from nomad_turbo.runtime import gpu_rows
 from nomad_turbo.scan import scan_library
 from nomad_turbo.schedule import (
@@ -46,6 +64,7 @@ from nomad_turbo.schedule import (
     COL_CHK_S,
     COL_CHUNKS,
     COL_COLOR,
+    COL_EMBEDDED,
     COL_ETA,
     COL_MARK,
     COL_NAME,
@@ -66,6 +85,7 @@ from nomad_turbo.schedule import (
     file_type_label,
     folder_store_row,
     hold_store_row,
+    gtk_foreground,
     index_store_row,
     library_tree,
     row_mark,
@@ -183,8 +203,20 @@ def pass_percent_text(value: int) -> str:
     return f"{max(0, min(100, int(value)))}%"
 
 
-def paint_pass_bar(cr, area, value: int, color: str) -> None:
-    """One file bar. The color is the pass. An empty color uses the ordinary blue."""
+def dual_percent_text(saved: int, processed_tenths: int) -> str:
+    """Saved in the knowledge base, then chunks that have vectors."""
+    saved_pct = max(0.0, min(100.0, float(int(saved))))
+    processed = max(0, min(1000, int(processed_tenths))) / 10.0
+    processed = max(saved_pct, min(100.0, processed))
+    return f"{saved_pct:.1f}% / {processed:.1f}%"
+
+
+def paint_pass_bar(cr, area, value: int, color: str, embedded: int = -1) -> None:
+    """One file bar. The color is the pass. An empty color uses the ordinary blue.
+
+    `embedded` of zero or more draws a faded bar for chunks that have vectors
+    and a solid bar for what is saved. Below zero, the bar is one percent.
+    """
     if area is None or cr is None:
         return
     width = int(getattr(area, "width", 0) or 0)
@@ -200,12 +232,26 @@ def paint_pass_bar(cr, area, value: int, color: str) -> None:
     cr.set_source_rgba(red, green, blue, 0.22)
     cr.fill()
     shown = max(0, min(100, int(value)))
-    fraction = shown / 100.0
-    if fraction > 0:
-        _round_box(cr, left, top, max(6.0, min(wide, wide * fraction)), bar_h, 3)
-        cr.set_source_rgb(red, green, blue)
-        cr.fill()
-    label = pass_percent_text(shown)
+    dual = int(embedded) >= 0
+    if dual:
+        saved_tenths = shown * 10
+        processed = max(saved_tenths, max(0, min(1000, int(embedded))))
+        if processed > 0:
+            _round_box(cr, left, top, max(0.0, min(wide, wide * processed / 1000.0)), bar_h, 3)
+            cr.set_source_rgba(red, green, blue, 0.45)
+            cr.fill()
+        if saved_tenths > 0:
+            _round_box(cr, left, top, max(0.0, min(wide, wide * saved_tenths / 1000.0)), bar_h, 3)
+            cr.set_source_rgb(red, green, blue)
+            cr.fill()
+        label = dual_percent_text(shown, processed)
+    else:
+        fraction = shown / 100.0
+        if fraction > 0:
+            _round_box(cr, left, top, max(6.0, min(wide, wide * fraction)), bar_h, 3)
+            cr.set_source_rgb(red, green, blue)
+            cr.fill()
+        label = pass_percent_text(shown)
     cr.select_font_face("Sans")
     cr.set_font_size(max(9.0, min(12.0, bar_h - 1.0)))
     extents = cr.text_extents(label)
@@ -226,6 +272,7 @@ def _pass_renderer(gtk):
             __gtype_name__ = "NomadTurboPassBar"
             value = GObject.Property(type=int, default=0)
             pass_color = GObject.Property(type=str, default="")
+            embedded = GObject.Property(type=int, default=-1)
 
             def __init__(self):
                 gtk.CellRenderer.__init__(self)
@@ -236,7 +283,13 @@ def _pass_renderer(gtk):
                 return 16, 20
 
             def do_render(self, cr, widget, background_area, cell_area, flags):
-                paint_pass_bar(cr, cell_area, int(self.value or 0), str(self.pass_color or ""))
+                paint_pass_bar(
+                    cr,
+                    cell_area,
+                    int(self.get_property("value") or 0),
+                    str(self.get_property("pass_color") or ""),
+                    int(self.get_property("embedded")),
+                )
 
         _pass_renderer.kind = PassBar
         kind = PassBar
@@ -267,6 +320,7 @@ def index_store_types() -> tuple:
         wide,
         wide,
         wide,
+        int,
         int,
     )
 
@@ -565,6 +619,7 @@ class _Window:
         self._optimize_pause = None
         self._optimize_live = None
         self._optimize_code = None
+        self._optimize_watch = None
         self._tune_hold = None
         self._pace_memory: dict = {}
         self._tune_applying = False
@@ -594,6 +649,10 @@ class _Window:
         self._shown_book = None
         self._shown_epoch = None
         self._shown_hide = None
+        self._doc_sig = None
+        self._doc_priority: dict[str, str] = {}
+        self._doc_rows: dict[str, tuple] = {}
+        self._doc_groups: tuple = ()
         self._shown_priority = None
         self._tree_dirty = False
         self._running_source = ""
@@ -632,12 +691,22 @@ class _Window:
         self._queue_order = {"embed": [], "ocr": []}
         self._queue_locked = {"embed": [], "ocr": []}
         self.save_timer = None
+        self.ocr_worker_timer = None
+        self._ocr_worker_applying = False
         self.hidden = False
         self.raise_requested = False
         self.started_at: float | None = None
         self._finish_told = False
         self.indicator = None
         self._tray_status_enum = None
+        self.live = LiveBoard()
+        self._applied_seq = 0
+        self._reading_library = object()
+        self._tray_label = ""
+        self._tray_guide = ""
+        self._tray_status_text = ""
+        self._optimize_painted_at = 0.0
+        self._publisher = None
 
         window = gtk.Window(title=f"Nomad TURBO Index {__version__}")
         window.set_resizable(True)
@@ -683,6 +752,12 @@ class _Window:
         self.qdrant_label.set_max_width_chars(110)
         self.qdrant_label.set_selectable(True)
         self.qdrant_label.set_tooltip_text(TIPS["qdrant"])
+        self.activity_label = gtk.Label(label="Idle.")
+        self.activity_label.set_xalign(0)
+        self.activity_label.set_line_wrap(True)
+        self.activity_label.set_max_width_chars(110)
+        self.activity_label.set_selectable(True)
+        self.activity_label.set_tooltip_text(TIPS["activity"])
         switcher = gtk.StackSwitcher()
         switcher.set_stack(self.stack)
         switcher.set_halign(gtk.Align.START)
@@ -748,6 +823,7 @@ class _Window:
         root.pack_start(header_scroll, False, False, 0)
         # Above the pages, not in the log split, so this line does not ride the log bar.
         root.pack_start(self.qdrant_label, False, False, 0)
+        root.pack_start(self.activity_label, False, False, 0)
         index = gtk.Box(orientation=gtk.Orientation.VERTICAL, spacing=8)
         index.set_vexpand(True)
         self.stack.add_titled(index, "index", "Index")
@@ -923,17 +999,9 @@ class _Window:
             button.connect("toggled", self.on_ocr_quality, name)
         ocr_caption = gtk.Label(label="OCR")
         ocr_caption.set_tooltip_text(TIPS["ocr_quality"])
-        self.parallel_ocr = gtk.ToggleButton(label="Parallel OCR")
-        self.parallel_ocr.set_active(bool(getattr(install, "parallel_ocr", False)))
-        self.parallel_ocr.set_halign(gtk.Align.START)
-        self.parallel_ocr.set_valign(gtk.Align.CENTER)
-        self.parallel_ocr.set_tooltip_text(TIPS["parallel_ocr"])
-        self.session.set_parallel_ocr(bool(getattr(install, "parallel_ocr", False)))
-        self.parallel_ocr.connect("toggled", self.on_parallel_ocr)
         self.ocr_group = self._flow(
             ocr_caption,
             self._linked(self.ocr_low, self.ocr_medium, self.ocr_high),
-            self.parallel_ocr,
         )
         self.tune_auto = gtk.ToggleButton(label="Auto")
         self.tune_auto.set_tooltip_text(TIPS["tune_auto"])
@@ -1158,6 +1226,21 @@ class _Window:
         self.window.show_all()
         self.begin_scan()
         threading.Thread(target=self._watch_qdrant, name="nomad-turbo-qdrant", daemon=True).start()
+        try:
+            from nomad_turbo.live import Publisher, Workload, collect_reading
+
+            try:
+                Workload.install()
+            except Exception:
+                log.exception("workload process did not start; embed and OCR stay in this process")
+            try:
+                self.live.publish(collect_reading(self))
+            except Exception:
+                log.exception("first paint reading failed")
+            self._publisher = Publisher(self)
+            self._publisher.start()
+        except Exception:
+            log.exception("paint publisher did not start")
         self.glib.timeout_add(500, self.on_tick)
         self.gtk.main()
 
@@ -1176,6 +1259,9 @@ class _Window:
                 self.qdrant_text = view.text
                 self.qdrant_ready = view.ready
                 self.collection_missing = bool(getattr(view, "collection_missing", False))
+                self.qdrant_collection_status = view.collection_status
+                self.qdrant_optimizer_error = view.optimizer_error
+                self.qdrant_unreadable = False
                 from nomad_turbo.ocr_budget import note_qdrant
 
                 note_qdrant(view.ready, view.collection_status)
@@ -1191,8 +1277,9 @@ class _Window:
                     temp_open,
                 )
                 self._optimize_live = (bar, detail, pulse)
-                if code != self._optimize_code:
-                    self._optimize_code = code
+                self._optimize_watch, due = segment_guard.optimize_log_due(self._optimize_watch, code)
+                self._optimize_code = code
+                if due:
                     level, line = segment_guard.optimize_watch_line(code, detail)
                     log.log(level, line)
                 self._note_qdrant_problem(indexing_qdrant_problem(view))
@@ -1204,6 +1291,9 @@ class _Window:
                 self.qdrant_text = "Qdrant status could not be read. Not ready for changes."
                 self.qdrant_ready = False
                 self.collection_missing = False
+                self.qdrant_collection_status = ""
+                self.qdrant_optimizer_error = ""
+                self.qdrant_unreadable = True
                 from nomad_turbo.ocr_budget import note_qdrant
 
                 note_qdrant(False, "")
@@ -1211,9 +1301,10 @@ class _Window:
             else:
                 self._qdrant_error = None
                 try:
-                    from nomad_turbo.logbook import watch_collection_logs
+                    from nomad_turbo.logbook import collection_clock, watch_collection_logs
 
-                    watch_collection_logs(state_dir(), self.install)
+                    if watch_collection_logs(state_dir(), self.install):
+                        self._apply_collection_clock(collection_clock(self.install))
                 except Exception:
                     log.exception("could not check log files against the knowledge index")
             if self.qdrant_stop.wait(5):
@@ -1516,6 +1607,9 @@ class _Window:
         panel = getattr(self, "host_panel", None)
         if panel is not None:
             panel.stop()
+        publisher = getattr(self, "_publisher", None)
+        if publisher is not None:
+            publisher.stop()
         stop = getattr(self, "_ocr_install_stop", None)
         if stop is not None:
             stop.set()
@@ -1647,6 +1741,7 @@ class _Window:
         except Exception:
             log.exception("could not restore saved file stats")
         self.session.bind_book(book)
+        self._bind_run_counts(book)
         self.rows_ready = True
         self.scanning = False
         todo = len(found.rows) - indexed
@@ -1684,7 +1779,7 @@ class _Window:
         file_column.pack_start(name_cell, True)
         file_column.add_attribute(mark_cell, "text", COL_MARK)
         file_column.add_attribute(name_cell, "text", COL_NAME)
-        file_column.add_attribute(name_cell, "foreground", COL_COLOR)
+        file_column.set_cell_data_func(name_cell, self._paint_name_color)
         if not headers:
             # The folder tree reads the indexing glyph from the row. The pinned row does not.
             file_column.set_cell_data_func(mark_cell, self._paint_tree_mark)
@@ -1737,8 +1832,8 @@ class _Window:
             "index:Progress",
             progress_column,
             text_index=None,
-            minimum=160,
-            maximum=280,
+            minimum=188,
+            maximum=320,
             fit=fit,
         )
         self._add_column(
@@ -1794,12 +1889,20 @@ class _Window:
         tree.connect("button-press-event", self.on_file_press)
         return tree
 
+    def _bar_hidden(self, model, iterator) -> bool:
+        """A folder has no bar. A ZIM whose document list is still growing has none either."""
+        if model.get_value(iterator, COL_TYPE) == FOLDER:
+            return True
+        source = str(model.get_value(iterator, COL_SOURCE) or "")
+        status = str(model.get_value(iterator, COL_STATUS) or "")
+        return source.startswith("doczim:") and status == "finding"
+
     def _hide_folder_progress(self, _column, cell, model, iterator, _data) -> None:
-        cell.set_property("visible", model.get_value(iterator, COL_TYPE) != FOLDER)
+        cell.set_property("visible", not self._bar_hidden(model, iterator))
 
     def _paint_pass_bar(self, _column, cell, model, iterator, _data) -> None:
         """Color the file bar from the status word. A folder row has no bar."""
-        folder = model.get_value(iterator, COL_TYPE) == FOLDER
+        folder = self._bar_hidden(model, iterator)
         cell.set_property("visible", not folder)
         if folder:
             return
@@ -1807,7 +1910,12 @@ class _Window:
             value = int(model.get_value(iterator, COL_PROGRESS) or 0)
         except (TypeError, ValueError):
             value = 0
+        try:
+            embedded = int(model.get_value(iterator, COL_EMBEDDED))
+        except (TypeError, ValueError):
+            embedded = -1
         cell.value = max(0, min(100, value))
+        cell.embedded = embedded
         cell.pass_color = bar_color(str(model.get_value(iterator, COL_STATUS) or ""))
 
     def _paint_tree_mark(self, _column, cell, model, iterator, _data) -> None:
@@ -1822,9 +1930,18 @@ class _Window:
         else:
             cell.set_property("foreground", "#000000")
 
-    def _paint_tree_name(self, _column, cell, model, iterator, _data) -> None:
+    def _paint_name_color(self, _column, cell, model, iterator, _data) -> None:
+        """Bold the indexing name, and never hand Gtk an empty color."""
         mark = str(model.get_value(iterator, COL_MARK) or "")
         cell.set_property("weight", self._pango_weight(INDEXING_MARK in mark))
+        color = gtk_foreground(model.get_value(iterator, COL_COLOR))
+        if color is None:
+            cell.set_property("foreground-set", False)
+            return
+        cell.set_property("foreground", color)
+
+    def _paint_tree_name(self, _column, cell, model, iterator, _data) -> None:
+        self._paint_name_color(_column, cell, model, iterator, _data)
 
     def _pango_weight(self, bold: bool):
         from gi.repository import Pango
@@ -2397,6 +2514,93 @@ class _Window:
         if hasattr(self, "device_sentence"):
             self._paint_devices()
 
+    def on_zim_documents(self, button) -> None:
+        """Files inside a ZIM. The running file keeps going. The next Start uses this."""
+        value = bool(button.get_active())
+        self.session.set_zim_documents(value)
+        self.install.zim_documents = value
+        try:
+            save_install(self.install)
+        except Exception:
+            log.exception("could not save the ZIM documents setting")
+        self._doc_sig = None
+        try:
+            self.refresh_rows()
+        except Exception:
+            log.exception("could not refresh the document list")
+
+    def on_ocr_every_pdf(self, button) -> None:
+        """Draw every PDF page. The next PDF uses this. An open ZIM keeps going until the next Start."""
+        value = bool(button.get_active())
+        self.session.set_ocr_every_pdf(value)
+        self.install.ocr_every_pdf = value
+        try:
+            save_install(self.install)
+        except Exception:
+            log.exception("could not save the OCR every PDF setting")
+
+    def on_ocr_worker_entry(self, entry) -> None:
+        """A typed worker count. The next OCR page uses it."""
+        if self._ocr_worker_applying:
+            return
+        text = entry.get_text().strip()
+        if not text.isdigit():
+            return
+        typed = int(text)
+        if typed < 1:
+            return
+        self._apply_ocr_worker_max(typed, move_scale=True)
+
+    def on_ocr_worker_scale(self, scale) -> None:
+        """The slider. The next OCR page uses the number it lands on."""
+        if self._ocr_worker_applying:
+            return
+        self._apply_ocr_worker_max(int(round(scale.get_value())), move_scale=False)
+
+    def on_ocr_worker_scale_release(self, scale, _event) -> bool:
+        if self._ocr_worker_applying:
+            return False
+        self._apply_ocr_worker_max(int(round(scale.get_value())), move_scale=True)
+        return False
+
+    def _apply_ocr_worker_max(self, count: int, *, move_scale: bool) -> None:
+        import nomad_turbo.ocr_budget as ocr_budget
+
+        count = ocr_budget.clamp_ocr_worker_max(count, self.cpu_count)
+        stored = ocr_budget.stored_worker_max(count, self.cpu_count)
+        shown = str(count)
+        scale_is_count = self.ocr_worker_scale.get_value() == count
+        if (
+            self.install.ocr_worker_max == stored
+            and self.ocr_worker_entry.get_text().strip() == shown
+            and (not move_scale or scale_is_count)
+        ):
+            return
+        ocr_budget.set_worker_max(count, cpus=self.cpu_count)
+        self.install.ocr_worker_max = stored
+        self._ocr_worker_applying = True
+        try:
+            if self.ocr_worker_entry.get_text().strip() != shown:
+                self.ocr_worker_entry.set_text(shown)
+            if move_scale and not scale_is_count:
+                self.ocr_worker_scale.set_value(count)
+        finally:
+            self._ocr_worker_applying = False
+        self._queue_ocr_worker_save()
+
+    def _queue_ocr_worker_save(self) -> None:
+        if self.ocr_worker_timer:
+            self.glib.source_remove(self.ocr_worker_timer)
+        self.ocr_worker_timer = self.glib.timeout_add(400, self._save_ocr_workers)
+
+    def _save_ocr_workers(self) -> bool:
+        self.ocr_worker_timer = None
+        try:
+            save_install(self.install)
+        except Exception:
+            log.exception("could not save the OCR worker maximum")
+        return False
+
     def on_ocr_quality(self, button, name: str) -> None:
         """One of Low, Medium, or High stays on. The choice is saved."""
         if getattr(self, "_ocr_guard", False):
@@ -2474,7 +2678,8 @@ class _Window:
         hint = gtk.Label(
             label=(
                 "The file in progress stays put. Drag a waiting file to change what comes next. "
-                "Index now still comes first. A saved queue comes before priority and before the Order menu."
+                "Index now still comes first. A saved queue comes before priority and before the Order menu. "
+                "Each column lists the next 200 files."
             )
         )
         hint.set_xalign(0)
@@ -2491,8 +2696,10 @@ class _Window:
         self.queue_ocr_tree.connect("drag-begin", self._on_queue_drag_begin)
         self.queue_embed_tree.connect("drag-end", self._on_queue_drag_end, "embed")
         self.queue_ocr_tree.connect("drag-end", self._on_queue_drag_end, "ocr")
-        paned.pack1(self._queue_column("Embedding", self.queue_embed_tree), True, False)
-        paned.pack2(self._queue_column("OCR", self.queue_ocr_tree), True, False)
+        embed_box, self.queue_embed_caption = self._queue_column("Embedding", self.queue_embed_tree)
+        ocr_box, self.queue_ocr_caption = self._queue_column("OCR", self.queue_ocr_tree)
+        paned.pack1(embed_box, True, False)
+        paned.pack2(ocr_box, True, False)
         paned.set_position(460)
         root.pack_start(paned, True, True, 0)
         window.add(root)
@@ -2511,7 +2718,7 @@ class _Window:
         scroll.set_shadow_type(gtk.ShadowType.IN)
         scroll.add(tree)
         box.pack_start(scroll, True, True, 0)
-        return box
+        return box, label
 
     def _make_queue_tree(self, store, prefix: str):
         """File, type, status, and the same progress facts as the file list."""
@@ -2573,8 +2780,8 @@ class _Window:
             f"{prefix}:Progress",
             progress_column,
             text_index=None,
-            minimum=120,
-            maximum=220,
+            minimum=176,
+            maximum=280,
             fit=True,
         )
         self._add_column(
@@ -2654,35 +2861,117 @@ class _Window:
         except Exception:
             log.exception("could not save the queue")
 
-    def _paint_queue(self, snap) -> None:
+    def _bind_run_counts(self, book) -> None:
+        """Load skipped and bad totals that belong to this collection."""
+        from nomad_turbo.run_counts import RunCounts
+
+        counts = RunCounts(state_dir() / "run-counts.json")
+        try:
+            counts.load()
+        except OSError:
+            log.exception("could not read skipped and bad counts")
+        if hasattr(book, "bind_run_counts"):
+            book.bind_run_counts(counts)
+
+    def _apply_collection_clock(self, clock: tuple[str, int]) -> None:
+        """Clear in-memory counts when the collection clock drops their record."""
+        kind, epoch = clock
+        stats = getattr(self, "file_stats", None)
+        if stats is not None and hasattr(stats, "apply_collection_clock"):
+            stats.apply_collection_clock(kind, epoch)
+        book = self.session.get_book() if hasattr(self.session, "get_book") else None
+        if book is not None and hasattr(book, "apply_run_clock"):
+            book.apply_run_clock(kind, epoch)
+
+    def _queue_files(self, snap) -> list:
+        """Unfinished library files for the Queue window.
+
+        The file-list tick only carries the running row. The queue needs the
+        waiting files too, so Shortest ETA first can list what comes next.
+        Indexed files stay out. The list store still paints 200 rows.
+        """
+        book = self.session.get_book() if hasattr(self.session, "get_book") else None
+        if book is not None and hasattr(book, "open_snaps"):
+            return list(book.open_snaps())
+        if snap is None and book is not None:
+            snap = book.pulse() if hasattr(book, "pulse") else book.snapshot()
+        return list(getattr(snap, "files", []) or [])
+
+    def _paint_queue(self, snap, reading=None) -> None:
         if getattr(self, "queue_window", None) is None or self._queue_drag:
             return
-        if snap is None:
-            book = self.session.get_book() if hasattr(self.session, "get_book") else None
-            if book is not None:
-                snap = book.pulse() if hasattr(book, "pulse") else book.snapshot()
-        files = list(getattr(snap, "files", []) or [])
-        dates = self.session.zim_dates() if hasattr(self.session, "zim_dates") else {}
-        lane = self.session.lane_view() if hasattr(self.session, "lane_view") else None
-        embed_order = self.session.embed_queue() if hasattr(self.session, "embed_queue") else None
-        ocr_order = self.session.ocr_queue() if hasattr(self.session, "ocr_queue") else None
+        if reading is not None:
+            files = list(reading.open_files or ())
+            dates = reading.zim_dates or {}
+            lane = reading.lane
+            embedding = reading.embedding
+            embed_order = reading.embed_order
+            ocr_order = reading.ocr_order
+            choice = reading.order or "library"
+            priorities = set(reading.priorities or ())
+            activity = reading.ocr_activity or ""
+            ocr_activity = activity
+            pace_now = reading.painted_at
+        else:
+            files = self._queue_files(snap)
+            dates = self.session.zim_dates() if hasattr(self.session, "zim_dates") else {}
+            lane = self.session.lane_view() if hasattr(self.session, "lane_view") else None
+            embedding = self.session.embedding_file() if hasattr(self.session, "embedding_file") else None
+            embed_order = self.session.embed_queue() if hasattr(self.session, "embed_queue") else None
+            ocr_order = self.session.ocr_queue() if hasattr(self.session, "ocr_queue") else None
+            choice = self.session.get_order() if hasattr(self.session, "get_order") else "library"
+            priorities = None
+            activity = self._ocr_activity()
+            ocr_activity = None
+            pace_now = None
         boards = build_queue(
             files,
-            choice=self.session.get_order() if hasattr(self.session, "get_order") else "library",
-            priorities=self._priorities(),
+            choice=choice,
+            priorities=priorities if priorities is not None else self._priorities(),
             dates=dates,
             embed_order=embed_order,
             ocr_order=ocr_order,
             lane=lane,
+            embedding=embedding,
         )
         self._queue_boards = boards
-        activity = ""
-        self._fill_queue_store(self.queue_embed_store, boards.embed, "embed", activity)
-        self._fill_queue_store(self.queue_ocr_store, boards.ocr, "ocr", activity)
+        shown_embed = shown_slots(boards.embed)
+        shown_ocr = shown_slots(boards.ocr)
+        self._set_queue_caption(getattr(self, "queue_embed_caption", None), "Embedding", len(shown_embed), len(boards.embed))
+        self._set_queue_caption(getattr(self, "queue_ocr_caption", None), "OCR", len(shown_ocr), len(boards.ocr))
+        self._fill_queue_store(
+            self.queue_embed_store,
+            shown_embed,
+            "embed",
+            activity,
+            priorities=priorities,
+            ocr_activity=ocr_activity,
+            pace_now=pace_now,
+        )
+        self._fill_queue_store(
+            self.queue_ocr_store,
+            shown_ocr,
+            "ocr",
+            activity,
+            priorities=priorities,
+            ocr_activity=ocr_activity,
+            pace_now=pace_now,
+        )
 
-    def _fill_queue_store(self, store, slots, side: str, activity: str) -> None:
-        priorities = self._priorities()
-        rows = [self._file_values(slot.item, priorities, activity) for slot in slots]
+    def _set_queue_caption(self, label, title: str, shown: int, total: int) -> None:
+        if label is None:
+            return
+        text = queue_caption(title, shown, total)
+        if label.get_text() != text:
+            label.set_text(text)
+
+    def _fill_queue_store(self, store, slots, side: str, activity: str, *, priorities=None, ocr_activity=None, pace_now=None) -> None:
+        if priorities is None:
+            priorities = self._priorities()
+        rows = [
+            self._file_values(slot.item, priorities, activity, ocr_activity=ocr_activity, pace_now=pace_now)
+            for slot in slots
+        ]
         sources = [slot.source for slot in slots]
         current = [store[index][COL_SOURCE] for index in range(len(store))]
         if sources == current:
@@ -2778,19 +3067,32 @@ class _Window:
             menu.popup(None, None, None, None, event.button, event.time)
         return True
 
+    def _priority_source(self, source: str) -> str:
+        """Index now and priority on a document row apply to its ZIM."""
+        mapped = getattr(self, "_doc_priority", {}).get(source)
+        if mapped:
+            return mapped
+        text = str(source or "")
+        if text.startswith("zimdoc\n"):
+            from nomad_turbo.zimdocs import parent_source
+
+            return parent_source(text)
+        return text
+
     def _file_menu(self, source: str):
-        priority = source in self.session.priorities()
+        target = self._priority_source(source)
+        priority = target in self.session.priorities()
         labels = row_menu_labels(priority=priority)
         menu = self.gtk.Menu()
         now = self.gtk.MenuItem()
         now.set_label(labels[0])
         now.set_tooltip_text(TIPS["index_now"])
-        now.connect("activate", lambda *_args, src=source: self.on_index_now(src))
+        now.connect("activate", lambda *_args, src=target: self.on_index_now(src))
         menu.append(now)
         mark = self.gtk.MenuItem()
         mark.set_label(labels[1])
         mark.set_tooltip_text(TIPS["priority"])
-        mark.connect("activate", lambda *_args, src=source, on=not priority: self.on_priority(src, on))
+        mark.connect("activate", lambda *_args, src=target, on=not priority: self.on_priority(src, on))
         menu.append(mark)
         details = self.gtk.MenuItem()
         details.set_label(labels[2])
@@ -2827,6 +3129,9 @@ class _Window:
             getattr(self.install, "container_storage", "/app/storage") or "/app/storage",
             source,
         )
+        shown_status = ""
+        if live is not None and getattr(live, "status", "") == "Waiting OCR":
+            shown_status = "Waiting OCR"
         stat = compose_detail(
             source,
             saved,
@@ -2843,12 +3148,23 @@ class _Window:
             priority=priority,
             have_live=live is not None,
         )
-        return detail_lines(stat)
+        return detail_lines(stat, status=shown_status)
 
     def on_details(self, source: str) -> None:
         """Show the saved facts for one file. This does not start indexing."""
         gtk = self.gtk
-        rows = self.file_detail_rows(source)
+        if str(source).startswith("zimdoc\n"):
+            parts = str(source).split("\n", 2)
+            parent = parts[1] if len(parts) > 1 else ""
+            inner = parts[2] if len(parts) > 2 else ""
+            name = inner.rsplit("/", 1)[-1] or inner or "Document"
+            rows = [
+                ("Name", name),
+                ("Path inside the ZIM", inner or "—"),
+                ("ZIM", Path(parent).name or parent or "—"),
+            ]
+        else:
+            rows = self.file_detail_rows(self._priority_source(source))
         title = next((value for label, value in rows if label == "Name" and value and value != "—"), "File details")
         dialog = gtk.Dialog(
             title=title,
@@ -2879,6 +3195,7 @@ class _Window:
 
     def on_index_now(self, source: str) -> None:
         """Leave the embed call already running, then index this file."""
+        source = self._priority_source(source)
         self.session.request_index_now(source)
         running = self.thread is not None and self.thread.is_alive()
         if running:
@@ -2887,6 +3204,7 @@ class _Window:
         self.on_start(False)
 
     def on_priority(self, source: str, on: bool) -> None:
+        source = self._priority_source(source)
         self.session.set_priority(source, bool(on))
         stats = getattr(self, "file_stats", None)
         if stats is not None:
@@ -3051,17 +3369,21 @@ class _Window:
         import nomad_turbo.passes as passes
         import nomad_turbo.pool as pool
         import nomad_turbo.progress as progress
+        import nomad_turbo.ocr_budget as ocr_budget
+        import nomad_turbo.queue_view as queue_view
         import nomad_turbo.runtime as runtime
         import nomad_turbo.schedule as schedule
         import nomad_turbo.session as session_mod
         import nomad_turbo.slots as slots
         import nomad_turbo.store as store
+        import nomad_turbo.zimdocs as zimdocs
 
         importlib.reload(slots)
         importlib.reload(discover)
         importlib.reload(session_mod)
         importlib.reload(store)
         importlib.reload(runtime)
+        importlib.reload(zimdocs)
         importlib.reload(schedule)
         importlib.reload(progress)
         importlib.reload(decisions)
@@ -3070,6 +3392,8 @@ class _Window:
         importlib.reload(passes)
         importlib.reload(pool)
         importlib.reload(logbook)
+        importlib.reload(ocr_budget)
+        importlib.reload(queue_view)
         importlib.reload(engine)
         return engine
 
@@ -3197,45 +3521,22 @@ class _Window:
             schedule.release_measure(self.session)
 
     def on_tick(self) -> bool:
+        """Paint the latest reading. This does not call embed, OCR, or a worker lock."""
         self.tick += 1
-        if self.tick % 4 == 0:
-            self._flush_stats()
-        snap = None
-        view = {"phase": "", "note": "", "error": ""}
         try:
-            if self.tick % 4 == 0:
-                self.live_gpu = pick_gpu(gpu_rows())
             if self.raise_requested:
                 self.raise_requested = False
                 self.present()
-            view = self.session.view()
-            if view["phase"] in ("waiting", "running", "done", "stopped", "error", "deleting") and view["note"]:
-                self._show(self.status, view["error"] or view["note"])
-            if self.scanning:
-                self.overall.pulse()
-            else:
-                snap = self.refresh_rows()
-            self._paint_queue(snap)
-            self.refresh_stats(snap, view)
-            self.refresh_usage()
-            self.refresh_repair()
-            self.refresh_qdrant()
-            self.refresh_tray(view, snap)
-            self._paint_index_optimize(view.get("optimize_hold") or "")
-            self._paint_repair_optimize()
-            self._tell_if_finished(view)
-            self._buttons(view["phase"])
+            board = getattr(self, "live", None)
+            reading = board.current() if board is not None else None
+            if reading is not None and reading.seq != self._applied_seq:
+                self._apply_reading(reading)
+                self._applied_seq = reading.seq
         except Exception:
             if not getattr(self, "_paint_failed", False):
                 self._paint_failed = True
                 log.exception("window refresh failed")
-        try:
-            self.refresh_log()
-        except Exception:
-            if not getattr(self, "_log_failed", False):
-                self._log_failed = True
-                log.exception("log pane failed")
-        if self.session.close_requested and not self._work_alive():
+        if getattr(self.session, "close_requested", False) and not self._work_alive():
             self._flush_frame()
             self._release_log_pane()
             self.qdrant_stop.set()
@@ -3243,45 +3544,68 @@ class _Window:
             return False
         return True
 
-    def _buttons(self, phase: str) -> None:
-        running = phase in ("waiting", "running") and self.thread is not None and self.thread.is_alive()
-        deleting = self.delete_thread is not None and self.delete_thread.is_alive()
-        file_repairing = (self.repair_thread is not None and self.repair_thread.is_alive()) or self.repair_starting
-        optimizing = self._optimize_busy()
-        repairing = file_repairing or optimizing
-        library_idle = self.rows_ready and not running and not repairing and not deleting
-        changes = changes_allowed(self.qdrant_ready)
-        can_delete = delete_allowed(self.qdrant_ready, getattr(self, "collection_missing", False))
-        self.start_button.set_sensitive(library_idle and changes)
-        self.delete_button.set_sensitive(library_idle and can_delete)
-        self.rescan_button.set_sensitive(library_idle)
-        measuring = bool(self.session.measuring()) if hasattr(self.session, "measuring") else False
-        measure_ready = (
-            self.rows_ready and changes and not measuring and not repairing and not deleting and (library_idle or running)
-        )
-        self.measure_button.set_sensitive(measure_ready)
+    def _apply_reading(self, reading) -> None:
+        """Copy one published reading onto the widgets. The figures stay when this is not called."""
+        view = reading.view or {}
+        phase = view.get("phase") or ""
+        if phase in ("waiting", "running", "done", "stopped", "error", "deleting") and view.get("note"):
+            self._show(self.status, view.get("error") or view.get("note"))
+        if reading.scanning:
+            self.overall.pulse()
+        else:
+            self._paint_rows_from(reading)
+        self._paint_queue(reading.snap, reading)
+        self.refresh_stats(reading.snap, view, elapsed=reading.elapsed, from_reading=True)
+        self.refresh_usage(reading)
+        if reading.repair is not None:
+            self.refresh_repair(reading.repair)
+        self.refresh_qdrant(reading)
+        self.refresh_tray(view, reading.snap, reading)
+        self._paint_index_optimize(view.get("optimize_hold") or "", now=reading.painted_at)
+        self._paint_repair_optimize(reading.optimize_live, busy=reading.facts.optimize_busy)
+        self._tell_if_finished(view, reading.repair, from_reading=True)
+        self._buttons(phase, reading.facts)
+        self.refresh_log(reading.log_lines, reset=reading.log_reset)
+        if reading.gpu is not None:
+            self.live_gpu = reading.gpu
+        panel = getattr(self, "host_panel", None)
+        if panel is not None and reading.host_points:
+            panel.stage(reading.host_points)
+            # The open pane redraws from the sampler. A reading must not cover that.
+            if getattr(panel, "_timer", None) is None:
+                panel.paint(reading.host_points)
+
+    def _buttons(self, phase: str, facts=None) -> None:
+        if facts is None:
+            facts = button_facts(self)
+        senses = control_senses(phase, facts)
+        file_repairing = senses["file_repairing"]
+        can_delete = senses["can_delete"]
+        self.start_button.set_sensitive(senses["start"])
+        self.delete_button.set_sensitive(senses["delete"])
+        self.rescan_button.set_sensitive(senses["rescan"])
+        self.measure_button.set_sensitive(senses["measure"])
         # Then index only takes effect during a measurement. It stays off until then.
-        self.then_index_button.set_sensitive(measuring and not repairing and not deleting)
-        armed = bool(measuring and hasattr(self.session, "measure_then_index") and self.session.measure_then_index())
-        self._set_then_index_shown(armed)
-        self._gate_tip(self.start_button, self.start_tip)
+        self.then_index_button.set_sensitive(senses["then_index"])
+        self._set_then_index_shown(senses["then_index_armed"])
+        self._gate_tip(self.start_button, self.start_tip, ready=facts.qdrant_ready)
         if can_delete:
             self.delete_button.set_tooltip_text(self.delete_tip)
         else:
             self.delete_button.set_tooltip_text(TIPS["qdrant_gate"])
-        self.stop_button.set_sensitive(running or deleting)
+        self.stop_button.set_sensitive(senses["stop"])
         if hasattr(self, "repair_start"):
-            idle_repair = not running and not repairing and not deleting and not self.scanning and changes
+            idle_repair = senses["optimize_segments"]
             self.repair_scan.set_sensitive(idle_repair)
             self.repair_start.set_sensitive(idle_repair)
-            self._gate_tip(self.repair_scan, self.repair_scan_tip)
-            self._gate_tip(self.repair_start, self.repair_start_tip)
+            self._gate_tip(self.repair_scan, self.repair_scan_tip, ready=facts.qdrant_ready)
+            self._gate_tip(self.repair_start, self.repair_start_tip, ready=facts.qdrant_ready)
             self.repair_stop_button.set_sensitive(file_repairing)
-            self.repair_quick.set_sensitive(not repairing)
-            self.repair_complete.set_sensitive(not repairing)
+            self.repair_quick.set_sensitive(senses["repair_quick"])
+            self.repair_complete.set_sensitive(senses["repair_complete"])
             if hasattr(self, "optimize_segments"):
                 self.optimize_segments.set_sensitive(idle_repair)
-                self._gate_tip(self.optimize_segments, self.optimize_segments_tip)
+                self._gate_tip(self.optimize_segments, self.optimize_segments_tip, ready=facts.qdrant_ready)
 
     def refresh_rows(self):
         book = self.session.get_book()
@@ -3307,12 +3631,61 @@ class _Window:
         elif frozenset(priorities) != self._shown_priority:
             self._paint_marks(priorities)
         self._shown_priority = frozenset(priorities)
-        running = [item for item in snap.files if item.state == "running"][:2]
-        self._running_source = running[0].source if running else ""
+        library_running = [item for item in snap.files if item.state == "running"]
+        lane = self.session.lane_view() if hasattr(self.session, "lane_view") else None
+        embedding = self.session.embedding_file() if hasattr(self.session, "embedding_file") else None
+        running = pinned_files(library_running, lane, embedding)
+        embedding = next((item for item in running if running_column(item) == "embed"), None)
+        current = embedding or (running[0] if running else None)
+        self._running_source = current.source if current is not None else ""
         self._paint_running(running, priorities, activity)
         self.overall.set_fraction(min(1.0, max(0.0, snap.overall_fraction)))
         self._show(self.overall, snap.overall_text)
         return snap
+
+    def _paint_rows_from(self, reading) -> None:
+        """File list from a reading. This does not take the book lock or stat the disk."""
+        snap = reading.snap
+        if snap is None:
+            self._running_source = ""
+            return
+        priorities = set(reading.priorities or ())
+        activity = reading.activity or ""
+        ocr = reading.ocr_activity or ""
+        hide = bool(reading.hide_finished)
+        prepared = (
+            tuple(reading.doc_sig or (False,)),
+            reading.structure_epoch,
+            tuple(reading.library_items or ()),
+            tuple(reading.doc_groups or ()),
+        )
+        rebuilt = self._ensure_library(self._reading_library, hide, reading.structure_epoch, prepared=prepared)
+        snaps = reading.row_snaps or {}
+        if rebuilt or self._tree_dirty:
+            self._sync_visible(
+                None,
+                self._root_entries(),
+                priorities,
+                activity,
+                snaps=snaps,
+                ocr_activity=ocr,
+                pace_now=reading.painted_at,
+            )
+            self._open_folders.intersection_update(self._folder_by_key)
+            self._restore_open_folders()
+            self._refit_columns(self.file_tree)
+            self._tree_dirty = False
+        elif frozenset(priorities) != self._shown_priority:
+            self._paint_marks(priorities)
+        self._shown_priority = frozenset(priorities)
+        library_running = [item for item in snap.files if item.state == "running"]
+        running = pinned_files(library_running, reading.lane, reading.embedding)
+        lead = next((item for item in running if running_column(item) == "embed"), None)
+        current = lead or (running[0] if running else None)
+        self._running_source = current.source if current is not None else ""
+        self._paint_running(running, priorities, activity, snaps=snaps, ocr_activity=ocr, pace_now=reading.painted_at)
+        self.overall.set_fraction(min(1.0, max(0.0, snap.overall_fraction)))
+        self._show(self.overall, snap.overall_text)
 
     def _hide_finished(self) -> bool:
         if not hasattr(self, "hide_finished"):
@@ -3338,23 +3711,73 @@ class _Window:
                 return text
         return self._activity()
 
-    def _ensure_library(self, book, hide: bool, seen_epoch) -> bool:
+    def _document_signature(self):
+        """Whether the document branch is on, and whether its lists have changed."""
+        enabled = False
+        getter = getattr(self.session, "zim_documents", None)
+        if callable(getter):
+            enabled = bool(getter())
+        elif getattr(self.install, "zim_documents", False):
+            enabled = True
+        if not enabled:
+            return (False,)
+        from nomad_turbo.zimdocs import document_stamp
+
+        return (True, document_stamp(state_dir()))
+
+    def _ensure_library(self, book, hide: bool, seen_epoch, *, prepared=None) -> bool:
         """Rebuild the folder cache when the library membership changes."""
-        if self._shown_book is book and self._shown_hide == hide and self._shown_epoch == seen_epoch:
-            return False
-        if hasattr(book, "library_items"):
-            epoch, items = book.library_items()
+        if prepared is None:
+            doc_sig = self._document_signature()
         else:
-            snap = book.snapshot()
-            epoch = getattr(snap, "structure_epoch", 0)
-            items = snap.files
-        folders = library_tree(items, hide_finished=hide)
+            doc_sig, seen_epoch, prepared_items, prepared_groups = prepared
+        if (
+            self._shown_book is book
+            and self._shown_hide == hide
+            and self._shown_epoch == seen_epoch
+            and getattr(self, "_doc_sig", None) == doc_sig
+        ):
+            return False
+        if prepared is None:
+            if hasattr(book, "library_items"):
+                epoch, items = book.library_items()
+            else:
+                snap = book.snapshot()
+                epoch = getattr(snap, "structure_epoch", 0)
+                items = snap.files
+            seen_epoch = epoch
+            groups = ()
+            self._doc_priority = {}
+            self._doc_rows = {}
+            if doc_sig[0]:
+                from nomad_turbo.zimdocs import doc_zim_key, load_document_groups, virtual_source
+
+                groups = load_document_groups(state_dir())
+                for group in groups:
+                    self._doc_priority[doc_zim_key(group.source)] = group.source
+                    for path, kind, doc_state in group.entries:
+                        self._doc_rows[virtual_source(group.source, path)] = (group.source, path, kind, doc_state)
+        else:
+            items = prepared_items
+            groups = prepared_groups if doc_sig and doc_sig[0] else ()
+            self._doc_priority = {}
+            self._doc_rows = {}
+            if doc_sig and doc_sig[0]:
+                from nomad_turbo.zimdocs import doc_zim_key, virtual_source
+
+                for group in groups:
+                    self._doc_priority[doc_zim_key(group.source)] = group.source
+                    for path, kind, doc_state in group.entries:
+                        self._doc_rows[virtual_source(group.source, path)] = (group.source, path, kind, doc_state)
+        self._doc_groups = groups
+        folders = library_tree(items, hide_finished=hide, documents=groups)
         self._root_folders = folders
         self._folder_by_key = {}
         self._index_folders(folders)
         self._shown_book = book
-        self._shown_epoch = epoch
+        self._shown_epoch = seen_epoch
         self._shown_hide = hide
+        self._doc_sig = doc_sig
         return True
 
     def _index_folders(self, folders) -> None:
@@ -3370,22 +3793,23 @@ class _Window:
         entries.extend(("file", source, source) for source in folder.files)
         return entries
 
-    def _file_values(self, item, priorities, activity: str, *, tree: bool = False) -> tuple:
+    def _file_values(self, item, priorities, activity: str, *, tree: bool = False, ocr_activity=None, pace_now=None) -> tuple:
         values = index_store_row(item, priority=item.source in priorities)
         if tree:
             mark = row_mark(priority=item.source in priorities, indexing=item.state == "running")
             values = (*values[:COL_MARK], mark, *values[COL_MARK + 1 :])
         if item.state == "running":
-            note = self._ocr_activity()
+            note = self._ocr_activity() if ocr_activity is None else ocr_activity
             if ocr_note_matches(note, item.name):
                 pace = None
                 observer = getattr(self, "_ocr_pace", None)
                 if observer is not None:
-                    pace = observer.observe(note)
+                    pace = observer.observe(note, now=pace_now)
+                self._painted_ocr_rate = pace
                 values = overlay_ocr_columns(values, note, pace)
         return values
 
-    def _sync_now_rows(self, items, priorities, activity: str) -> None:
+    def _sync_now_rows(self, items, priorities, activity: str, *, ocr_activity=None, pace_now=None) -> None:
         """Files in progress stay above the folder tree, outside the scroll.
 
         CPU OCR can be reading one file while the GPU indexes another. Both
@@ -3400,19 +3824,23 @@ class _Window:
         if current != sources:
             self.now_store.clear()
             for item in items:
-                self.now_store.append(self._file_values(item, priorities, activity))
+                self.now_store.append(self._file_values(item, priorities, activity, ocr_activity=ocr_activity, pace_now=pace_now))
             return
         iterator = self.now_store.get_iter_first()
         for item in items:
             if iterator is None:
                 break
-            self._set_row(self.now_store, iterator, self._file_values(item, priorities, activity))
+            self._set_row(
+                self.now_store,
+                iterator,
+                self._file_values(item, priorities, activity, ocr_activity=ocr_activity, pace_now=pace_now),
+            )
             iterator = self.now_store.iter_next(iterator)
 
-    def _paint_running(self, items, priorities, activity: str) -> None:
+    def _paint_running(self, items, priorities, activity: str, *, snaps=None, ocr_activity=None, pace_now=None) -> None:
         if items is None or getattr(items, "state", None) == "running":
             items = [items] if items is not None else []
-        self._sync_now_rows(items, priorities, activity)
+        self._sync_now_rows(items, priorities, activity, ocr_activity=ocr_activity, pace_now=pace_now)
         current = [item.source for item in items]
         previous = list(getattr(self, "_tree_indexing_sources", None) or [])
         if not previous:
@@ -3420,30 +3848,41 @@ class _Window:
             previous = [one] if one else []
         for source in previous:
             if source not in current:
-                self._rewrite_tree_file(source, priorities, activity)
+                self._rewrite_tree_file(source, priorities, activity, snaps=snaps, ocr_activity=ocr_activity, pace_now=pace_now)
         self._tree_indexing_sources = current
         self._tree_indexing = current[0] if current else ""
         for item in items:
             iterator = self._file_iters.get(item.source)
             if iterator is None:
                 continue
-            self._set_row(self.store, iterator, self._file_values(item, priorities, activity, tree=True))
+            self._set_row(
+                self.store,
+                iterator,
+                self._file_values(item, priorities, activity, tree=True, ocr_activity=ocr_activity, pace_now=pace_now),
+            )
 
-    def _rewrite_tree_file(self, source: str, priorities, activity: str) -> None:
+    def _rewrite_tree_file(self, source: str, priorities, activity: str, *, snaps=None, ocr_activity=None, pace_now=None) -> None:
         """Drop the indexing mark once that file is no longer the one indexing."""
         iterator = self._file_iters.get(source)
         if iterator is None:
             return
-        book = self.session.get_book() if hasattr(self.session, "get_book") else None
         item = None
-        if book is not None and hasattr(book, "files_for"):
-            item = book.files_for([source]).get(source)
+        if snaps is not None:
+            item = snaps.get(source)
+        else:
+            book = self.session.get_book() if hasattr(self.session, "get_book") else None
+            if book is not None and hasattr(book, "files_for"):
+                item = book.files_for([source]).get(source)
         if item is None:
             mark = row_mark(priority=source in priorities, indexing=False)
             if self.store.get_value(iterator, COL_MARK) != mark:
                 self.store.set_value(iterator, COL_MARK, mark)
             return
-        self._set_row(self.store, iterator, self._file_values(item, priorities, activity, tree=True))
+        self._set_row(
+            self.store,
+            iterator,
+            self._file_values(item, priorities, activity, tree=True, ocr_activity=ocr_activity, pace_now=pace_now),
+        )
 
     def _paint_marks(self, priorities) -> None:
         running = set(getattr(self, "_tree_indexing_sources", None) or [])
@@ -3452,11 +3891,22 @@ class _Window:
             if one:
                 running.add(one)
         for source, iterator in self._file_iters.items():
-            mark = row_mark(priority=source in priorities, indexing=source in running)
+            target = self._priority_source(source)
+            info = getattr(self, "_doc_rows", {}).get(source)
+            indexing = source in running or bool(info and info[3] == "running")
+            mark = row_mark(priority=target in priorities, indexing=indexing)
+            if self.store.get_value(iterator, COL_MARK) != mark:
+                self.store.set_value(iterator, COL_MARK, mark)
+        for key, iterator in self._folder_iters.items():
+            parent = getattr(self, "_doc_priority", {}).get(key)
+            if not parent:
+                continue
+            indexing = any(row[0] == parent and row[3] == "running" for row in self._doc_rows.values())
+            mark = row_mark(priority=parent in priorities, indexing=indexing)
             if self.store.get_value(iterator, COL_MARK) != mark:
                 self.store.set_value(iterator, COL_MARK, mark)
 
-    def _sync_visible(self, parent, entries, priorities, activity: str) -> None:
+    def _sync_visible(self, parent, entries, priorities, activity: str, *, snaps=None, ocr_activity=None, pace_now=None) -> None:
         """Keep one open level in place. A closed folder keeps a single hidden child."""
         wanted = {key for _kind, key, _payload in entries}
         found = self._child_map(parent)
@@ -3465,19 +3915,44 @@ class _Window:
                 self._forget_subtree(iterator)
                 self.store.remove(iterator)
         found = self._child_map(parent)
-        book = self.session.get_book() if hasattr(self.session, "get_book") else None
-        file_sources = [key for kind, key, _payload in entries if kind == "file"]
-        snaps = {}
-        if file_sources and book is not None and hasattr(book, "files_for"):
-            snaps = book.files_for(file_sources)
+        file_sources = [
+            key for kind, key, _payload in entries if kind == "file" and not str(key).startswith("zimdoc\n")
+        ]
+        if snaps is None:
+            book = self.session.get_book() if hasattr(self.session, "get_book") else None
+            snaps = {}
+            if file_sources and book is not None and hasattr(book, "files_for"):
+                snaps = book.files_for(file_sources)
         for kind, key, payload in entries:
-            if kind == "file":
+            if kind == "file" and str(key).startswith("zimdoc\n"):
+                info = getattr(self, "_doc_rows", {}).get(key)
+                if info is None:
+                    continue
+                parent, inner, doc_kind, doc_state = info
+                from nomad_turbo.zimdocs import document_file_row
+
+                values = document_file_row(
+                    parent,
+                    inner,
+                    doc_kind,
+                    doc_state,
+                    priority=parent in priorities,
+                    indexing=doc_state == "running",
+                )
+            elif kind == "file":
                 item = snaps.get(key)
                 if item is None:
                     continue
-                values = self._file_values(item, priorities, activity, tree=True)
+                values = self._file_values(item, priorities, activity, tree=True, ocr_activity=ocr_activity, pace_now=pace_now)
             else:
                 values = folder_store_row(payload)
+                doc_source = getattr(payload, "doc_source", "") or ""
+                if doc_source:
+                    indexing = any(
+                        row[0] == doc_source and row[3] == "running" for row in getattr(self, "_doc_rows", {}).values()
+                    )
+                    mark = row_mark(priority=doc_source in priorities, indexing=indexing)
+                    values = (values[0], mark, *values[2:])
             iterator = found.get(key)
             if iterator is None:
                 iterator = self.store.append(parent, values)
@@ -3488,7 +3963,15 @@ class _Window:
                 self._folder_iters[key] = iterator
                 path = self.store.get_path(iterator)
                 if path is not None and self.file_tree.row_expanded(path):
-                    self._sync_visible(iterator, self._child_entries(payload), priorities, activity)
+                    self._sync_visible(
+                    iterator,
+                    self._child_entries(payload),
+                    priorities,
+                    activity,
+                    snaps=snaps,
+                    ocr_activity=ocr_activity,
+                    pace_now=pace_now,
+                )
                 else:
                     self._hold(iterator)
             else:
@@ -3591,19 +4074,42 @@ class _Window:
         if widget.get_text() != text:
             widget.set_text(text)
 
-    def refresh_stats(self, snap, view: dict) -> None:
-        elapsed = None
-        if self.started_at:
+    def refresh_stats(self, snap, view: dict, elapsed=None, *, from_reading: bool = False) -> None:
+        if not from_reading and elapsed is None and self.started_at:
             elapsed = max(0, int(time.monotonic() - self.started_at))
         text = format_run_stats(view["phase"], elapsed, snap)
         self._show(self.stats, text)
         self.stats.set_tooltip_text(f"{text}\n{TIPS['stats']}".strip() if text else TIPS["stats"])
 
-    def refresh_tray(self, view: dict, snap) -> None:
+    def refresh_tray(self, view: dict, snap, reading=None) -> None:
+        if reading is not None:
+            facts = reading.facts
+            indexing = view.get("phase") in ("waiting", "running") and facts.thread_alive
+            repairing = facts.repair_alive
+            repair_kind = facts.repair_kind
+            repair_overall = reading.repair.overall if repairing and reading.repair is not None else ""
+        else:
+            indexing = view["phase"] in ("waiting", "running") and self.thread is not None and self.thread.is_alive()
+            repairing = self.repair_thread is not None and self.repair_thread.is_alive()
+            repair_kind = getattr(self.repair_board, "kind", "") if repairing and self.repair_board is not None else ""
+            repair_snap = self.repair_board.snapshot() if repairing and self.repair_board is not None else None
+            repair_overall = repair_snap.overall if repair_snap is not None else ""
+        label, guide = tray_indicator_label(
+            view,
+            indexing=indexing,
+            repairing=repairing,
+            hidden=bool(self.hidden),
+            repair_kind=repair_kind,
+        )
+        status_text = tray_status_text(repair_overall, snap)
+        self._tray_label = label
+        self._tray_guide = guide
+        self._tray_status_text = status_text
+        stop_label = tray_stop_label(repairing=repairing, repair_kind=repair_kind)
+        if hasattr(self, "tray_stop"):
+            self.tray_stop.set_label(stop_label)
         if self.indicator is None:
             return
-        indexing = view["phase"] in ("waiting", "running") and self.thread is not None and self.thread.is_alive()
-        repairing = self.repair_thread is not None and self.repair_thread.is_alive()
         status = self._tray_status_enum
         icon = self._tray_icon(indexing, repairing)
         if icon:
@@ -3611,40 +4117,29 @@ class _Window:
             self.indicator.set_attention_icon_full(icon, "Nomad TURBO Index")
         if self.hidden and (indexing or repairing):
             self.indicator.set_status(status.ATTENTION)
-            if indexing:
-                label = str(view.get("chunks", view["percent"]))
-            elif getattr(self.repair_board, "kind", "") == "scan":
-                label = "scan"
-            else:
-                label = "repair"
-            self.indicator.set_label(label, "100%")
         else:
             self.indicator.set_status(status.ACTIVE)
-            self.indicator.set_label(str(view.get("chunks", view["percent"])) if indexing else "", "chunks")
-        if repairing and hasattr(self, "tray_stop"):
-            scanning = getattr(self.repair_board, "kind", "") == "scan"
-            self.tray_stop.set_label("Stop scan" if scanning else "Stop repair")
-        elif hasattr(self, "tray_stop"):
-            self.tray_stop.set_label("Stop indexing")
-        repair_snap = self.repair_board.snapshot() if repairing and self.repair_board is not None else None
-        if repair_snap is not None:
-            self.tray_status.set_label(repair_snap.overall[:120])
-        elif snap is not None:
-            self.tray_status.set_label(snap.overall_text[:120])
+        self.indicator.set_label(label, guide)
+        if hasattr(self, "tray_status"):
+            self.tray_status.set_label(status_text)
 
-    def _tell_if_finished(self, view: dict) -> None:
+    def _tell_if_finished(self, view: dict, repair=None, *, from_reading: bool = False) -> None:
         if not self.hidden or self._finish_told:
             return
-        repair = self.repair_board.snapshot() if self.repair_board is not None else None
+        if not from_reading:
+            repair = self.repair_board.snapshot() if self.repair_board is not None else None
         repair_done = repair is not None and repair.phase in ("done", "stopped", "error") and not repair.busy
         if view["phase"] not in ("done", "stopped", "error") and not repair_done:
             return
         if repair_done and not self._repair_told:
             self._repair_told = True
-            self._notify(repair.note or "Repair stopped.")
+            self._notify_later(repair.note or "Repair stopped.")
             return
         self._finish_told = True
-        self._notify(view["note"] or "Turbo stopped.")
+        self._notify_later(view["note"] or "Turbo stopped.")
+
+    def _notify_later(self, body: str) -> None:
+        threading.Thread(target=self._notify, args=(body,), name="nomad-turbo-notify", daemon=True).start()
 
     def _notify(self, body: str) -> None:
         if shutil.which("notify-send"):
@@ -3655,56 +4150,149 @@ class _Window:
                 stderr=subprocess.DEVNULL,
             )
 
-    def refresh_qdrant(self) -> None:
-        self._show(self.qdrant_label, self.qdrant_text)
+    def refresh_qdrant(self, reading=None) -> None:
+        from nomad_turbo.attention import activity_status, qdrant_level
 
-    def refresh_usage(self) -> None:
-        view = self.session.view()
-        running = view["active_slots"] if view["phase"] in ("waiting", "running") else 0
-        workers = None
-        getter = getattr(self.session, "ocr_workers", None)
-        if callable(getter):
-            workers = getter()
+        if reading is None:
+            text = self.qdrant_text
+            ready = bool(self.qdrant_ready)
+            collection_status = getattr(self, "qdrant_collection_status", "")
+            optimizer_error = getattr(self, "qdrant_optimizer_error", "")
+            collection_missing = bool(getattr(self, "collection_missing", False))
+            unreadable = bool(getattr(self, "qdrant_unreadable", False))
+            repairing = self.repair_thread is not None and self.repair_thread.is_alive()
+            repair_note = ""
+            if repairing and self.repair_board is not None:
+                try:
+                    repair_note = self.repair_board.snapshot().note or ""
+                except Exception:
+                    repair_note = ""
+            view = self.session.view()
+            scanning = bool(self.scanning)
+            qdrant_ready = ready
+            work_alive = self._work_alive()
+        else:
+            text = reading.qdrant_text
+            ready = bool(reading.qdrant_ready)
+            collection_status = reading.collection_status
+            optimizer_error = reading.optimizer_error
+            collection_missing = bool(reading.collection_missing)
+            unreadable = bool(reading.qdrant_unreadable)
+            facts = reading.facts
+            repairing = facts.repair_alive
+            repair_note = reading.repair.note if repairing and reading.repair is not None else ""
+            view = reading.view or {}
+            scanning = bool(reading.scanning)
+            qdrant_ready = ready
+            work_alive = bool(
+                facts.thread_alive
+                or facts.delete_alive
+                or facts.repair_alive
+                or facts.repair_starting
+                or facts.optimize_busy
+            )
+        level = qdrant_level(
+            text,
+            ready=ready,
+            collection_status=collection_status,
+            optimizer_error=optimizer_error,
+            collection_missing=collection_missing,
+            unreadable=unreadable,
+        )
+        self._paint_colored(self.qdrant_label, text, level)
+        shown, attention = activity_status(
+            phase=view.get("phase") or "",
+            note=view.get("note") or "",
+            error=view.get("error") or "",
+            optimize_hold=view.get("optimize_hold") or "",
+            scanning=scanning,
+            repairing=repairing,
+            repair_note=repair_note or "",
+            qdrant_ready=qdrant_ready,
+            qdrant_attention=level,
+            work_alive=work_alive,
+        )
+        self._paint_colored(self.activity_label, shown, attention)
+        self.activity_label.set_tooltip_text(f"{TIPS['activity']} {shown}".strip())
+
+    def _paint_colored(self, label, text: str, level: str) -> None:
+        from nomad_turbo.attention import markup
+
+        if getattr(label, "_turbo_level", None) == level and label.get_text() == text:
+            return
+        label._turbo_level = level
+        label.set_markup(markup(text, level))
+
+    def refresh_usage(self, reading=None) -> None:
         from nomad_turbo.progress import server_status_text
 
-        text = server_status_text(running, workers)
+        if reading is None:
+            view = self.session.view()
+            running = view["active_slots"] if view["phase"] in ("waiting", "running") else 0
+            workers = None
+            getter = getattr(self.session, "ocr_workers", None)
+            if callable(getter):
+                workers = getter()
+        else:
+            view = reading.view or {}
+            running = view.get("active_slots") if view.get("phase") in ("waiting", "running") else 0
+            workers = reading.ocr_workers
+        text = server_status_text(running or 0, workers)
         self._show(self.server_label, text)
         self.server_label.set_tooltip_text(f"{TIPS['usage']} {text}".strip())
-        self._apply_tune()
+        self._apply_tune(reading)
 
-    def _apply_tune(self) -> None:
-        """Show the live batch advice. Auto changes the chunk count only after finished calls earn it."""
-        from nomad_turbo.tune import EmbedSample, content_kind, tune_advice
+    def _embed_samples(self, calls) -> list:
+        from nomad_turbo.tune import EmbedSample
 
-        if self._tune_applying or not hasattr(self, "tune_label"):
-            return
-        view = self.session.view()
-        running = view["phase"] in ("waiting", "running") and self.thread is not None and self.thread.is_alive()
-        gpu = self._index_memory()
-        free = None
-        if gpu and gpu[1]:
-            free = max(0, int(gpu[1]) - int(gpu[2]))
         samples = []
-        for item in self.session.embed_calls():
+        for item in calls:
             size, chunks, seconds, ok = item[:4]
             kind = item[4] if len(item) > 4 else ""
             article_size = item[5] if len(item) > 5 else 0
             samples.append(EmbedSample(int(size), int(chunks), float(seconds), bool(ok), str(kind), int(article_size)))
-        live_kind = ""
-        source = getattr(self, "_running_source", "") or ""
-        if source:
-            live_kind = content_kind(source)
-        count = int(view.get("chunks", view["percent"]))
+        return samples
+
+    def _apply_tune(self, reading=None) -> None:
+        """Show the live batch advice. Auto changes the chunk count only after finished calls earn it."""
+        from nomad_turbo.tune import content_kind, tune_advice
+
+        if self._tune_applying or not hasattr(self, "tune_label"):
+            return
+        if reading is None:
+            view = self.session.view()
+            running = view["phase"] in ("waiting", "running") and self.thread is not None and self.thread.is_alive()
+            gpu = self._index_memory()
+            calls = self.session.embed_calls()
+            auto = bool(self.tune_auto.get_active()) if hasattr(self, "tune_auto") else False
+            call_count = self.session.embed_call_count()
+            source = getattr(self, "_running_source", "") or ""
+            now = time.monotonic()
+        else:
+            view = reading.view or {}
+            running = view.get("phase") in ("waiting", "running") and reading.facts.thread_alive
+            gpu = reading.gpu
+            calls = reading.embed_calls
+            auto = bool(reading.tune_auto)
+            call_count = reading.embed_call_count
+            source = reading.running_source or ""
+            now = reading.painted_at
+        free = None
+        if gpu and gpu[1]:
+            free = max(0, int(gpu[1]) - int(gpu[2]))
+        samples = self._embed_samples(calls)
+        live_kind = content_kind(source) if source else ""
+        count = int(view.get("chunks", view.get("percent", 0)) or 0)
         advice = tune_advice(
             samples,
             count,
-            auto=bool(self.tune_auto.get_active()) if hasattr(self, "tune_auto") else False,
+            auto=auto,
             running=running,
             optimizing=bool(view.get("optimize_hold")),
             gpu_free_mib=free,
             hold=self._tune_hold,
-            call_count=self.session.embed_call_count(),
-            now=time.monotonic(),
+            call_count=call_count,
+            now=now,
             memory=self._pace_memory,
             kind=live_kind,
         )
@@ -3716,20 +4304,44 @@ class _Window:
         if advice.text != self._tune_logged:
             self._tune_logged = advice.text
             log.info("embed batch: %s", advice.text)
-        self._show_chunk_count(advice.count)
-        self._queue_chunk_save(advice.count)
+        if reading is None:
+            self._show_chunk_count(advice.count)
+            self._queue_chunk_save(advice.count)
+            return
+        if self._try_apply_chunks(advice.count):
+            self._queue_chunk_save(advice.count)
 
-    def refresh_log(self) -> None:
+    def _try_apply_chunks(self, count: int) -> bool:
+        """Update the chunk count without waiting on the session lock."""
+        from nomad_turbo.slots import clamp_embed_chunks
+
+        setter = getattr(self.session, "try_set_chunks", None)
+        if not callable(setter) or not setter(count):
+            return False
+        shown = str(clamp_embed_chunks(count))
+        if self.chunk_entry.get_text().strip() != shown:
+            self._tune_applying = True
+            try:
+                self.chunk_entry.set_text(shown)
+            finally:
+                self._tune_applying = False
+        return True
+
+    def refresh_log(self, lines=None, *, reset: bool = False) -> None:
         show_info = self.info_check.get_active()
         show_debug = self.debug_check.get_active()
         show_errors = self.error_check.get_active()
-        if self.filter_dirty:
-            lines = self.memory.since(0)
-        else:
-            lines = self.memory.since(self.last_seq)
-            if not lines:
+        if lines is None:
+            reset = bool(self.filter_dirty)
+            lines = self.memory.since(0 if reset else self.last_seq)
+            if not lines and not reset:
                 self._trim_log_pane()
                 return
+        elif not lines and not reset:
+            self._trim_log_pane()
+            return
+        if reset:
+            self.filter_dirty = True
         adjustment = self.log_scroll.get_vadjustment()
         follow = self.follow_check.get_active()
         stick = log_should_stick(
@@ -3808,7 +4420,15 @@ class _Window:
         def apply_pin() -> bool:
             self._log_pinning += 1
             try:
-                adjustment = self.log_scroll.get_vadjustment()
+                scroll = getattr(self, "log_scroll", None)
+                if scroll is None:
+                    return False
+                try:
+                    adjustment = scroll.get_vadjustment()
+                except Exception:
+                    return False
+                if adjustment is None:
+                    return False
                 if bottom and self.follow_check.get_active() and not self._log_away:
                     adjustment.set_value(max(0.0, adjustment.get_upper() - adjustment.get_page_size()))
                 elif mark is not None and not mark.get_deleted():
@@ -4090,6 +4710,7 @@ class _Window:
 
     def _build_settings_page(self) -> None:
         """CPU or a card for indexing, and CPU or a card for OCR."""
+        import nomad_turbo.ocr_budget as ocr_budget
         from nomad_turbo.devices import list_devices, normalize_device_choice
 
         gtk = self.gtk
@@ -4104,6 +4725,72 @@ class _Window:
         heading.set_markup("<span size='large' weight='bold'>Settings</span>")
         heading.set_xalign(0)
         inner.pack_start(heading, False, False, 0)
+
+        self.parallel_ocr = gtk.ToggleButton(label="Parallel OCR")
+        self.parallel_ocr.set_active(bool(getattr(self.install, "parallel_ocr", False)))
+        self.parallel_ocr.set_halign(gtk.Align.START)
+        self.parallel_ocr.set_valign(gtk.Align.CENTER)
+        self.parallel_ocr.set_tooltip_text(TIPS["parallel_ocr"])
+        self.session.set_parallel_ocr(bool(getattr(self.install, "parallel_ocr", False)))
+        self.parallel_ocr.connect("toggled", self.on_parallel_ocr)
+        self.zim_documents = gtk.ToggleButton(label="ZIM documents")
+        self.zim_documents.set_active(bool(getattr(self.install, "zim_documents", False)))
+        self.zim_documents.set_halign(gtk.Align.START)
+        self.zim_documents.set_valign(gtk.Align.CENTER)
+        self.zim_documents.set_tooltip_text(TIPS["zim_documents"])
+        self.session.set_zim_documents(bool(getattr(self.install, "zim_documents", False)))
+        self.zim_documents.connect("toggled", self.on_zim_documents)
+        self.ocr_every_pdf = gtk.ToggleButton(label="OCR every PDF")
+        self.ocr_every_pdf.set_active(bool(getattr(self.install, "ocr_every_pdf", False)))
+        self.ocr_every_pdf.set_halign(gtk.Align.START)
+        self.ocr_every_pdf.set_valign(gtk.Align.CENTER)
+        self.ocr_every_pdf.set_tooltip_text(TIPS["ocr_every_pdf"])
+        self.session.set_ocr_every_pdf(bool(getattr(self.install, "ocr_every_pdf", False)))
+        self.ocr_every_pdf.connect("toggled", self.on_ocr_every_pdf)
+        worker_limit = ocr_budget.ocr_worker_limit(self.cpu_count)
+        worker_count = ocr_budget.shown_worker_max(
+            getattr(self.install, "ocr_worker_max", None), self.cpu_count
+        )
+        self.ocr_worker_caption = gtk.Label(label="OCR workers")
+        self.ocr_worker_caption.set_tooltip_text(TIPS["ocr_worker_max"])
+        self.ocr_worker_caption.set_valign(gtk.Align.CENTER)
+        self.ocr_worker_scale = gtk.Scale(
+            orientation=gtk.Orientation.HORIZONTAL,
+            adjustment=gtk.Adjustment(
+                value=worker_count,
+                lower=1,
+                upper=worker_limit,
+                step_increment=1,
+                page_increment=1,
+                page_size=0,
+            ),
+        )
+        self.ocr_worker_scale.set_digits(0)
+        self.ocr_worker_scale.set_draw_value(False)
+        self.ocr_worker_scale.set_hexpand(True)
+        self.ocr_worker_scale.set_size_request(220, -1)
+        self.ocr_worker_scale.set_valign(gtk.Align.CENTER)
+        self.ocr_worker_scale.set_tooltip_text(TIPS["ocr_worker_max"])
+        self.ocr_worker_entry = gtk.Entry()
+        self.ocr_worker_entry.set_width_chars(4)
+        self.ocr_worker_entry.set_text(str(worker_count))
+        self.ocr_worker_entry.set_valign(gtk.Align.CENTER)
+        self.ocr_worker_entry.set_tooltip_text(TIPS["ocr_worker_max"])
+        self.ocr_worker_scale.connect("value-changed", self.on_ocr_worker_scale)
+        self.ocr_worker_scale.connect("button-release-event", self.on_ocr_worker_scale_release)
+        self.ocr_worker_entry.connect("changed", self.on_ocr_worker_entry)
+        self.ocr_worker_row = gtk.Box(orientation=gtk.Orientation.HORIZONTAL, spacing=8)
+        self.ocr_worker_row.pack_start(self.ocr_worker_caption, False, False, 0)
+        self.ocr_worker_row.pack_start(self.ocr_worker_scale, True, True, 0)
+        self.ocr_worker_row.pack_start(self.ocr_worker_entry, False, False, 0)
+        ocr_budget.set_worker_max(worker_count, cpus=self.cpu_count)
+        self.settings_toggles = gtk.Box(orientation=gtk.Orientation.VERTICAL, spacing=8)
+        self.settings_toggles.set_halign(gtk.Align.START)
+        self.settings_toggles.pack_start(self.parallel_ocr, False, False, 0)
+        self.settings_toggles.pack_start(self.ocr_worker_row, False, False, 0)
+        self.settings_toggles.pack_start(self.zim_documents, False, False, 0)
+        self.settings_toggles.pack_start(self.ocr_every_pdf, False, False, 0)
+        inner.pack_start(self.settings_toggles, False, False, 0)
 
         self._devices = list_devices()
         self._ocr_probe = {}
@@ -4506,8 +5193,9 @@ class _Window:
         guide = TIPS["repair_page"]
         self.repair_status.set_tooltip_text(f"{note}\n\n{guide}" if note else guide)
 
-    def _gate_tip(self, button, normal: str) -> None:
-        if self.qdrant_ready:
+    def _gate_tip(self, button, normal: str, ready=None) -> None:
+        shown = self.qdrant_ready if ready is None else bool(ready)
+        if shown:
             button.set_tooltip_text(normal)
         else:
             button.set_tooltip_text(TIPS["qdrant_gate"])
@@ -4587,13 +5275,17 @@ class _Window:
         self.optimize_starting = False
         return False
 
-    def _paint_index_optimize(self, reason: str) -> None:
+    def _paint_index_optimize(self, reason: str, now=None) -> None:
         from nomad_turbo.segment_guard import pause_caption, track_optimize_pause
 
         bar = getattr(self, "index_optimize", None)
         if bar is None:
             return
-        now = time.monotonic()
+        if now is None:
+            now = time.monotonic()
+        else:
+            now = float(now)
+        self._optimize_painted_at = now
         pause = track_optimize_pause(self._optimize_pause, reason, now)
         changed = self._optimize_pause is None or pause.generation != self._optimize_pause.generation
         self._optimize_pause = pause
@@ -4612,10 +5304,13 @@ class _Window:
             bar.set_fraction(min(1.0, max(0.0, fraction)))
         self._show(bar, text)
 
-    def _paint_repair_optimize(self) -> None:
-        if self._optimize_busy():
+    def _paint_repair_optimize(self, live=None, *, busy=None) -> None:
+        if busy is None:
+            if self._optimize_busy():
+                return
+            live = self._optimize_live
+        elif busy:
             return
-        live = self._optimize_live
         bar = getattr(self, "repair_optimize_bar", None)
         if live is None or bar is None:
             return
@@ -4706,11 +5401,14 @@ class _Window:
         finally:
             self.repair_starting = False
 
-    def refresh_repair(self) -> None:
-        board = self.repair_board
-        if board is None or not hasattr(self, "repair_store"):
+    def refresh_repair(self, snap=None) -> None:
+        if not hasattr(self, "repair_store"):
             return
-        snap = board.snapshot()
+        if snap is None:
+            board = self.repair_board
+            if board is None:
+                return
+            snap = board.snapshot()
         if snap.note:
             self._set_repair_status(snap.note)
         seen = {row.source for row in snap.rows}
@@ -4719,21 +5417,7 @@ class _Window:
                 del self.repair_store[index]
         existing = self._iters_by_source(self.repair_store)
         for item in snap.rows:
-            tooltip = f"{item.source}\n{item.detail}" if item.source else item.detail
-            values = (
-                item.source,
-                item.name,
-                item.problem,
-                item.points,
-                item.percent,
-                item.pulse,
-                item.status,
-                item.elapsed,
-                tooltip,
-                item.color,
-                int(item.points_value),
-                int(item.elapsed_seconds),
-            )
+            values = repair_store_values(item)
             if item.source in existing:
                 self._set_row(self.repair_store, existing[item.source], values)
             else:

@@ -8,6 +8,8 @@ active. Offsets are safe to read only after that queue's active count is 0.
 
 from __future__ import annotations
 
+import re
+
 
 def offsets_are_safe(active_count: int) -> bool:
     """True only when file-embeddings has no active job.
@@ -191,6 +193,140 @@ def partial_row_state(existing_state: str | None) -> str | None:
     return None
 
 
+def ingest_write(*, done: bool, chunks: int, existing_state: str | None) -> tuple[str, int] | None:
+    """Ingest row to write when a file opens, restarts, or finishes.
+
+    A finished file is indexed with the chunk count from that finish.
+    A partial file stays pending_decision, including when a restart finds
+    the same unfinished file. An indexed row is not demoted.
+    """
+    count = max(0, int(chunks))
+    if done:
+        return "indexed", count
+    if existing_state == "indexed":
+        return None
+    return "pending_decision", count
+
+
+def record_file_finish(store, path: str, *, done: bool, chunks: int, existing_state: str | None) -> str | None:
+    """Write the finish decision through a store that records rows."""
+    choice = ingest_write(done=done, chunks=chunks, existing_state=existing_state)
+    if choice is None:
+        return None
+    state, count = choice
+    if state == "indexed":
+        store.mark_indexed(path, count)
+    else:
+        store.mark_pending(path, count)
+    return state
+
+
+_EDITION_NAME = re.compile(r"^(?P<family>.+)_(?P<version>\d{4}-\d{2})\.zim$", re.IGNORECASE)
+
+
+def zim_edition(path: str) -> tuple[str, str] | None:
+    """Family name and YYYY-MM version from a Kiwix ZIM path. None for other files."""
+    name = (path or "").replace("\\", "/").rsplit("/", 1)[-1]
+    match = _EDITION_NAME.match(name)
+    if match is None:
+        return None
+    return match.group("family"), match.group("version")
+
+
+def previous_edition_path(new_path: str, candidates: list[str]) -> str | None:
+    """The newest other edition of this ZIM. The new path itself is not returned."""
+    parsed = zim_edition(new_path)
+    if parsed is None:
+        return None
+    family, version = parsed
+    parent = (new_path or "").replace("\\", "/").rsplit("/", 1)[0]
+    best_path = None
+    best_version = ""
+    for candidate in candidates:
+        other = zim_edition(candidate)
+        if other is None or other[0] != family or other[1] == version:
+            continue
+        text = candidate.replace("\\", "/")
+        if text.rsplit("/", 1)[0] != parent:
+            continue
+        if text == (new_path or "").replace("\\", "/"):
+            continue
+        if other[1] > best_version:
+            best_version = other[1]
+            best_path = candidate
+    return best_path
+
+
+def edition_offered_only(path: str, offered_version: str | None, offered_on_disk: bool) -> bool:
+    """True when a newer edition is only offered and this file is still installed."""
+    parsed = zim_edition(path)
+    if parsed is None or not (offered_version or "").strip():
+        return False
+    if offered_on_disk:
+        return False
+    return parsed[1] != str(offered_version).strip()
+
+
+def offered_edition_path(installed_path: str, offered_version: str | None) -> str | None:
+    """Path the offered edition would have, beside the file that is installed."""
+    parsed = zim_edition(installed_path)
+    if parsed is None or not (offered_version or "").strip():
+        return None
+    family, _version = parsed
+    text = installed_path.replace("\\", "/")
+    parent, _name = text.rsplit("/", 1)
+    return f"{parent}/{family}_{str(offered_version).strip()}.zim"
+
+
+def replacement_delete(
+    *,
+    new_path: str,
+    previous_path: str | None,
+    previous_on_disk: bool,
+    previous_state: str | None,
+    upsert_in_flight: bool,
+    offered_only: bool,
+) -> str | None:
+    """Old path to delete before the new edition is embedded.
+
+    A pending_decision row and a missing row both still name the old path.
+    Nothing is deleted while an upsert is in flight, and a file that is still
+    installed is kept when a newer edition is only offered. The new path is
+    never the delete target.
+    """
+    del previous_state
+    if upsert_in_flight or offered_only or previous_on_disk:
+        return None
+    if not previous_path or previous_path == new_path:
+        return None
+    return previous_path
+
+
+def delete_replaced_edition(
+    store,
+    *,
+    new_path: str,
+    previous_path: str | None,
+    previous_on_disk: bool,
+    previous_state: str | None,
+    upsert_in_flight: bool,
+    offered_only: bool,
+) -> str | None:
+    """Delete only the previous path, through a store that records the call."""
+    target = replacement_delete(
+        new_path=new_path,
+        previous_path=previous_path,
+        previous_on_disk=previous_on_disk,
+        previous_state=previous_state,
+        upsert_in_flight=upsert_in_flight,
+        offered_only=offered_only,
+    )
+    if not target:
+        return None
+    store.delete_source_points(target)
+    return target
+
+
 def choose_resume(redis_offsets: list[int], checkpoint_articles: int | None) -> int:
     """Article offset to continue from. Never an in-flight batch-start offset."""
     redis_at = max(redis_offsets) if redis_offsets else 0
@@ -214,8 +350,9 @@ def article_outcome(skip: str | None, *, already_stored: bool, stored_chunks: in
 
     A read or parse failure is bad. So is an article the embedder rejected
     down to a piece too small to split. A page with no text is skipped. A page
-    already stored, or one that produced chunks, is indexed. A long page is
-    indexed in full, so it counts as indexed.
+    that is not English is skipped. A page already stored, or one that
+    produced chunks, is indexed. A long page is indexed in full, so it counts
+    as indexed.
     """
     if already_stored:
         return "indexed"

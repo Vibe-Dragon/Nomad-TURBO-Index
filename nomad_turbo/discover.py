@@ -82,6 +82,13 @@ class Install:
     ocr_quality: str = "medium"
     # Experimental. Off reads or indexes one file at a time.
     parallel_ocr: bool = False
+    # Most OCR workers at once. None means every worker the computer allows,
+    # with two threads left free. A lower number is used on the next page.
+    ocr_worker_max: int | None = None
+    # Off indexes a ZIM's pages and leaves PDFs, Word documents, and EPUBs inside it unread.
+    zim_documents: bool = False
+    # Off leaves a PDF page that already has text undrawn. On draws every PDF page.
+    ocr_every_pdf: bool = False
     # auto, cpu, or a card id such as nvidia:<uuid>. The OCR engine is not stored.
     index_device: str = "auto"
     ocr_device: str = "auto"
@@ -287,6 +294,9 @@ def load_install() -> Install:
         "window_max",
         "ocr_quality",
         "parallel_ocr",
+        "ocr_worker_max",
+        "zim_documents",
+        "ocr_every_pdf",
         "index_device",
         "ocr_device",
     ):

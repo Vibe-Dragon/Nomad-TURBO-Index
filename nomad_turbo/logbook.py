@@ -4,6 +4,9 @@ One file per local day, under logs/YYYY-MM-DD.log. The files stay until that
 Qdrant collection is deleted, or until a file's first line is older than the
 collection. Export writes every kept file into one zip. The log buttons do
 not change what these files record.
+
+PDFs copied out of a ZIM for OCR live under ocr-queue/ and follow the same
+collection clock. A timeout keeps them. A deleted collection removes them.
 """
 
 from __future__ import annotations
@@ -11,6 +14,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import shutil
 import subprocess
 import threading
 import zipfile
@@ -196,6 +200,28 @@ class DailyLogHandler(logging.Handler):
             pass
 
 
+def collection_clock(install) -> tuple[str, int]:
+    """present plus birth epoch, missing, or unknown. Unknown must not clear records."""
+    return _read_clock(install)
+
+
+def record_survives(saved_at: datetime | None, kind: str, epoch: int) -> bool:
+    """Whether a saved record belongs to this collection.
+
+    A timeout or an unreadable clock keeps it. A confirmed missing collection
+    drops it. A record dated before the collection was created is dropped.
+    A record with no time is kept while the collection is present, the same
+    way a log line with no timestamp is kept.
+    """
+    if kind == "unknown":
+        return True
+    if kind == "missing":
+        return False
+    if saved_at is None or kind != "present" or epoch <= 0:
+        return True
+    return saved_at >= datetime.fromtimestamp(epoch)
+
+
 def prepare_collection_logs(directory: Path, install) -> None:
     """Keep logs that belong to this collection. Drop the ones that do not.
 
@@ -230,13 +256,196 @@ def clear_collection_logs(directory: Path) -> None:
         try:
             for path in log_files(directory):
                 path.unlink(missing_ok=True)
+            clear_ocr_queue(directory)
             _remember(directory, "missing", 0)
+            _remember_counts(directory, "missing", 0)
         finally:
             _attach_daily_handler(directory, formatter, level)
 
 
-def watch_collection_logs(directory: Path, install) -> None:
-    """Notice a deleted or reborn collection. A timeout does not clear logs."""
+def ocr_queue_dir(directory: Path) -> Path:
+    """Host folder of PDFs copied out of ZIMs for OCR."""
+    return Path(directory) / "ocr-queue"
+
+
+def clear_ocr_queue(directory: Path) -> None:
+    """Delete every exported PDF. Used when the collection is deleted."""
+    folder = ocr_queue_dir(directory)
+    if not _queue_is_real(folder):
+        return
+    try:
+        _remove_children(folder, list(folder.iterdir()))
+    except Exception:
+        logging.getLogger(__name__).exception("could not clear the OCR queue")
+
+
+def align_ocr_queue(directory: Path, kind: str, epoch: int) -> None:
+    """Drop OCR exports that do not belong to this collection.
+
+    A timeout keeps them. A missing collection removes them. An export
+    older than the collection is removed. An export whose time cannot be
+    read stays while the collection is present.
+    """
+    folder = ocr_queue_dir(directory)
+    if not _queue_is_real(folder) or kind == "unknown":
+        return
+    try:
+        if kind == "missing":
+            _remove_children(folder, list(folder.iterdir()))
+            return
+        _remove_children(folder, _stale_exports(folder, kind, epoch))
+    except Exception:
+        logging.getLogger(__name__).exception("could not align the OCR queue")
+
+
+def _queue_is_real(folder: Path) -> bool:
+    return folder.is_dir() and not folder.is_symlink()
+
+
+def _is_real_dir(path: Path) -> bool:
+    try:
+        return path.is_dir() and not path.is_symlink()
+    except OSError:
+        return False
+
+
+def _is_export(path: Path) -> bool:
+    """True for a file or a link. A path that cannot be stated is kept in the list.
+
+    Dropping it here would let one unreadable export hide the rest of the queue.
+    The collection clock then keeps a path whose time cannot be read.
+    """
+    try:
+        if path.is_symlink():
+            return True
+        return not path.is_dir()
+    except OSError:
+        return True
+
+
+def _export_stamp(path: Path) -> datetime | None:
+    try:
+        return datetime.fromtimestamp(path.stat().st_mtime)
+    except OSError:
+        return None
+
+
+def _stale_exports(folder: Path, kind: str, epoch: int) -> list[Path]:
+    """Files and spill directories the collection clock does not keep."""
+    doomed: list[Path] = []
+    for child in list(folder.iterdir()):
+        try:
+            linked = child.is_symlink()
+            directory = child.is_dir()
+        except OSError:
+            continue
+        if linked or not directory:
+            if not record_survives(_export_stamp(child), kind, epoch):
+                doomed.append(child)
+            continue
+        files = [path for path in child.rglob("*") if _is_export(path)]
+        if not files:
+            if not record_survives(_export_stamp(child), kind, epoch):
+                doomed.append(child)
+            continue
+        stale = [path for path in files if not record_survives(_export_stamp(path), kind, epoch)]
+        if len(stale) == len(files):
+            doomed.append(child)
+        else:
+            doomed.extend(stale)
+    return doomed
+
+
+def _inside_queue(folder: Path, path: Path) -> bool:
+    """True when path is a child of the queue and not the queue itself.
+
+    The check does not follow symlinks, so a link cannot aim the delete
+    at another directory.
+    """
+    try:
+        root = Path(os.path.abspath(folder))
+        candidate = path if path.is_absolute() else folder / path
+        absolute = Path(os.path.abspath(candidate))
+    except OSError:
+        return False
+    return root in absolute.parents
+
+
+def _remove_children(folder: Path, paths: list[Path]) -> None:
+    blocked: list[Path] = []
+    for path in paths:
+        if not _inside_queue(folder, path):
+            continue
+        try:
+            if path.is_symlink() or not path.is_dir():
+                path.unlink()
+            else:
+                shutil.rmtree(path)
+        except OSError:
+            blocked.append(path)
+    if blocked:
+        _remove_blocked(folder, blocked)
+    _prune_empty(folder)
+
+
+def _remove_blocked(folder: Path, paths: list[Path]) -> None:
+    """Remove exports the extractor wrote as root.
+
+    The desktop user cannot unlink those files. One elevated delete does
+    the whole batch. A machine without passwordless sudo keeps the files
+    and this function logs that.
+    """
+    if os.geteuid() == 0:
+        logging.getLogger(__name__).warning("could not remove OCR exports under %s", folder)
+        return
+    safe = [str(path) for path in paths if _inside_queue(folder, path)]
+    if not safe:
+        return
+    for start in range(0, len(safe), 100):
+        chunk = safe[start : start + 100]
+        try:
+            completed = subprocess.run(
+                ["sudo", "-n", "rm", "-rf", "--", *chunk],
+                check=False,
+                timeout=600,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        except (OSError, subprocess.SubprocessError):
+            logging.getLogger(__name__).warning("could not remove OCR exports under %s", folder)
+            return
+        if completed.returncode != 0:
+            logging.getLogger(__name__).warning(
+                "could not remove OCR exports under %s: %s",
+                folder,
+                (completed.stderr or "").strip()[:300],
+            )
+            return
+
+
+def _prune_empty(folder: Path) -> None:
+    """Remove spill directories left empty. The queue directory itself stays."""
+    blocked: list[Path] = []
+    children = [path for path in folder.rglob("*") if _is_real_dir(path)]
+    for child in sorted(children, key=lambda path: len(path.parts), reverse=True):
+        try:
+            child.rmdir()
+        except OSError:
+            try:
+                if not any(child.iterdir()):
+                    blocked.append(child)
+            except OSError:
+                blocked.append(child)
+    if blocked:
+        _remove_blocked(folder, blocked)
+
+
+def watch_collection_logs(directory: Path, install) -> bool:
+    """Notice a deleted or reborn collection. A timeout does not clear logs.
+
+    True when the clock was applied. The caller can then clear in-memory counts.
+    """
     directory = Path(directory)
     path = collection_directory(install.storage_host, install.collection)
     epoch = birth_epoch(path) if path.exists() else None
@@ -245,21 +454,44 @@ def watch_collection_logs(directory: Path, install) -> None:
         seen = _seen.get(key)
     if epoch is not None:
         if seen == ("present", epoch):
-            return
+            return False
         align_running_logs(directory, install)
-        return
+        return True
     if path.exists():
         # The folder is there, but its birth time could not be read. Keep the logs.
-        return
+        return False
     if seen == ("missing", 0):
-        return
+        return False
     from nomad_turbo.store import collection_copy_state
 
     # The folder is gone. A timeout still means the collection may exist, so logs stay.
     state = collection_copy_state(install)
     if state != "missing":
-        return
+        return False
     align_running_logs(directory, install)
+    return True
+
+
+def _remember_counts(directory: Path, kind: str, epoch: int) -> None:
+    """Apply the collection clock to skipped and bad counts stored beside the logs."""
+    directory = Path(directory)
+    try:
+        from nomad_turbo.run_counts import RunCounts
+
+        RunCounts(directory / "run-counts.json").load_and_apply(kind, epoch)
+    except Exception:
+        logging.getLogger(__name__).exception("could not align skipped and bad counts")
+    try:
+        from nomad_turbo.file_stats import STATS_NAME, FileStats
+
+        path = directory / STATS_NAME
+        if not path.exists():
+            return
+        stats = FileStats(path)
+        stats.load()
+        stats.apply_collection_clock(kind, epoch)
+    except Exception:
+        logging.getLogger(__name__).exception("could not align per-file article counts")
 
 
 def _prepare_unlocked(directory: Path, install) -> None:
@@ -271,19 +503,23 @@ def _prepare_unlocked(directory: Path, install) -> None:
     kind, epoch = _read_clock(install)
     if kind == "unknown":
         _adopt_legacy(directory)
+        align_ocr_queue(directory, kind, epoch)
+        _remember_counts(directory, kind, epoch)
         return
     if kind == "missing":
         for path in log_files(directory):
             path.unlink(missing_ok=True)
         _remember(directory, "missing", 0)
+        align_ocr_queue(directory, kind, epoch)
+        _remember_counts(directory, kind, epoch)
         return
-    born = datetime.fromtimestamp(epoch)
     for path in list(log_files(directory)):
-        stamp = first_stamp(path)
-        if stamp is not None and stamp < born:
+        if not record_survives(first_stamp(path), kind, epoch):
             path.unlink(missing_ok=True)
     _adopt_legacy(directory)
+    align_ocr_queue(directory, kind, epoch)
     _remember(directory, "present", epoch)
+    _remember_counts(directory, kind, epoch)
 
 
 def _read_clock(install) -> tuple[str, int]:
@@ -455,6 +691,10 @@ def log_help_text() -> str:
             "Opening the window continues today's file. "
             "Deleting the collection, from Turbo or from Project NOMAD, clears these files. "
             "If the first line of a log is older than the current collection, that log is cleared when Turbo starts. "
+            "PDFs copied out of a ZIM for OCR follow those same rules. "
+            "Deleting the collection removes that queue. "
+            "An export older than the current collection is removed when Turbo starts. "
+            "A timeout leaves the queue in place. "
             "Export log saves the kept files in one zip. "
             "The buttons only hide lines in the pane. The files still record every line.",
         ),
@@ -492,7 +732,10 @@ def log_help_text() -> str:
             "\"embed sequences\" is that server adding or dropping a second sequence. "
             "Each sequence keeps 2048 tokens. "
             "\"embedder not ready yet\" means the model is still loading. "
-            "\"embedder call failed\" means that call will be tried again.",
+            "\"embedder call failed\" means that call will be tried again. "
+            "\"cutting one chunk of <file> (<path>) in half so it fits the embedder\" means that piece "
+            "was over the embedder's token limit. Turbo cuts it and keeps the text. The article is not skipped. "
+            "\"The embedder timed out on it\" means that one chunk or article was left unread and the file continued.",
         ),
         (
             "Indexing",

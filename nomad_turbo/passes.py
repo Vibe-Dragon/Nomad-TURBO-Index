@@ -1,6 +1,7 @@
 """ZIM passes, OCR quality, spelling, and duplicate text.
 
-HTML is indexed first. Other text is next. PDFs and pictures are last.
+HTML is indexed first. Documents inside a ZIM wait until every ZIM's pages
+and every upload are stored. Uploaded PDFs and pictures are read on their own.
 A long passage that is already stored is not stored again. The word list
 ships with Turbo. Nothing is downloaded to correct a spelling.
 """
@@ -11,6 +12,7 @@ import hashlib
 import re
 import sqlite3
 import threading
+import time
 from pathlib import Path
 
 _WORD = re.compile(r"[A-Za-z0-9]+")
@@ -61,13 +63,17 @@ PASS_LABELS = {
     "html": "HTML",
     "text": "text",
     "ocr": "OCR",
-    "ocr-text": "OCR text",
+    # Recognized words are stored as text. The orange bar is the page being read.
+    "ocr-text": "text",
 }
 BAR_COLORS = {
     "HTML": "#2f9e44",
     "text": "#1c7ed6",
     "OCR": "#e8590c",
-    "OCR text": "#7048e8",
+    # A row still carrying the old status word uses the text color.
+    "OCR text": "#1c7ed6",
+    # Documents stored inside a ZIM, after its pages.
+    "documents": "#1c7ed6",
 }
 PAGE_CHARS = 3000
 BOILER_WORDS = 200
@@ -394,7 +400,15 @@ def same_work(left: tuple[int, int], right: tuple[int, int]) -> bool:
 
 
 def _popcount(value: int) -> int:
-    return bin(value & _FNV_MASK).count("1")
+    return (value & _FNV_MASK).bit_count()
+
+
+# Three flipped bits cannot put two errors in both 32-bit halves, so a close
+# copy still matches one half with at most one bit different.
+_HALF_BITS = 32
+_HALF_MASK = (1 << _HALF_BITS) - 1
+_HALF_FLIPS = tuple(1 << bit for bit in range(_HALF_BITS))
+assert FINGERPRINT_DISTANCE == 3
 
 
 class ArticlePrints:
@@ -408,6 +422,7 @@ class ArticlePrints:
     def __init__(self) -> None:
         self._rows: list[tuple[int, int]] = []
         self._exact: set[tuple[int, int]] = set()
+        self._halves: tuple[dict[int, list[int]], dict[int, list[int]]] = ({}, {})
         self._path: Path | None = None
         self._handle = None
 
@@ -428,14 +443,46 @@ class ArticlePrints:
         current = fingerprint(text)
         if current[1] < FINGERPRINT_WORDS:
             return False
-        return any(same_work(current, old) for old in self._rows)
+        return self._matches(current)
+
+    def _matches(self, row: tuple[int, int]) -> bool:
+        """True when a stored print is the same article, within a few words."""
+        hashed = row[0] & _FNV_MASK
+        rows = self._rows
+        for table, value in (
+            (self._halves[0], hashed & _HALF_MASK),
+            (self._halves[1], hashed >> _HALF_BITS),
+        ):
+            for bit in range(_HALF_BITS + 1):
+                key = value if bit == _HALF_BITS else value ^ _HALF_FLIPS[bit]
+                bucket = table.get(key)
+                if not bucket:
+                    continue
+                for index in bucket:
+                    if same_work(row, rows[index]):
+                        return True
+        return False
+
+    def _index_row(self, index: int, hashed: int) -> None:
+        hashed &= _FNV_MASK
+        for table, key in (
+            (self._halves[0], hashed & _HALF_MASK),
+            (self._halves[1], hashed >> _HALF_BITS),
+        ):
+            bucket = table.get(key)
+            if bucket is None:
+                table[key] = [index]
+            else:
+                bucket.append(index)
 
     def _remember(self, row: tuple[int, int]) -> bool:
         """Store one print. False when this article is already represented."""
-        if row in self._exact or any(same_work(row, old) for old in self._rows):
+        if row in self._exact or self._matches(row):
             return False
+        index = len(self._rows)
         self._rows.append(row)
         self._exact.add(row)
+        self._index_row(index, row[0])
         return True
 
     def keep(self, text: str) -> None:
@@ -454,7 +501,9 @@ class ArticlePrints:
     def merge_file(self, path: Path) -> None:
         if not path.is_file():
             return
-        for line in path.read_text(encoding="utf-8").splitlines():
+        # Checking a long file is one stretch of work. Pause between batches
+        # so the window can paint Start and the log checkboxes.
+        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines()):
             parts = line.split()
             if len(parts) != 2:
                 continue
@@ -466,6 +515,8 @@ class ArticlePrints:
             if count < FINGERPRINT_WORDS:
                 continue
             self._remember((hashed, count))
+            if (number & 1023) == 0:
+                time.sleep(0)
 
     def write(self, path: Path) -> None:
         """Replace the file with what is in memory, then keep appending to it."""
@@ -489,12 +540,19 @@ def chunk_key(text: str) -> str | None:
 
 
 class ChunkLedger:
-    """Chunks already stored for the whole library. The file lives on disk."""
+    """Chunks already stored for the whole library. The file lives on disk.
+
+    A slice is one transaction. `seen` reads this same connection, so a copy
+    prepared while that transaction is still committing is recognized. Short
+    chunks are not recorded.
+    """
 
     def __init__(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
-        self._lock = threading.Lock()
-        self._db = sqlite3.connect(str(path), check_same_thread=False)
+        # Re-entrant so a commit observer on this thread can call seen().
+        self._lock = threading.RLock()
+        # Autocommit, so a slice can begin and commit exactly once.
+        self._db = sqlite3.connect(str(path), check_same_thread=False, isolation_level=None)
         self._db.execute("create table if not exists chunks (hash text primary key)")
         self._db.commit()
 
@@ -507,12 +565,33 @@ class ChunkLedger:
         return row is not None
 
     def remember(self, text: str) -> None:
-        key = chunk_key(text)
-        if key is None:
+        self.remember_many((text,))
+
+    def remember_many(self, texts) -> None:
+        """Record one stored slice, then sync the ledger once.
+
+        Rows are visible on this connection before the commit returns. A crash
+        before the commit leaves them unseen. Nothing is written for a slice
+        that has no long chunk.
+        """
+        keys = []
+        for text in texts:
+            key = chunk_key("" if text is None else str(text))
+            if key is not None:
+                keys.append((key,))
+        if not keys:
             return
         with self._lock:
-            self._db.execute("insert or ignore into chunks (hash) values (?)", (key,))
-            self._db.commit()
+            try:
+                if self._db.in_transaction:
+                    self._db.rollback()
+                self._db.execute("BEGIN IMMEDIATE")
+                self._db.executemany("insert or ignore into chunks (hash) values (?)", keys)
+                self._db.commit()
+            except Exception:
+                if self._db.in_transaction:
+                    self._db.rollback()
+                raise
 
     def close(self) -> None:
         with self._lock:

@@ -71,6 +71,25 @@ class RepairSnap:
     stats: str = ""
 
 
+def repair_store_values(item: RepairRow) -> tuple:
+    """One repair-list row, in the same order as the repair store."""
+    tooltip = f"{item.source}\n{item.detail}" if item.source else item.detail
+    return (
+        item.source,
+        item.name,
+        item.problem,
+        item.points,
+        item.percent,
+        item.pulse,
+        item.status,
+        item.elapsed,
+        tooltip,
+        item.color,
+        int(item.points_value),
+        int(item.elapsed_seconds),
+    )
+
+
 def format_repair_current(snap: RepairSnap) -> tuple[str, float, str]:
     """Title, bar fraction, and bar text for the file repair is on right now."""
     active = next((row for row in snap.rows if row.pulse >= 0), None)

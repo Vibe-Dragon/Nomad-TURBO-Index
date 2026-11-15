@@ -15,6 +15,7 @@ from nomad_turbo.schedule import (
     COL_ARTICLES_SORT,
     COL_ART_MIN,
     COL_ART_MIN_SORT,
+    COL_EMBEDDED,
     COL_ETA,
     COL_ETA_SORT,
     COL_PROGRESS,
@@ -435,6 +436,8 @@ class FileSnap:
     chunks_per_second: float | None = None
     rate_text: str = "—"
     eta_seconds: int | None = None
+    # Tenths of the chunks-processed percent. -1 draws one bar.
+    embedded: int = -1
     file_type: str = ""
     art_text: str = "—"
     chk_text: str = "—"
@@ -487,6 +490,11 @@ class _Row:
         self.rate = RateTracker()
         self.chunk_rate = RateTracker()
         self.measured_rate: float | None = None
+        # Chunks and articles whose vectors have returned, including ones not saved yet.
+        self.live_chunks = 0
+        self.live_articles = 0
+        self.live_chunk_rate = RateTracker()
+        self.live_article_rate = RateTracker()
         # Chunks of the article being embedded. They are not stored yet.
         self.flight_done = 0
         self.flight_total = 0
@@ -495,6 +503,9 @@ class _Row:
         self.label = ""
         self.pass_done = 0
         self.pass_total: int | None = None
+        self.inventory_units: int | None = None
+        self.inventory_pages: int | None = None
+        self.waiting_ocr = bool(getattr(row, "waiting_ocr", False))
 
 
 # A caller that omits a pass field leaves the row's previous value alone.
@@ -514,6 +525,7 @@ class ProgressBook:
         self.skipped = 0
         self.bad = 0
         self._stats = None
+        self._run_counts = None
         self._structure_epoch = 0
         self._running = None
         self._running_sources: list[str] = []
@@ -597,6 +609,63 @@ class ProgressBook:
                 self.skipped += 1
             elif kind == "skipped":
                 self.skipped += 1
+            else:
+                return
+            counts = self._run_counts
+        if counts is not None:
+            counts.note(kind)
+            try:
+                counts.save()
+            except OSError:
+                pass
+
+    def bind_run_counts(self, counts) -> None:
+        """Use the saved skipped and bad totals. Later notes update that file."""
+        with self._lock:
+            self._run_counts = counts
+            if counts is None:
+                return
+            self.skipped = int(getattr(counts, "skipped", 0) or 0)
+            self.bad = int(getattr(counts, "bad", 0) or 0)
+
+    def apply_run_clock(self, kind: str, epoch: int) -> None:
+        """Clear skipped and bad when the collection clock drops the record."""
+        with self._lock:
+            counts = self._run_counts
+        if counts is None or not hasattr(counts, "apply_clock"):
+            return
+        if counts.apply_clock(kind, epoch):
+            with self._lock:
+                self.skipped = 0
+                self.bad = 0
+
+    def open_snaps(self, now: float | None = None) -> list[FileSnap]:
+        """Unfinished files, for the Queue window. Indexed files stay out.
+
+        The window tick still paints only the running rows in the file list.
+        The queue asks for this shorter set when its window is open.
+        """
+        moment = time.monotonic() if now is None else now
+        with self._lock:
+            files: list[FileSnap] = []
+            for source in self._order:
+                row = self._rows[source]
+                if row.state in ("indexed", "deferred"):
+                    continue
+                files.append(_file_snap(row, moment))
+            return files
+
+    def note_inventory(self, source: str, *, units: int | None, pages: int | None = None) -> None:
+        """The Measure total for one file. ETA uses it when the file is waiting."""
+        with self._lock:
+            row = self._rows.get(source)
+            if row is None:
+                return
+            if units:
+                row.inventory_units = int(units)
+            if pages:
+                row.inventory_pages = int(pages)
+            self._install_contrib(row)
 
     def update(
         self,
@@ -610,6 +679,7 @@ class ProgressBook:
         label=_KEEP,
         pass_done=_KEEP,
         pass_total=_KEEP,
+        waiting_ocr=_KEEP,
     ) -> None:
         moment = time.monotonic() if now is None else now
         with self._lock:
@@ -641,6 +711,8 @@ class ProgressBook:
             self._chunk_rate.push(moment, self._chunk_advanced)
             row.chunks = incoming_chunks
             row.chunk_rate.push(moment, row.chunks)
+            row.live_chunks = max(row.live_chunks, row.chunks)
+            row.live_articles = max(row.live_articles, row.articles)
             # A stored update replaces the in-flight count. The two are not added.
             row.flight_done = 0
             row.flight_total = 0
@@ -656,6 +728,8 @@ class ProgressBook:
                 row.pass_done = max(0, int(pass_done or 0))
             if pass_total is not _KEEP:
                 row.pass_total = int(pass_total) if pass_total else None
+            if waiting_ocr is not _KEEP:
+                row.waiting_ocr = bool(waiting_ocr)
             self._install_contrib(row)
             self._bytes.push(moment, self._done_bytes)
             if created or previous_state != row.state:
@@ -686,6 +760,29 @@ class ProgressBook:
             row.flight_rate.push(moment, done_chunks)
             self._install_contrib(row)
             self._bytes.push(moment, self._done_bytes)
+
+    def note_live(self, source: str, chunks: int, articles: int, now: float | None = None) -> None:
+        """Chunks and articles whose vectors have returned. Nothing is stored here.
+
+        Counts only move forward. A repeat of the same count does not extend
+        the pace unless a second has passed, so filling the next call does not
+        wash the rate out. Saved totals stay on update().
+        """
+        moment = time.monotonic() if now is None else now
+        with self._lock:
+            row = self._rows.get(source)
+            if row is None or row.state != "running":
+                return
+            chunks_now = max(int(row.live_chunks), int(row.chunks), max(0, int(chunks or 0)))
+            articles_now = max(int(row.live_articles), int(row.articles), max(0, int(articles or 0)))
+            changed = chunks_now != row.live_chunks or articles_now != row.live_articles
+            row.live_chunks = chunks_now
+            row.live_articles = articles_now
+            last = row.live_chunk_rate.samples[-1][0] if row.live_chunk_rate.samples else None
+            if not changed and (last is None or moment - last < 1):
+                return
+            row.live_chunk_rate.push(moment, float(chunks_now))
+            row.live_article_rate.push(moment, float(articles_now))
 
     def ensure_present(
         self,
@@ -763,6 +860,10 @@ class ProgressBook:
                 row.flight_done = 0
                 row.flight_total = 0
                 row.flight_rate = RateTracker()
+                row.live_chunks = 0
+                row.live_articles = 0
+                row.live_chunk_rate = RateTracker()
+                row.live_article_rate = RateTracker()
                 row.measured_rate = None
             self._bytes = RateTracker()
             self._advanced = 0.0
@@ -771,6 +872,7 @@ class ProgressBook:
             self._chunk_rate = RateTracker()
             self.skipped = 0
             self.bad = 0
+            counts = self._run_counts
             self._running = None
             self._running_sources = []
             self._reset_totals()
@@ -779,6 +881,8 @@ class ProgressBook:
             for source in self._order:
                 self._install_contrib(self._rows[source])
             self._structure_epoch += 1
+        if counts is not None and hasattr(counts, "clear"):
+            counts.clear()
 
     def attach_stats(self, stats) -> None:
         with self._lock:
@@ -789,11 +893,18 @@ class ProgressBook:
         with self._lock:
             sources = list(self._rows)
         saved_rates: dict[str, float] = {}
+        saved_inventory: dict[str, tuple] = {}
         if stats is not None:
             for source in sources:
                 saved = stats.get(source)
-                if saved is not None and saved.measured_article_rate:
+                if saved is None:
+                    continue
+                if saved.measured_article_rate:
                     saved_rates[source] = float(saved.measured_article_rate)
+                units = getattr(saved, "inventory_units", None)
+                pages = getattr(saved, "inventory_pages", None)
+                if units or pages:
+                    saved_inventory[source] = (units, pages)
         with self._lock:
             self._stats = stats
             changed = False
@@ -801,6 +912,20 @@ class ProgressBook:
                 row = self._rows.get(source)
                 if row is not None and row.measured_rate != rate:
                     row.measured_rate = rate
+                    self._install_contrib(row)
+                    changed = True
+            for source, (units, pages) in saved_inventory.items():
+                row = self._rows.get(source)
+                if row is None:
+                    continue
+                row_changed = False
+                if units and row.inventory_units != int(units):
+                    row.inventory_units = int(units)
+                    row_changed = True
+                if pages and row.inventory_pages != int(pages):
+                    row.inventory_pages = int(pages)
+                    row_changed = True
+                if row_changed:
                     self._install_contrib(row)
                     changed = True
             if changed:
@@ -828,6 +953,7 @@ class ProgressBook:
                     total=row.total,
                     live_rate=None,
                     measured_rate=rate,
+                    inventory_units=row.inventory_units,
                 )
             remembered = self._progress_fact(row)
         if remembered is None:
@@ -978,6 +1104,85 @@ def _flight_eta_seconds(row: _Row) -> int | None:
     return int(remaining / rate)
 
 
+def _article_pace(row: _Row) -> float | None:
+    """Articles per second. Saved pace, then articles whose vectors have returned."""
+    saved = row.rate.per_second()
+    if saved:
+        return saved
+    return row.live_article_rate.per_second()
+
+
+def _saved_fraction(row: _Row) -> float:
+    """Share of the file that is already stored. In-flight chunks stay out of this."""
+    if row.state == "indexed":
+        return 1.0
+    if row.state == "deferred":
+        return 0.0
+    if row.state == "running" and row.pass_total:
+        return min(1.0, max(0.0, row.pass_done / int(row.pass_total)))
+    if row.total and int(row.total) > 0:
+        return min(1.0, max(0.0, row.articles / int(row.total)))
+    return 0.0
+
+
+def _processed_tenths(row: _Row, saved: float) -> int:
+    """Tenths of chunks that have vectors. -1 keeps a single bar.
+
+    Total chunks are unknown until the file is finished, so chunks that have
+    vectors and are not saved yet count as a fraction of an article.
+    """
+    if row.state != "running":
+        return -1
+    processed = saved
+    if _open_article(row):
+        flight = min(1.0, max(0.0, row.flight_done / row.flight_total))
+        if row.total and int(row.total) > 0:
+            credit = flight if row.articles < int(row.total) else 0.0
+            processed = min(1.0, (row.articles + credit) / int(row.total))
+        else:
+            processed = flight
+    else:
+        ahead = max(0, int(row.live_chunks) - int(row.chunks))
+        if row.articles > 0 and row.chunks > 0:
+            typical = row.chunks / row.articles
+        else:
+            typical = float(max(ahead, 1))
+        extra = (ahead / typical) if typical > 0 else 0.0
+        if row.pass_total:
+            base = int(row.pass_done)
+            total = int(row.pass_total)
+        elif row.total and int(row.total) > 0:
+            base = int(row.articles)
+            total = int(row.total)
+        else:
+            base = 0
+            total = 0
+        if total > 0:
+            processed = min(1.0, max(0.0, (base + extra) / total))
+    processed = max(saved, processed)
+    return max(0, min(1000, int(round(processed * 1000))))
+
+
+def _article_text(row: _Row) -> str:
+    """Articles saved, and how many are left while this file is running."""
+    if row.state == "indexed":
+        return "indexed"
+    if row.state == "running" and row.pass_total:
+        left = max(0, int(row.pass_total) - int(row.pass_done))
+        shown = left if left else int(row.pass_total)
+        return f"{row.articles:,} / {shown:,}"
+    if row.total:
+        total = int(row.total)
+        if row.state == "running":
+            left = max(0, total - int(row.articles))
+            shown = left if left else total
+            return f"{row.articles:,} / {shown:,}"
+        return f"{row.articles:,} / {total:,}"
+    if row.articles:
+        return f"{row.articles:,}"
+    return "—"
+
+
 def _row_eta(row: _Row) -> tuple[str, int | None]:
     """ETA text and seconds. An open article with no article pace uses chunks.
 
@@ -989,7 +1194,7 @@ def _row_eta(row: _Row) -> tuple[str, int | None]:
         remaining = max(0, int(row.pass_total) - int(row.pass_done))
         if remaining == 0:
             return format_eta(0), 0
-        rate = row.rate.per_second()
+        rate = _article_pace(row)
         if rate:
             seconds = int(remaining / rate)
             return format_eta(seconds), seconds
@@ -998,8 +1203,9 @@ def _row_eta(row: _Row) -> tuple[str, int | None]:
         state=row.state,
         articles=row.articles,
         total=row.total,
-        live_rate=row.rate.per_second() if running else None,
+        live_rate=_article_pace(row) if running else None,
         measured_rate=row.measured_rate,
+        inventory_units=row.inventory_units,
     )
     if seconds is None and running:
         flight = _flight_eta_seconds(row)
@@ -1016,26 +1222,22 @@ def _eta_seconds(row: _Row) -> int | None:
 
 def _file_snap(row: _Row, _moment: float) -> FileSnap:
     """One list row. The caller holds the book lock."""
-    fraction = _fraction(row.state, row.articles, row.total, row.flight_done, row.flight_total)
-    if row.state == "running" and row.pass_total:
-        fraction = min(1.0, max(0.0, row.pass_done / int(row.pass_total)))
+    saved = _saved_fraction(row)
     art_rate = row.rate.per_second()
     chk_rate = row.chunk_rate.per_second()
     running = row.state == "running"
-    if _open_article(row):
-        live_chunks = row.flight_rate.per_second()
+    if running:
+        live_articles = row.live_article_rate.per_second()
+        live_chunks = row.live_chunk_rate.per_second()
+        if live_articles:
+            art_rate = live_articles
         if live_chunks:
             chk_rate = live_chunks
-    if row.state == "indexed":
-        count = "indexed"
-    elif row.state == "running" and row.pass_total:
-        count = f"{row.pass_done:,} / {row.pass_total:,}"
-    elif row.total:
-        count = f"{row.articles:,} / {row.total:,}"
-    elif row.articles:
-        count = f"{row.articles:,}"
-    else:
-        count = "—"
+    if _open_article(row):
+        flight_chunks = row.flight_rate.per_second()
+        if flight_chunks:
+            chk_rate = flight_chunks
+    count = _article_text(row)
     eta, eta_seconds = _row_eta(row)
     art_minute = (art_rate * 60) if running and art_rate else None
     chk_live = chk_rate if running and chk_rate else None
@@ -1049,8 +1251,12 @@ def _file_snap(row: _Row, _moment: float) -> FileSnap:
         source=row.source,
         name=row.name,
         origin=row.origin,
-        status=row.label if row.state == "running" and row.label else status_word(row.state),
-        percent=int(round(fraction * 100)),
+        status=(
+            row.label
+            if row.state == "running" and row.label
+            else status_word(row.state, waiting_ocr=bool(getattr(row, "waiting_ocr", False)))
+        ),
+        percent=int(round(saved * 100)),
         count=count,
         eta=eta,
         color=row_color(row.origin, row.state),
@@ -1067,6 +1273,7 @@ def _file_snap(row: _Row, _moment: float) -> FileSnap:
         file_type=file_type_label(row.name),
         art_text=pace_text(running, art_minute),
         chk_text=pace_text(running, chk_live),
+        embedded=_processed_tenths(row, saved),
         total_articles=row.total,
         mtime=row.mtime,
         walk_index=row.walk_index,
@@ -1251,6 +1458,7 @@ def overlay_ocr_columns(values: tuple, activity: str, pages_per_minute: float | 
     out = list(values)
     out[COL_STATUS] = status
     out[COL_PROGRESS] = percent
+    out[COL_EMBEDDED] = -1
     pages = ocr_pages(activity)
     if pages is not None:
         page, total = pages
