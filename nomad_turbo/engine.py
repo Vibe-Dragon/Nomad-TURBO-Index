@@ -102,6 +102,7 @@ from nomad_turbo.store import (
     point_id,
     set_policy,
     source_active,
+    stop_between_writes,
     upsert,
 )
 
@@ -1663,7 +1664,8 @@ def _store_ready(
     if flat:
         if stop is not None and not _wait_to_write(install, stop, session):
             raise RuntimeError("stopped")
-        upsert(install, flat)
+        with stop_between_writes(stop):
+            upsert(install, flat)
         _remember_stored(getattr(work, "ledger", None), flat)
     last = len(staged) - 1
     for index, (prepared, points) in enumerate(staged):
@@ -2371,7 +2373,7 @@ def _index_zim(
 def _halt_reason(stop: threading.Event, retire: threading.Event | None = None, switch_check=None) -> str | None:
     """Why to leave the file. `replaced` drops points. A switch keeps them.
 
-    The check runs between embed calls, so the call already running finishes first.
+    Stop drops the embed already running. A switch still lets that call finish.
     """
     if retire is not None and retire.is_set():
         return "replaced"
@@ -2439,12 +2441,13 @@ class _Ahead:
         self.executor = executor
         self.width = 1
         self.items: list = []
+        self._chunks = 0
         self.ended = False
         self.saw_done = False
         self.quiet = 0.0
 
     def chunks(self) -> int:
-        return sum(len(getattr(item, "inputs", ())) for item in self.items)
+        return self._chunks
 
     def poll(self, timeout: float) -> bool:
         """Read one article. False means stop polling and wait for the request."""
@@ -2460,17 +2463,65 @@ class _Ahead:
         if item is _EXTRACT_CLOSED:
             self.ended = True
             return False
-        self.items.append(_prepare_article(self.install, self.work, item, self.seen))
+        prepared = _prepare_article(self.install, self.work, item, self.seen)
+        self.items.append(prepared)
+        self._chunks += len(prepared.inputs)
         self.quiet = time.monotonic()
         return True
 
     def flush(self, feed) -> None:
+        """Move prefetched articles onto the feed, up to one batch.
+
+        A chunk the embedder rejects ends the call early. Articles already
+        read for the next batch stay here until the feed has room, so that
+        reject does not leave another full batch waiting behind this one.
+        """
         if feed._claim:
             return
-        items = self.items
-        self.items = []
-        for item in items:
+        limit = max(1, int(self.width))
+        remain: list = []
+        for index, item in enumerate(self.items):
+            if feed.pending() >= limit:
+                remain.extend(self.items[index:])
+                break
+            self._chunks -= len(item.inputs)
             feed.add(item)
+        self.items = remain
+
+
+# How long Stop waits after the embed server is dropped. The request already
+# running cannot see Stop. Dropping the server fails that request.
+_STOP_EMBED_WAIT = 5.0
+
+
+def _drop_running_embed(pool) -> None:
+    """Remove the embed server so the request already running fails."""
+    stopper = getattr(pool, "stop_all", None)
+    if not callable(stopper):
+        return
+    try:
+        stopper()
+    except Exception:
+        log.warning("could not drop the embed server while stopping", exc_info=True)
+
+
+def _release_stuck_embed() -> None:
+    """End an embed that kept going after its server was dropped.
+
+    A dead server used to be split into one retry per chunk. Replacing the
+    workload process ends that and leaves a fresh process for the next Start.
+    """
+    from nomad_turbo.live import Workload
+
+    host = Workload.current()
+    if host is None or not host.proc.is_alive():
+        return
+    log.info("stopping the embed that was still running")
+    host.close()
+    try:
+        Workload.install()
+    except Exception:
+        log.warning("could not start a new workload process after stopping", exc_info=True)
 
 
 def _embed_texts(pool, install, texts: list[str], ahead: _Ahead | None):
@@ -2481,7 +2532,23 @@ def _embed_texts(pool, install, texts: list[str], ahead: _Ahead | None):
     while not future.done():
         if not ahead.poll(0.05):
             break
-    return future.result()
+    if future.done() or _halt_reason(ahead.stop, ahead.retire, ahead.switch_check) != "stopped":
+        return future.result()
+    if not future.done():
+        _drop_running_embed(pool)
+    try:
+        return future.result(timeout=_STOP_EMBED_WAIT)
+    except TimeoutError:
+        if not future.done():
+            _release_stuck_embed()
+            raise RuntimeError("stopped") from None
+        if ahead.stop.is_set():
+            raise RuntimeError("stopped") from None
+        raise
+    except Exception:
+        if ahead.stop.is_set():
+            raise RuntimeError("stopped") from None
+        raise
 
 
 def _embed_width(install, pool, work, session, feed, pipe, seen, stop, retire, switch_check, width: int, ahead: _Ahead | None = None) -> bool:
@@ -2558,7 +2625,9 @@ def _embed_width(install, pool, work, session, feed, pipe, seen, stop, retire, s
                         exc.detail,
                     )
                 return False
-            except Exception:
+            except Exception as exc:
+                if str(exc) == "stopped" or (stop is not None and stop.is_set()):
+                    raise
                 elapsed = time.monotonic() - slice_started
                 _note_embed_call(
                     session,
@@ -2581,7 +2650,9 @@ def _embed_width(install, pool, work, session, feed, pipe, seen, stop, retire, s
                 pipe.submit(lambda batch=ready: _store_ready(install, work, seen, session, batch, stop))
     finally:
         note_embed(False)
-        if ahead is not None:
+        # Stop is leaving this file. The articles read ahead of this call
+        # stay unread until the file is opened again.
+        if ahead is not None and _halt_reason(stop, retire, switch_check) is None:
             ahead.flush(feed)
     if (sent >= width or feed.pending() == 0) and sent >= max(4, width // 2):
         elapsed = time.monotonic() - started
@@ -2668,9 +2739,14 @@ def _consume_articles(install, pool, work, stop, session, seen, pull, retire=Non
         except Exception as exc:
             if error is None:
                 error = exc
-            else:
+            elif str(exc) != "stopped":
                 log.error("upsert failed after another error: %s", exc)
-        embed_calls.shutdown(wait=True, cancel_futures=False)
+        # A request that did not notice Stop must not hold the file for the
+        # rest of its answer limit. The normal path still waits for its thread.
+        if stop is not None and stop.is_set():
+            embed_calls.shutdown(wait=False, cancel_futures=True)
+        else:
+            embed_calls.shutdown(wait=True, cancel_futures=False)
     if error is not None:
         raise error
     reason = _halt_reason(stop, retire, switch_check)
@@ -3165,7 +3241,8 @@ def _index_text_bundle(
         if flat:
             if not _wait_to_write(install, stop, session):
                 raise RuntimeError("stopped")
-            upsert(install, flat)
+            with stop_between_writes(stop):
+                upsert(install, flat)
             grouped: dict[int, tuple] = {}
             for item, _prepared, points in staged:
                 ledger = getattr(item, "ledger", None)

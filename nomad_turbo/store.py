@@ -7,6 +7,7 @@ It does not change that contract. An existing collection is left in place.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import subprocess
@@ -22,6 +23,8 @@ log = logging.getLogger("nomad_turbo")
 # Upserts and point deletes share Qdrant. A delete running at the same time
 # as a write makes the write time out, and one timeout used to fail the file.
 _write_lock = threading.Lock()
+# Stop for the upsert running on this thread. Checked between point batches.
+_write_stop = threading.local()
 
 
 class StoreError(RuntimeError):
@@ -447,6 +450,17 @@ def apply_segment_cap(install: Install) -> None:
 POINT_BATCH = 128
 
 
+@contextlib.contextmanager
+def stop_between_writes(stop):
+    """Notice Stop between point batches of the upsert on this thread."""
+    previous = getattr(_write_stop, "event", None)
+    _write_stop.event = stop
+    try:
+        yield
+    finally:
+        _write_stop.event = previous
+
+
 def upsert(install: Install, points: list[dict]) -> None:
     if not points:
         return
@@ -455,8 +469,13 @@ def upsert(install: Install, points: list[dict]) -> None:
     note_upsert(True)
     try:
         url = f"{install.qdrant_url.rstrip('/')}/collections/{install.collection}/points?wait=true"
+        stop = getattr(_write_stop, "event", None)
         with _write_lock:
             for start in range(0, len(points), POINT_BATCH):
+                # The request already sent finishes. Stop leaves the rest of
+                # the slice uncommitted so resume can write it again.
+                if stop is not None and stop.is_set():
+                    raise RuntimeError("stopped")
                 batch = points[start : start + POINT_BATCH]
                 for attempt in range(3):
                     try:

@@ -454,6 +454,8 @@ def _post_with_retry(post, texts: list[str], attempts: int, pause) -> list[list[
             raise RuntimeError_(f"embedder {last}") from exc
         except (TimeoutError, urllib.error.URLError, OSError, json.JSONDecodeError, RuntimeError_) as exc:
             last = str(getattr(exc, "reason", exc))
+            if _server_gone(exc):
+                raise RuntimeError_(f"embedder {last}") from exc
             if embed_call_plan(None, attempt, attempts) == "retry":
                 log.warning("embedder call failed (%s). Trying again.", last)
                 pause(min(4, 2**attempt))
@@ -478,6 +480,24 @@ def _call_unanswered(exc: BaseException) -> bool:
         or "timeout" in text
         or "connection" in text
         or "did not answer" in text
+    )
+
+
+def _server_gone(exc: BaseException) -> bool:
+    """The embed server is gone. Splitting the batch would only retry the miss."""
+    reason = getattr(exc, "reason", None)
+    blob = f"{exc} {reason or ''}".lower()
+    return any(
+        mark in blob
+        for mark in (
+            "connection refused",
+            "connection reset",
+            "connection aborted",
+            "broken pipe",
+            "remote end closed",
+            "no route to host",
+            "network is unreachable",
+        )
     )
 
 
@@ -513,7 +533,7 @@ def _collect(post, texts: list[str], attempts: int, pause) -> list[list[float]]:
             _reraise_rejected(err, mid)
         return left + right
     except RuntimeError_ as exc:
-        if not _call_unanswered(exc):
+        if _server_gone(exc) or not _call_unanswered(exc):
             raise
         if len(texts) == 1:
             raise ChunkTimedOut(0, str(exc)) from exc

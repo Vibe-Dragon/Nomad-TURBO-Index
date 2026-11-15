@@ -298,7 +298,7 @@ The script writes `dist/nomad-turbo_<version>_all.deb`. It does not install the 
 
 Click the icon. The window scans the library. Opening it does not start or stop indexing.
 
-**Start indexing** pauses NOMAD's file embedding and continues from the saved article. The reader opens the ZIM once, walks to that article, and keeps going from there. **Rescan** reads the library again. It does not pause NOMAD or start indexing. **Stop** finishes the embed call already running. It does not delete the index. When the run started on Manual, unfinished files are not handed back to stock NOMAD. **Delete index** sits at the right end of the button row. You must type DELETE. Indexing does not start. ZIM files and uploads stay.
+**Start indexing** pauses NOMAD's file embedding and continues from the saved article. The reader opens the ZIM once, walks to that article, and keeps going from there. **Rescan** reads the library again. It does not pause NOMAD or start indexing. **Stop** ends the embed that is already running and keeps the last article that was fully saved. It does not delete the index. When the run started on Manual, unfinished files are not handed back to stock NOMAD. **Delete index** sits at the right end of the button row. You must type DELETE. Indexing does not start. ZIM files and uploads stay.
 
 The header shows the package version beside **Index**, **Repair**, and **About**. **Host system graphs** is a button. It shows CPU, memory, GPU, and video memory, plus a read graph and a write graph for each disk indexing uses and for the disk that holds the knowledge base. A folder on its own disk is its own graph. The blue line is read and the red line is write. A vertical bar sets that pane's width. Dragging it left wraps the Index controls, the Repair controls, and the log row so they stay visible, and the bar stops at the narrowest width those controls still fit. The window still asks for at most 480 by 280. If the window is already that small, the host side shrinks. Whether the pane is open, and that width, are remembered. **Order** and **Hide finished** sit on that header. The order is remembered. The header link opens the [Nomad TURBO Index repository](https://github.com/Vibe-Dragon/Nomad-TURBO-Index). **About** is its own page. It shows this Turbo version, states that this version was tested with Project NOMAD 1.35.1, and links to that repository and the [Project NOMAD repository](https://github.com/Crosstalk-Solutions/project-nomad). It names the author Vibe-Dragon, the MIT license, Copyright 2026, that these notes are updated when I get to it, and that I am not responsible if Turbo messes up an index.
 
@@ -421,7 +421,7 @@ The desktop icon runs `nomad-turbo toggle`. It opens or raises the window. It do
 
 - `nomad-turbo plan` prints the call size for the computer it is running on. It does not pause NOMAD or start containers.
 - `nomad-turbo status` prints whether indexing is running, or only the window is open.
-- `nomad-turbo stop` stops after the embed call that is already running.
+- `nomad-turbo stop` ends the embed that is already running and keeps the last article that was fully saved.
 - `nomad-turbo recover` puts the ingest policy back and resumes NOMAD embedding after a crash that left the queue paused. A repair delete that may still be running leaves embedding paused.
 
 ## Common log lines

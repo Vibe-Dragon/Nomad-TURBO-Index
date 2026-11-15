@@ -139,6 +139,9 @@ class ArticleFeed:
         self._open: list[PreparedArticle] = []
         self._vectors: list[list[list[float] | None]] = []
         self._claim: list[tuple[int, int]] = []
+        # Running totals. Adding an article must not walk every chunk already waiting.
+        self._waiting = 0
+        self._filled = 0
         # Kept after an article is emitted, so the row does not drop to zero
         # while that article is stored.
         self._last_progress = (0, 0)
@@ -146,20 +149,14 @@ class ArticleFeed:
     def add(self, prepared: PreparedArticle) -> None:
         if self._claim:
             raise RuntimeError("finish the open embed call before adding articles")
+        count = len(prepared.inputs)
         self._open.append(prepared)
-        self._vectors.append([None] * len(prepared.inputs))
+        self._vectors.append([None] * count)
+        self._waiting += count
         self._remember_progress()
 
-    def _count_vectors(self) -> tuple[int, int]:
-        done = 0
-        total = 0
-        for row in self._vectors:
-            total += len(row)
-            done += sum(vector is not None for vector in row)
-        return done, total
-
     def _remember_progress(self) -> None:
-        self._last_progress = self._count_vectors()
+        self._last_progress = (self._filled, self._filled + self._waiting)
 
     def vector_progress(self) -> tuple[int, int]:
         """Chunks that have vectors, and chunks still in the feed.
@@ -167,13 +164,13 @@ class ArticleFeed:
         After the article is emitted the last count is kept. The row can show
         that count until the stored article replaces it.
         """
-        done, total = self._count_vectors()
+        total = self._filled + self._waiting
         if total <= 0 and self._last_progress[1] > 0:
             return self._last_progress
-        return done, total
+        return self._filled, total
 
     def pending(self) -> int:
-        return sum(vector is None for row in self._vectors for vector in row)
+        return self._waiting
 
     def next_inputs(self, width: int) -> list[str]:
         if self._claim:
@@ -261,6 +258,7 @@ class ArticleFeed:
         section.payloads[payload_pos] = left
         section.payloads.insert(payload_pos + 1, right)
         self._vectors[item_index].insert(input_index + 1, None)
+        self._waiting += 1
         self._claim = []
         self._remember_progress()
         return "split", path
@@ -279,6 +277,7 @@ class ArticleFeed:
         del prepared.section_for_input[input_index]
         del section.payloads[payload_pos]
         del self._vectors[item_index][input_index]
+        self._waiting -= 1
         self._claim = []
         self._remember_progress()
         if not prepared.inputs and (prepared.article.get("skip") or "").strip() not in ("read", "parse"):
@@ -291,6 +290,9 @@ class ArticleFeed:
             raise RuntimeError(f"embedder returned {len(vectors)} vectors for {len(self._claim)} chunks")
         for (item_index, input_index), vector in zip(self._claim, vectors):
             self._vectors[item_index][input_index] = vector
+        moved = len(vectors)
+        self._waiting -= moved
+        self._filled += moved
         self._claim = []
         self._remember_progress()
         return self.drain_ready()
@@ -303,6 +305,7 @@ class ArticleFeed:
                 break
             prepared = self._open.pop(0)
             vectors = self._vectors.pop(0)
+            self._filled -= len(vectors)
             done.append((prepared, [vector for vector in vectors if vector is not None]))
         return done
 

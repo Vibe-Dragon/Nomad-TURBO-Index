@@ -1432,6 +1432,391 @@ class SpeedTest(unittest.TestCase):
         self.assertEqual(feed.pending(), 1)
         self.assertEqual(ahead.items, [])
 
+    def test_a_too_long_chunk_does_not_stack_the_next_batch(self):
+        import threading
+        import time
+        from concurrent.futures import ThreadPoolExecutor
+        from unittest import mock
+
+        from nomad_turbo.engine import FileWork, _Ahead, _embed_width
+        from nomad_turbo.packing import SectionDraft
+
+        width = 4
+
+        def prepared(index: int) -> PreparedArticle:
+            return PreparedArticle(
+                article={"index": index, "path": f"A/{index}"},
+                sections=[SectionDraft(meta={}, payloads=["alpha"])],
+                inputs=[DOCUMENT_PREFIX + "alpha"],
+                section_for_input=[0],
+            )
+
+        feed = ArticleFeed()
+        for index in range(width):
+            feed.add(prepared(index))
+        nxt = {"n": width}
+
+        def pull(_timeout):
+            number = nxt["n"]
+            nxt["n"] = number + 1
+            if number >= width * 2:
+                return None
+            return {
+                "title": "Next",
+                "path": f"N/{number}",
+                "index": number,
+                "sections": [{"heading": "", "text": "beta words", "level": 2}],
+            }
+
+        install = mock.Mock()
+        install.document_prefix = DOCUMENT_PREFIX
+        install.embed_model = "nomic"
+        pool = mock.Mock()
+        pool.urls = ["http://embed"]
+        work = FileWork(host=Path("a.zim"), kind="zim", source="/app/storage/zim/a.zim")
+        executor = ThreadPoolExecutor(max_workers=1)
+        ahead = _Ahead(pull, install, work, set(), None, threading.Event(), None, None, executor)
+
+        def reject_embed(_url, _model, _texts):
+            deadline = time.monotonic() + 2
+            while ahead.chunks() < width and time.monotonic() < deadline:
+                time.sleep(0.01)
+            raise ChunkRejected(0, "too long")
+
+        try:
+            with mock.patch("nomad_turbo.engine.embed", reject_embed), mock.patch(
+                "nomad_turbo.ocr_budget.note_embed"
+            ), mock.patch("nomad_turbo.ocr_budget.note_zim_embed_call"):
+                _embed_width(
+                    install,
+                    pool,
+                    work,
+                    None,
+                    feed,
+                    mock.Mock(),
+                    set(),
+                    threading.Event(),
+                    None,
+                    None,
+                    width,
+                    ahead,
+                )
+            self.assertEqual(feed.pending(), width + 1)
+            self.assertEqual(ahead.chunks(), width)
+            self.assertEqual([item.article["path"] for item in ahead.items], [f"N/{index}" for index in range(width, width * 2)])
+
+            def accept_embed(_url, _model, texts):
+                return [[0.1] for _text in texts]
+
+            with mock.patch("nomad_turbo.engine.embed", accept_embed), mock.patch(
+                "nomad_turbo.ocr_budget.note_embed"
+            ), mock.patch("nomad_turbo.ocr_budget.note_zim_embed_call"):
+                _embed_width(
+                    install,
+                    pool,
+                    work,
+                    None,
+                    feed,
+                    mock.Mock(),
+                    set(),
+                    threading.Event(),
+                    None,
+                    None,
+                    width,
+                    ahead,
+                )
+        finally:
+            executor.shutdown(wait=True, cancel_futures=False)
+        self.assertLessEqual(feed.pending(), width)
+        self.assertLessEqual(ahead.chunks(), width)
+        self.assertLessEqual(feed.pending() + ahead.chunks(), width * 2)
+
+    def test_stop_drops_the_embed_already_running(self):
+        import threading
+        import time
+        from concurrent.futures import ThreadPoolExecutor
+        from unittest import mock
+
+        from nomad_turbo.engine import FileWork, _Ahead, _embed_width
+        from nomad_turbo.packing import SectionDraft
+
+        def one_chunk(index: int, path: str) -> PreparedArticle:
+            return PreparedArticle(
+                article={"index": index, "path": path},
+                sections=[SectionDraft(meta={}, payloads=["alpha"])],
+                inputs=[DOCUMENT_PREFIX + "alpha"],
+                section_for_input=[0],
+            )
+
+        feed = ArticleFeed()
+        feed.add(one_chunk(1, "A"))
+        stop = threading.Event()
+        release = threading.Event()
+        dropped = []
+        gave = {"n": 0}
+
+        def fake_embed(_url, _model, _texts):
+            self.assertTrue(release.wait(2), "stop left the embed call running")
+            raise ConnectionError("connection reset")
+
+        def pull(_timeout):
+            gave["n"] += 1
+            if gave["n"] == 1:
+                return {
+                    "title": "Next",
+                    "path": "B",
+                    "index": 2,
+                    "sections": [{"heading": "", "text": "beta words", "level": 2}],
+                }
+            stop.set()
+            return None
+
+        def stop_all():
+            dropped.append(1)
+            release.set()
+
+        install = mock.Mock()
+        install.document_prefix = DOCUMENT_PREFIX
+        install.embed_model = "nomic"
+        pool = mock.Mock()
+        pool.urls = ["http://embed"]
+        pool.stop_all = stop_all
+        work = FileWork(host=Path("a.zim"), kind="zim", source="/app/storage/zim/a.zim")
+        executor = ThreadPoolExecutor(max_workers=1)
+        ahead = _Ahead(pull, install, work, set(), None, stop, None, None, executor)
+        started = time.monotonic()
+        try:
+            with mock.patch("nomad_turbo.engine.embed", fake_embed), mock.patch(
+                "nomad_turbo.ocr_budget.note_embed"
+            ), mock.patch("nomad_turbo.ocr_budget.note_zim_embed_call"):
+                with self.assertRaises(RuntimeError) as caught:
+                    _embed_width(
+                        install,
+                        pool,
+                        work,
+                        None,
+                        feed,
+                        mock.Mock(),
+                        set(),
+                        stop,
+                        None,
+                        None,
+                        4,
+                        ahead,
+                    )
+        finally:
+            release.set()
+            executor.shutdown(wait=True, cancel_futures=True)
+        self.assertLess(time.monotonic() - started, 2)
+        self.assertEqual(str(caught.exception), "stopped")
+        self.assertEqual(dropped, [1])
+        self.assertEqual(feed.pending(), 1)
+        self.assertEqual([item.article["path"] for item in ahead.items], ["B"])
+
+    def test_stop_keeps_the_next_batch_off_the_feed(self):
+        import threading
+        import time
+        from concurrent.futures import ThreadPoolExecutor
+        from unittest import mock
+
+        from nomad_turbo.engine import FileWork, _Ahead, _embed_width
+        from nomad_turbo.packing import SectionDraft
+
+        feed = ArticleFeed()
+        feed.add(
+            PreparedArticle(
+                article={"index": 1, "path": "A"},
+                sections=[SectionDraft(meta={}, payloads=["alpha"])],
+                inputs=[DOCUMENT_PREFIX + "alpha"],
+                section_for_input=[0],
+            )
+        )
+        stop = threading.Event()
+        release = threading.Event()
+        gave = {"n": 0}
+
+        def fake_embed(_url, _model, texts):
+            self.assertTrue(release.wait(2), "stop left the embed call running")
+            return [[0.1] for _text in texts]
+
+        def pull(_timeout):
+            gave["n"] += 1
+            if gave["n"] == 1:
+                return {
+                    "title": "Next",
+                    "path": "B",
+                    "index": 2,
+                    "sections": [{"heading": "", "text": "beta words", "level": 2}],
+                }
+            stop.set()
+            return None
+
+        install = mock.Mock()
+        install.document_prefix = DOCUMENT_PREFIX
+        install.embed_model = "nomic"
+        pool = mock.Mock()
+        pool.urls = ["http://embed"]
+        pool.stop_all = release.set
+        work = FileWork(host=Path("a.zim"), kind="zim", source="/app/storage/zim/a.zim")
+        executor = ThreadPoolExecutor(max_workers=1)
+        ahead = _Ahead(pull, install, work, set(), None, stop, None, None, executor)
+        pipe = mock.Mock()
+        started = time.monotonic()
+        try:
+            with mock.patch("nomad_turbo.engine.embed", fake_embed), mock.patch(
+                "nomad_turbo.ocr_budget.note_embed"
+            ), mock.patch("nomad_turbo.ocr_budget.note_zim_embed_call"):
+                _embed_width(
+                    install,
+                    pool,
+                    work,
+                    None,
+                    feed,
+                    pipe,
+                    set(),
+                    stop,
+                    None,
+                    None,
+                    4,
+                    ahead,
+                )
+        finally:
+            release.set()
+            executor.shutdown(wait=True, cancel_futures=True)
+        self.assertLess(time.monotonic() - started, 2)
+        self.assertEqual(pipe.submit.call_count, 1)
+        self.assertEqual(feed.pending(), 0)
+        self.assertEqual([item.article["path"] for item in ahead.items], ["B"])
+
+    def test_stop_does_not_wait_for_an_embed_that_keeps_running(self):
+        import threading
+        import time
+        from unittest import mock
+
+        from nomad_turbo.engine import FileWork, _consume_articles
+
+        stop = threading.Event()
+        release = threading.Event()
+        entered = threading.Event()
+        finished = threading.Event()
+        dropped = []
+
+        def fake_embed(_url, _model, texts):
+            entered.set()
+            release.wait(3)
+            finished.set()
+            return [[0.1] for _text in texts]
+
+        def stop_all():
+            dropped.append(1)
+
+        def pull(_timeout):
+            if pull.once:
+                pull.once = False
+                return {
+                    "title": "Page",
+                    "path": "A",
+                    "index": 1,
+                    "sections": [{"heading": "", "text": "alpha words", "level": 2}],
+                }
+            return None
+
+        pull.once = True
+
+        def trip():
+            if entered.wait(2):
+                stop.set()
+
+        threading.Thread(target=trip, daemon=True).start()
+        install = mock.Mock()
+        install.document_prefix = DOCUMENT_PREFIX
+        install.embed_model = "nomic"
+        pool = mock.Mock()
+        pool.urls = ["http://embed"]
+        pool.stop_all = stop_all
+        work = FileWork(host=Path("a.zim"), kind="zim", source="/app/storage/zim/a.zim")
+        started = time.monotonic()
+        try:
+            with mock.patch("nomad_turbo.engine._next_call_chunks", return_value=1), mock.patch(
+                "nomad_turbo.engine._STOP_EMBED_WAIT", 0.05
+            ), mock.patch("nomad_turbo.engine.embed", fake_embed), mock.patch(
+                "nomad_turbo.ocr_budget.note_embed"
+            ), mock.patch("nomad_turbo.ocr_budget.note_zim_embed_call"):
+                with self.assertRaises(RuntimeError) as caught:
+                    _consume_articles(install, pool, work, stop, None, set(), pull)
+        finally:
+            release.set()
+            finished.wait(2)
+        self.assertLess(time.monotonic() - started, 1.5)
+        self.assertEqual(str(caught.exception), "stopped")
+        self.assertEqual(dropped, [1])
+
+    def test_stop_leaves_the_rest_of_a_slice_unwritten(self):
+        import threading
+        from unittest import mock
+
+        from nomad_turbo.engine import FileWork, _store_ready
+        from nomad_turbo.packing import SectionDraft
+
+        stop = threading.Event()
+        calls = []
+
+        def fake_request(url, payload=None, timeout=60, method=None):
+            self.assertIn("/points?wait=true", url)
+            calls.append(payload["points"])
+            stop.set()
+            return {}
+
+        payloads = [f"chunk {index} words" for index in range(129)]
+        prepared = PreparedArticle(
+            article={"index": 1, "path": "A/1", "title": "T"},
+            sections=[
+                SectionDraft(
+                    meta={
+                        "source": "/app/storage/zim/a.zim",
+                        "article_path": "A/1",
+                        "section_title": "body",
+                        "full_title": "T",
+                        "article_title": "T",
+                        "active": True,
+                    },
+                    payloads=list(payloads),
+                )
+            ],
+            inputs=[DOCUMENT_PREFIX + text for text in payloads],
+            section_for_input=[0] * len(payloads),
+        )
+        install = mock.Mock()
+        install.dimension = 1
+        install.embed_model = "nomic"
+        install.qdrant_url = "http://127.0.0.1:9"
+        install.collection = "nomad_knowledge_base"
+        work = FileWork(host=Path("a.zim"), kind="zim", source="/app/storage/zim/a.zim")
+        checkpoints = []
+        original = store._request
+        store._request = fake_request
+        try:
+            with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+                os.environ, {"NOMAD_TURBO_STATE": tmp}
+            ), mock.patch("nomad_turbo.engine._wait_to_write", return_value=True), mock.patch(
+                "nomad_turbo.engine._write_checkpoint",
+                side_effect=lambda work: checkpoints.append(work.articles),
+            ):
+                with self.assertRaises(RuntimeError) as caught:
+                    _store_ready(
+                        install,
+                        work,
+                        set(),
+                        None,
+                        [(prepared, [[0.1] for _text in payloads])],
+                        stop,
+                    )
+        finally:
+            store._request = original
+        self.assertEqual(str(caught.exception), "stopped")
+        self.assertEqual([len(batch) for batch in calls], [128])
+        self.assertEqual(checkpoints, [])
+
     def test_upsert_sends_128_points_at_a_time(self):
         install = Install(
             admin_container="admin",
@@ -1724,6 +2109,28 @@ class EmbedRetryTest(unittest.TestCase):
         self.assertNotIsInstance(caught.exception, ChunkTimedOut)
         self.assertEqual(caught.exception.index, 2)
         self.assertIn("2048", caught.exception.detail)
+
+    def test_a_dropped_server_is_not_split_into_more_calls(self):
+        calls = []
+
+        def post(texts):
+            calls.append(list(texts))
+            raise RuntimeError_("embedder [Errno 111] Connection refused")
+
+        with self.assertRaises(RuntimeError_) as caught:
+            collect_embeddings(post, ["a", "b", "c", "d"], pause=lambda _seconds: None)
+        self.assertIn("connection refused", str(caught.exception).lower())
+        self.assertEqual(len(calls), 1)
+
+        calls.clear()
+
+        def one(_texts):
+            calls.append(1)
+            raise RuntimeError_("embedder [Errno 111] Connection refused")
+
+        with self.assertRaises(RuntimeError_):
+            collect_embeddings(one, ["only"], pause=lambda _seconds: None)
+        self.assertEqual(calls, [1])
 
 
 class _Node:

@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Moderate
+
+- Stop ends the embed that is already running. Articles already saved stay saved. A slice that was still being written is stored the next time that file runs, and those points keep the same ids. A chunk the embedder rejects no longer piles another full batch onto the waiting list, and adding an article does not recount every chunk already waiting. Reopen Turbo once so the open window uses this.
+
 ## 1.3.0
 
 ### Major

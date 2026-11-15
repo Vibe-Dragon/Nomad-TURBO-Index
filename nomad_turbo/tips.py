@@ -251,7 +251,7 @@ TIPS: dict[str, str] = {
     ),
     "start": "Pause NOMAD's file embedding and index from the saved place. This does not delete anything.",
     "stop": (
-        "Stop after the embed call that is already running. This does not delete the index. "
+        "Stop ends the embed that is already running and keeps the last article that was fully saved. This does not delete the index. "
         "When the run started on Manual, unfinished files are not handed back to stock NOMAD. "
         "The ingest policy returns to the value found at Start, except a half-finished file "
         "that started on Always stays Manual."
