@@ -644,7 +644,12 @@ class StallRefreshTest(unittest.TestCase):
             qdrant_ready=bool(reading.qdrant_ready),
             qdrant_attention=level,
             work_alive=bool(
-                facts.thread_alive or facts.delete_alive or facts.repair_alive or facts.repair_starting or facts.optimize_busy
+                facts.thread_alive
+                or facts.delete_alive
+                or facts.repair_alive
+                or facts.repair_starting
+                or facts.optimize_busy
+                or facts.qdrant_busy
             ),
         )
         self.assertEqual(app.qdrant_label.get_text(), reading.qdrant_text)

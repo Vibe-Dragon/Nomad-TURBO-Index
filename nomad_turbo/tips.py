@@ -1,4 +1,4 @@
-"""Plain-language tooltips for the Index and Repair pages.
+"""Plain-language tooltips for the Index, Repair, Qdrant, and Models pages.
 
 The window and the tests share this table, so the wording can be checked
 without opening a window. Each sentence describes what that control does.
@@ -367,5 +367,276 @@ TIPS: dict[str, str] = {
         "Waiting for an update means Qdrant will not run until Optimize stuck segments sends one. "
         "Not started means the click was refused and the reason is on the status line and in the log. "
         "Qdrant does not report a percent for a segment build."
+    ),
+    "qdrant_page": (
+        "How the knowledge-base collection stores vectors. "
+        "Distance stays cosine and each vector stays 768 numbers, which is what NOMAD search expects. "
+        "NOMAD can search and embed either way. It sends ordinary floats, and Qdrant converts them on the way in."
+    ),
+    "qdrant_storage": (
+        "Float32 stores each number in 4 bytes. Float16 stores it in 2 bytes, and search quality barely moves. "
+        "A newer Qdrant also offers Turbo16, Turbo8, and Turbo4. Those keep a compressed copy as the vector itself "
+        "and still accept an ordinary float on write. "
+        "uint8 is not listed. That type expects numbers from 0 to 255, and this embedder does not send those. "
+        "The storage type cannot be changed on a collection that already exists. "
+        "Apply deletes it and creates another, after you type DELETE. Points already stored are removed. "
+        "Library files stay. A later delete of the index creates the collection again with the type saved here."
+    ),
+    "qdrant_quant": (
+        "The quantization add-on keeps the original vectors and writes a 1-byte copy beside them. "
+        "The graph walk reads that smaller copy, including from disk, so that walk is faster, then scores the short result list "
+        "again with the original numbers. NOMAD still sends the same search request, and Qdrant does the faster walk itself. "
+        "Disk grows by about 768 bytes a point. Points stay. "
+        "The copy is built when Qdrant indexes a segment. "
+        "Qdrant rebuilds segments in the background, so indexing may pause. "
+        "With the vectors stored on disk, the int8 copy stays on disk too and is not pinned into RAM. "
+        "Search reads it from disk. In-RAM vector storage would pin that copy even when this says it is not."
+    ),
+    "qdrant_graph": (
+        "The HNSW graph is in memory unless this is on. On disk uses less RAM and makes a search a little slower. "
+        "Points stay. NOMAD does not care which place the graph lives. "
+        "Apply writes this now, on ahead of time or off at any time. "
+        "Qdrant rebuilds the graph in the background. "
+        "The place is stored with the collection, so a newer Qdrant keeps it."
+    ),
+    "qdrant_vectors": (
+        "Where the original vectors are stored. On disk keeps the int8 search copy on disk too, "
+        "so it is not pinned into RAM. In memory pins that copy even when quantization says it is not. "
+        "Apply writes this now, on ahead of time or off at any time. Points stay. "
+        "Qdrant rebuilds segments in the background. Search then reads the int8 copy from disk."
+    ),
+    "qdrant_vectors_auto": (
+        "On by default. Indexing moves the vectors to disk once spare memory cannot hold the int8 copy. "
+        "It does not move them back. "
+        "Turn this off to keep the vectors where you put them. "
+        "Vectors on disk still applies immediately. "
+        "Leaving this on and turning the vectors off lets indexing turn them on again when memory is short."
+    ),
+    "qdrant_graph_auto": (
+        "Off by default. The graph is small next to the int8 copy. "
+        "When this is on, indexing moves the graph to disk once spare memory cannot hold it. "
+        "It does not move the graph back. "
+        "Graph on disk still applies immediately. "
+        "Leaving this on and turning the graph off lets indexing turn it on again when memory is short."
+    ),
+    "qdrant_apply": (
+        "Write these choices. A storage-type change deletes the collection after you type DELETE, "
+        "then creates an empty one. Indexing does not start. "
+        "Quantization, where the vectors live, and the graph location change the live collection and keep the points."
+    ),
+    "models_page": (
+        "The models the assistant can talk with. "
+        "Pick one, change how it is named and how it answers, then Save. "
+        "The line under the title is how many are installed."
+    ),
+    "models_list": (
+        "Pick the model to look at. "
+        "The list follows the Order numbers. A smaller number is higher. "
+        "Models people can choose come first. "
+        "Hidden models, the tasks helper, and the benchmark sit at the bottom, still in their own number order."
+    ),
+    "models_refresh": (
+        "Read the installed models again. "
+        "Use this after a model is installed or deleted somewhere else. "
+        "Refresh does not change any settings."
+    ),
+    "models_detail": (
+        "The file's own name, how many parameters it has, how tightly it was packed, and how big it is on disk. "
+        "Q2_0 is a small pack and a little less exact. Q4 and Q8 are larger and closer to the original. "
+        "The menu name can be friendlier. This line stays the file's own name."
+    ),
+    "models_in_use": (
+        "Says when the assistant is set to this model right now. "
+        "Deleting it moves the assistant to the next model that is still shown."
+    ),
+    "models_name": (
+        "The words people see in the assistant's model menu. "
+        "The file's real name stays the same, so updates still find it. "
+        "Keep it short enough to read in the menu. At most 80 characters, on one line."
+    ),
+    "models_show": (
+        "On, people can pick this model in the assistant. "
+        "Off, it stays installed here and stays off that menu. "
+        "Hiding it leaves the file on disk. "
+        "The tasks helper and the benchmark stay off the assistant menu either way."
+    ),
+    "models_order": (
+        "Where this model sits. A smaller number is higher. 1 is the first model people see. "
+        "The assistant menu uses the same numbers. "
+        "Hidden models, the tasks helper, and the benchmark stay out of that menu. "
+        "On this page they sit at the bottom, still in their own number order."
+    ),
+    "models_chat": (
+        "A model people talk to. It can appear in the assistant menu when Show is on. "
+        "Use this for a normal chat model."
+    ),
+    "models_tasks": (
+        "The small helper that writes chat titles and short suggestions. People never pick it. "
+        "Only one model has this job, and it should stay small so it does not crowd the card. "
+        "A large model is refused. "
+        "Another model has to take this job before this one can return to chat."
+    ),
+    "models_job": (
+        "Chat is a model people talk to. Tasks is the small hidden helper for titles and suggestions. "
+        "Only one model is the helper. The benchmark stays on Llama 3.1 8B."
+    ),
+    "models_think": (
+        "Thinking is the model working through the question before it answers. "
+        "A careful answer takes longer. "
+        "Pick one. Chat decides follows the switch in the assistant. "
+        "On always thinks. Off answers right away. "
+        "A model that cannot think leaves these grey."
+    ),
+    "models_think_follow": (
+        "Chat decides means the thinking switch in the assistant controls this model. "
+        "Switch that on and this model thinks. Switch it off and this model answers right away. "
+        "This is the usual choice. "
+        "Someone who already turned thinking on or off for this model in their own browser keeps that choice."
+    ),
+    "models_think_on": (
+        "On means this model thinks before it answers, including when the assistant switch is off. "
+        "The answer is more careful. The wait is longer. "
+        "Someone who already turned thinking off for this model in their own browser keeps that until they switch it."
+    ),
+    "models_think_off": (
+        "Off means this model answers right away and skips the working-out, including when the assistant switch is on. "
+        "That is faster. The answer can be less careful. "
+        "Someone who already turned thinking on for this model in their own browser keeps that until they switch it."
+    ),
+    "models_photos": (
+        "Photos: yes means a picture sent to this model can be seen by it. "
+        "Photos: no means the model only reads text. "
+        "This comes with the file. A projector install is what adds pictures to a text file. "
+        "This page cannot switch it by itself."
+    ),
+    "models_tools": (
+        "Tools: yes means the model can call helpers, such as search, while it answers. "
+        "Tools: no means it only answers from the question. "
+        "This comes with the file. This page cannot switch it."
+    ),
+    "models_context": (
+        "How much of the conversation this model holds at once. "
+        "A bigger number remembers more of the chat and the library. It also uses more of the card, so a long chat can get slower or fail to load. "
+        "Three limits apply, and the smallest one wins. "
+        "The model has its own maximum. NOMAD has a cap, shown in the sentence. This page leaves that cap alone. "
+        "The card has to hold the weight file and the conversation together, and it keeps a spare fifth. "
+        "A bigger file leaves less room, so its list stops sooner. A small packed file can go higher. "
+        "Auto lets NOMAD pick. A number is saved on the model. "
+        "A number already saved above the fit can still appear in the list. NOMAD uses the smaller one. "
+        "A quiet card is unused conversation room. The room is taken when the chat fills up."
+    ),
+    "models_temperature": (
+        "How surprising the next word is. From 0 to 2. "
+        "A low number, such as 0.2, stays with the obvious wording. Answers stay steady, and they can get repetitive. "
+        "A higher number, such as 1.2, tries less likely words. Answers vary more, and they can wander or make things up. "
+        "Many chats sit near 0.7. "
+        "This is saved on the model and used when someone talks to it. Titles and suggestions ignore it. "
+        "An empty box leaves the current number as it is."
+    ),
+    "models_top_p": (
+        "How far down the likely words the model may look. From 0 to 1. "
+        "It lines the words up from most likely to least, then keeps going until their chances add up to this number. "
+        "A small number, such as 0.5, stays with the sure words. Answers sound confident, and they can be plain. "
+        "A high number, such as 0.95, lets in more unusual words. Answers can be richer, or less reliable. "
+        "1 keeps almost every word in play. "
+        "This is saved on the model. An empty box leaves the current number as it is."
+    ),
+    "models_top_k": (
+        "How many words are even allowed to be next. A whole number from 0 to 200. "
+        "20 means only the 20 most likely words can be chosen, which keeps answers on topic. "
+        "A larger number lets rarer words in. Answers can sound fresher, or drift off. "
+        "0 turns this limit off. "
+        "This is saved on the model. An empty box leaves the current number as it is."
+    ),
+    "models_min_p": (
+        "The smallest chance a word needs before it can be picked. From 0 to 1. "
+        "A higher number, such as 0.1, drops the weak words. Answers get tighter, and less playful. "
+        "0 lets even unlikely words through. Type 0 to turn that floor off. "
+        "An empty box does not mean 0. It leaves the current number as it is. "
+        "This is saved on the model."
+    ),
+    "models_advanced": (
+        "How the program reads this model's reply, including a thinking section when it has one. "
+        "Leave this closed unless a model card gives you the names. "
+        "A wrong name can scramble the answer. Empty leaves the current names in place. "
+        "A new file does not copy these from the model that is selected."
+    ),
+    "models_renderer": (
+        "How the model lays out its reply, including the thinking part when it has one. "
+        "The model maker names this. A wrong name can mix the scratch work into the answer. "
+        "Empty leaves the current name in place."
+    ),
+    "models_parser": (
+        "How the program splits the reply into the thinking part and the answer people read. "
+        "A wrong name can hide the answer or show the scratch work as the reply. "
+        "Empty leaves the current name in place."
+    ),
+    "models_save": (
+        "Writes the menu name, the order, Show, thinking, and the job. "
+        "Context, temperature, top p, top k, and min p are written when you changed them. "
+        "Those wait while indexing is running. The menu name can still be saved. "
+        "A save that only changes the menu does not load the model onto the card."
+    ),
+    "models_test": (
+        "Asks this model two short questions so you can see that it answers. "
+        "One is with thinking off. When the model can think, another is with thinking on. "
+        "The model is unloaded when the test ends, so the card is free again. "
+        "This waits while indexing is running."
+    ),
+    "models_delete": (
+        "Deletes this model from the disk after you confirm. The space comes back. "
+        "The embedding model, the benchmark, and the current tasks helper stay until another model takes the tasks job. "
+        "If people were chatting with this model, the assistant moves to the next one that is still shown. "
+        "This waits while indexing is running."
+    ),
+    "models_install": (
+        "Adds a model. Use a library tag to download one Ollama already knows, or pick a weight file from this computer. "
+        "Fill in one of those. "
+        "A library tag can update a model you already have. A file from disk needs a new name. "
+        "The size is shown before anything is downloaded, when it can be read. "
+        "This waits while indexing is running, because a download would share the card."
+    ),
+    "models_tag": (
+        "A name from the Ollama library, such as gemma4:12b. Install downloads that model. "
+        "The same name as one you already have updates that model and keeps its menu settings. "
+        "Leave this empty when the model is a file on disk."
+    ),
+    "models_gguf": (
+        "The model file on this computer. A GGUF is the packed weights Ollama runs. "
+        "Pick the file, or type its path. "
+        "Fill this in or a library tag, one of them. "
+        "A file from disk needs a new name that is not already installed."
+    ),
+    "models_gguf_browse": (
+        "Pick the GGUF weight file from this computer."
+    ),
+    "models_projector": (
+        "An optional second file that lets a text model look at pictures. "
+        "The GGUF is the model. The projector turns a photo into something that model can read. "
+        "The file is often named mmproj or projector, and it has to be the one published for this same model. "
+        "A matching projector is what turns Photos on. "
+        "A projector from a different model can load and then describe the picture badly. "
+        "Leave this empty for a text-only model, and when the library tag already includes pictures."
+    ),
+    "models_projector_browse": (
+        "Pick the projector file that matches the GGUF. This is the picture add-on, not the weights."
+    ),
+    "models_new_name": (
+        "The name Ollama will store a disk file under, such as my-model:27b. "
+        "It has to be a new name. Spaces and brackets are refused. "
+        "The friendly menu name is the other box, after the install. "
+        "A library download keeps the library tag as its name, so this box is for a GGUF."
+    ),
+    "models_fork": (
+        "Some packed files need a modified copy of Ollama. "
+        "Names with PQ2_0, PTQ1_0, or MTP are those files. "
+        "The usual Ollama will take the file and then run it wrong. "
+        "Check this only when this computer is already running that modified copy. "
+        "The install waits until the box is checked."
+    ),
+    "models_embed": (
+        "Indexing uses this small model to turn pages into search data. "
+        "It is not a chat model, so it is kept out of the list. "
+        "Replacing it would make the knowledge base that is already stored stop matching."
     ),
 }

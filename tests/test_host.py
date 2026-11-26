@@ -228,7 +228,20 @@ class HostReadingTest(unittest.TestCase):
         self.assertEqual(restored.host_width, 0)
         self.assertIsNone(restored.host_x)
         source = inspect.getsource(load_install)
-        for key in ("host_open", "host_x", "host_y", "host_width", "host_height", "index_order"):
+        for key in (
+            "host_open",
+            "host_x",
+            "host_y",
+            "host_width",
+            "host_height",
+            "index_order",
+            "qdrant_datatype",
+            "qdrant_quantization",
+            "qdrant_hnsw_on_disk",
+            "qdrant_graph_auto",
+            "qdrant_vectors_on_disk",
+            "qdrant_vectors_auto",
+        ):
             self.assertIn(f'"{key}"', source)
         for key in ("window_x", "window_y", "window_width", "window_height", "window_max"):
             self.assertIn(f'"{key}"', source)

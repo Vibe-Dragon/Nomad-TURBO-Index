@@ -1,5 +1,30 @@
 # Changelog
 
+## 1.3.3
+
+### Moderate
+
+- **Models** sits after Qdrant. It installs an Ollama library tag or a local GGUF, names the assistant menu, and sets thinking, context, and sampling for each model. A new model stays off the menu until Show is turned on. Install, test, and delete wait while indexing is running. A menu name can still be saved. Reopen Turbo once so the open window shows the page. A NOMAD update restores the stock menu until Turbo is opened again.
+
+### Minor
+
+- **Models** puts thinking on three buttons: Chat decides, On, and Off. Each button has its own tip. Chat decides follows the thinking switch in the assistant. The context sentence says the list stops at what fits beside the weight file. Reopen Turbo once so the open window shows this.
+- **Models** explains each control in a tooltip, including what temperature, top p, top k, min p, and a projector do to an answer. The model list follows the order numbers. Hidden models, the tasks helper, and the benchmark sit at the bottom. Reopen Turbo once so the open window shows this.
+- **Models** reads the model list with the request Ollama accepts. The page uses the width of the window: the model sits on the left and Install sits beside it. Empty lines stay hidden. Reopen Turbo once so the open window shows this.
+- A ZIM checkpoint keeps the dirent of the last saved page beside its path. The next time that file is opened, the reader seeks to that entry and checks the path. The archive stays open. A checkpoint that only has a path still walks forward once, and that walk records the dirent. Stop, then Start. The next Start loads this reader. The window can stay open.
+- The About page names Project NOMAD 1.35.2. The repository front page is the short landing page. The FAQ, the comparison with stock NOMAD, the window, the log, and Repair are their own pages.
+
+## 1.3.2
+
+### Moderate
+
+- **Qdrant** sits beside Settings. Opening the page reads the knowledge-base collection. Storage is Float32 or Float16. A Qdrant that reports 1.20 or newer also lists Turbo16, Turbo8, and Turbo4. uint8 is not offered. The quantization add-on and Graph on disk change the collection that is already there and keep the points. A storage-type change asks for DELETE, removes the collection, and creates an empty one. Indexing does not start, and ingest stays on Manual. Until Apply is pressed, deleting the index still creates Float32. Hover each control for what it does. Reopen Turbo once so the open window shows the page.
+
+### Minor
+
+- A segment with no status file is counted from the width of the stored vector. Float16 is two bytes a number, so that count stays the number of vectors.
+- The quantization tip says the graph walk is faster. NOMAD still sends the same search request, and Qdrant uses the smaller copy on its own. Reopen Turbo once so the open window shows that tip.
+
 ## 1.3.1
 
 ### Moderate

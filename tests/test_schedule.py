@@ -491,6 +491,17 @@ class OrderTest(unittest.TestCase):
             self.assertEqual(argv[script + 1], "--zim")
             self.assertNotIn("--max-old-space-size", argv)
             self.assertIn("--after-path", argv)
+            self.assertNotIn("--after-dirent", argv)
+            with mock.patch("nomad_turbo.runtime._remove_ours"), mock.patch(
+                "nomad_turbo.runtime.subprocess.Popen",
+                return_value=mock.Mock(),
+            ) as again:
+                start_extract(install, str(zim), 0, "A.html", 3, after_dirent=80)
+            sought = again.call_args.args[0]
+            path_at = sought.index("--after-path")
+            self.assertEqual(sought[path_at + 1], "A.html")
+            dirent_at = sought.index("--after-dirent")
+            self.assertEqual(sought[dirent_at + 1], "80")
 
     def test_the_engine_learns_one_zim_date_without_starting_extract(self):
         with tempfile.TemporaryDirectory() as tmp:

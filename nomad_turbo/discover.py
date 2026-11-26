@@ -92,6 +92,20 @@ class Install:
     # auto, cpu, or a card id such as nvidia:<uuid>. The OCR engine is not stored.
     index_device: str = "auto"
     ocr_device: str = "auto"
+    # Used when Turbo creates the collection. An existing collection keeps its
+    # own type until the Qdrant page rebuilds it. float32 matches a collection
+    # NOMAD creates itself.
+    qdrant_datatype: str = "float32"
+    qdrant_quantization: bool = False
+    qdrant_hnsw_on_disk: bool = False
+    # Off unless the user asks. The graph is small next to the int8 vector copy.
+    qdrant_graph_auto: bool = False
+    # Saved place of the original vectors. A quantized collection stores them
+    # on disk so the int8 copy is not pinned in RAM.
+    qdrant_vectors_on_disk: bool = False
+    # When true, indexing may move the vectors to disk if the int8 copy would
+    # not fit in spare RAM. It never moves them back.
+    qdrant_vectors_auto: bool = True
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2)
@@ -299,6 +313,12 @@ def load_install() -> Install:
         "ocr_every_pdf",
         "index_device",
         "ocr_device",
+        "qdrant_datatype",
+        "qdrant_quantization",
+        "qdrant_hnsw_on_disk",
+        "qdrant_graph_auto",
+        "qdrant_vectors_on_disk",
+        "qdrant_vectors_auto",
     ):
         setattr(found, key, getattr(saved, key))
     return found

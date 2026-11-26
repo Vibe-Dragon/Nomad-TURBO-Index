@@ -551,6 +551,7 @@ def _measure(install: Install, *, count_deleted: bool) -> SegmentFacts:
     best_count = 0
     best_deleted = 0
     saw_segment = False
+    vector_width = _vector_width(root)
     try:
         for shard in shards:
             if _dir_has_entry(shard / "temp_segments"):
@@ -562,7 +563,11 @@ def _measure(install: Install, *, count_deleted: bool) -> SegmentFacts:
                 if not segment.is_dir():
                     continue
                 saw_segment = True
-                described = _describe_segment(segment, count_deleted=count_deleted)
+                described = _describe_segment(
+                    segment,
+                    count_deleted=count_deleted,
+                    vector_width=vector_width,
+                )
                 if described is None:
                     # A segment we cannot classify might be the one past the cap.
                     return SegmentFacts(
@@ -643,8 +648,21 @@ def _dir_has_entry(path: Path) -> bool:
     return False
 
 
+def _vector_width(root: Path) -> int:
+    """Bytes of one stored vector. A missing config stays on the float32 width."""
+    from nomad_turbo.qdrant_settings import vector_bytes_from_config
+
+    path = root / "config.json"
+    try:
+        config = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return 3072
+    width = vector_bytes_from_config(config)
+    return width if width > 0 else 3072
+
+
 def _describe_segment(
-    segment: Path, *, count_deleted: bool
+    segment: Path, *, count_deleted: bool, vector_width: int = 3072
 ) -> tuple[str, int, int, int] | None:
     """Return kind, vector bytes, disk bytes, and vector count. None when the segment is unreadable."""
     info = _segment_index_type(segment / "segment.json")
@@ -653,8 +671,9 @@ def _describe_segment(
     vector_bytes = _vector_bytes(segment / "vector_storage" / "vectors")
     disk_bytes = _tree_bytes(segment)
     vector_count = _vector_count(segment / "vector_storage" / "vectors" / "status.dat")
+    width = vector_width if vector_width > 0 else 3072
     if vector_count is None and vector_bytes > 0:
-        vector_count = vector_bytes // 3072
+        vector_count = vector_bytes // width
     if vector_count is None:
         vector_count = 0
     fully_deleted = False

@@ -660,6 +660,7 @@ def start_extract(
     after_path: str | None,
     index_start: int,
     *,
+    after_dirent: int | None = None,
     quality: str | None = None,
     spill_id: str | None = None,
     zim_pass: str | None = None,
@@ -717,6 +718,8 @@ def start_extract(
     ]
     if after_path:
         command += ["--after-path", after_path]
+    if after_path and isinstance(after_dirent, int) and not isinstance(after_dirent, bool) and after_dirent >= 0:
+        command += ["--after-dirent", str(after_dirent)]
     if quality:
         command += ["--quality", normalize_ocr_quality(quality)]
     if spill_id:

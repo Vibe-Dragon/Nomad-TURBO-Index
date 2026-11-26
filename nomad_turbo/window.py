@@ -108,7 +108,7 @@ log = logging.getLogger("nomad_turbo")
 REPO_URL = "https://github.com/Vibe-Dragon/Nomad-TURBO-Index"
 NOMAD_REPO_URL = "https://github.com/Crosstalk-Solutions/project-nomad"
 # The README's tested-version sentence uses this same fact.
-TESTED_NOMAD_VERSION = "1.35.1"
+TESTED_NOMAD_VERSION = "1.35.2"
 
 
 def about_facts() -> dict[str, str]:
@@ -455,6 +455,11 @@ def open_window() -> int:
     signal.signal(signal.SIGTERM, app.on_signal)
     signal.signal(signal.SIGINT, app.on_signal)
     signal.signal(signal.SIGUSR1, app.on_raise)
+    # Tests build a window and never call this. The menu is written only when the app opens.
+    try:
+        app.model_page.repair_menu_async()
+    except Exception:
+        log.exception("chat menu")
     # Opening the window does not start indexing. The desktop icon stays the app icon.
     write_shortcut(False)
     try:
@@ -613,6 +618,7 @@ class _Window:
         self.glib = glib
         self.thread: threading.Thread | None = None
         self.delete_thread: threading.Thread | None = None
+        self.qdrant_thread: threading.Thread | None = None
         self.repair_thread: threading.Thread | None = None
         self.optimize_thread: threading.Thread | None = None
         self.optimize_starting = False
@@ -1037,6 +1043,8 @@ class _Window:
         index.pack_start(self.index_controls, False, False, 0)
         self._build_repair_page(headed)
         self._build_settings_page()
+        self._build_qdrant_page()
+        self._build_model_page()
         self._build_about_page()
 
         self.error_check = gtk.ToggleButton(label="Errors")
@@ -1348,7 +1356,8 @@ class _Window:
         indexing = self.thread is not None and self.thread.is_alive()
         deleting = self.delete_thread is not None and self.delete_thread.is_alive()
         repairing = self.repair_thread is not None and self.repair_thread.is_alive()
-        return indexing or deleting or repairing or self.repair_starting or self._optimize_busy()
+        qdrant = self.qdrant_thread is not None and self.qdrant_thread.is_alive()
+        return indexing or deleting or repairing or qdrant or self.repair_starting or self._optimize_busy()
 
     def on_raise(self, _signum, _frame) -> None:
         self.raise_requested = True
@@ -2309,6 +2318,7 @@ class _Window:
                 getattr(self, "log_filters", None),
                 getattr(self, "log_export_group", None),
                 getattr(self, "settings_page", None),
+                getattr(self, "models_page", None),
             )
         ]
         # A hidden page still sets the stack's minimum. Settings is wider than
@@ -3375,12 +3385,14 @@ class _Window:
         import nomad_turbo.schedule as schedule
         import nomad_turbo.session as session_mod
         import nomad_turbo.slots as slots
+        import nomad_turbo.qdrant_settings as qdrant_settings
         import nomad_turbo.store as store
         import nomad_turbo.zimdocs as zimdocs
 
         importlib.reload(slots)
         importlib.reload(discover)
         importlib.reload(session_mod)
+        importlib.reload(qdrant_settings)
         importlib.reload(store)
         importlib.reload(runtime)
         importlib.reload(zimdocs)
@@ -4190,6 +4202,7 @@ class _Window:
                 or facts.repair_alive
                 or facts.repair_starting
                 or facts.optimize_busy
+                or facts.qdrant_busy
             )
         level = qdrant_level(
             text,
@@ -4876,6 +4889,412 @@ class _Window:
         self.index_combo.connect("changed", self.on_device_card, "index")
         self.ocr_combo.connect("changed", self.on_device_card, "ocr")
         threading.Thread(target=self._load_ocr_probe, name="nomad-turbo-ocr-probe", daemon=True).start()
+
+    def _build_qdrant_page(self) -> None:
+        """Storage type, the quantization add-on, and where the graph lives."""
+        from nomad_turbo.qdrant_settings import storage_label
+
+        gtk = self.gtk
+        page = gtk.Box(orientation=gtk.Orientation.VERTICAL, spacing=8)
+        page.set_vexpand(True)
+        scroll = gtk.ScrolledWindow()
+        scroll.set_policy(gtk.PolicyType.NEVER, gtk.PolicyType.AUTOMATIC)
+        inner = gtk.Box(orientation=gtk.Orientation.VERTICAL, spacing=12)
+        inner.set_margin_top(4)
+        inner.set_margin_bottom(8)
+        heading = gtk.Label()
+        heading.set_markup("<span size='large' weight='bold'>Qdrant settings</span>")
+        heading.set_xalign(0)
+        heading.set_tooltip_text(TIPS["qdrant_page"])
+        inner.pack_start(heading, False, False, 0)
+
+        self._qdrant_guard = False
+        self._qdrant_load = 0
+        self._qdrant_error = ""
+        self._qdrant_view = {
+            "ok": False,
+            "loaded": False,
+            "present": False,
+            "choices": ("float32", "float16"),
+            "datatype": "float32",
+            "quantization": False,
+            "hnsw_on_disk": False,
+            "points": 0,
+            "version": "",
+            "error": None,
+        }
+        self.qdrant_settings_status = gtk.Label(label="The collection is read when this page is opened.")
+        self.qdrant_settings_status.set_xalign(0)
+        self.qdrant_settings_status.set_line_wrap(True)
+        self.qdrant_settings_status.set_max_width_chars(80)
+        self.qdrant_settings_status.set_selectable(True)
+        self.qdrant_settings_status.set_tooltip_text(TIPS["qdrant_page"])
+        inner.pack_start(self.qdrant_settings_status, False, False, 0)
+
+        storage_caption = gtk.Label(label="Storage")
+        storage_caption.set_tooltip_text(TIPS["qdrant_storage"])
+        storage_caption.set_valign(gtk.Align.CENTER)
+        self.qdrant_storage = gtk.ComboBoxText()
+        self.qdrant_storage.set_tooltip_text(TIPS["qdrant_storage"])
+        self.qdrant_storage.set_valign(gtk.Align.CENTER)
+        for key in ("float32", "float16"):
+            self.qdrant_storage.append(key, storage_label(key))
+        self.qdrant_storage.set_active_id("float32")
+        self.qdrant_storage.connect("changed", self.on_qdrant_choice)
+        storage_row = gtk.Box(orientation=gtk.Orientation.HORIZONTAL, spacing=8)
+        storage_row.pack_start(storage_caption, False, False, 0)
+        storage_row.pack_start(self.qdrant_storage, False, False, 0)
+        inner.pack_start(storage_row, False, False, 0)
+
+        self.qdrant_quant = gtk.ToggleButton(label="Quantization add-on")
+        self.qdrant_quant.set_halign(gtk.Align.START)
+        self.qdrant_quant.set_tooltip_text(TIPS["qdrant_quant"])
+        self.qdrant_quant.connect("toggled", self.on_qdrant_choice)
+        inner.pack_start(self.qdrant_quant, False, False, 0)
+
+        self.qdrant_vectors_disk = gtk.ToggleButton(label="Vectors on disk")
+        self.qdrant_vectors_disk.set_halign(gtk.Align.START)
+        self.qdrant_vectors_disk.set_tooltip_text(TIPS["qdrant_vectors"])
+        self.qdrant_vectors_disk.connect("toggled", self.on_qdrant_choice)
+        inner.pack_start(self.qdrant_vectors_disk, False, False, 0)
+
+        self.qdrant_vectors_auto = gtk.ToggleButton(label="Automatic")
+        self.qdrant_vectors_auto.set_halign(gtk.Align.START)
+        self.qdrant_vectors_auto.set_active(bool(self.install.qdrant_vectors_auto))
+        self.qdrant_vectors_auto.set_tooltip_text(TIPS["qdrant_vectors_auto"])
+        self.qdrant_vectors_auto.connect("toggled", self.on_qdrant_choice)
+        inner.pack_start(self.qdrant_vectors_auto, False, False, 0)
+
+        self.qdrant_graph = gtk.ToggleButton(label="Graph on disk")
+        self.qdrant_graph.set_halign(gtk.Align.START)
+        self.qdrant_graph.set_tooltip_text(TIPS["qdrant_graph"])
+        self.qdrant_graph.connect("toggled", self.on_qdrant_choice)
+        inner.pack_start(self.qdrant_graph, False, False, 0)
+
+        self.qdrant_graph_auto = gtk.ToggleButton(label="Graph automatic")
+        self.qdrant_graph_auto.set_halign(gtk.Align.START)
+        self.qdrant_graph_auto.set_active(bool(self.install.qdrant_graph_auto))
+        self.qdrant_graph_auto.set_tooltip_text(TIPS["qdrant_graph_auto"])
+        self.qdrant_graph_auto.connect("toggled", self.on_qdrant_choice)
+        inner.pack_start(self.qdrant_graph_auto, False, False, 0)
+
+        self.qdrant_apply = gtk.Button(label="Apply")
+        self.qdrant_apply.set_halign(gtk.Align.START)
+        self.qdrant_apply.set_sensitive(False)
+        self.qdrant_apply.set_tooltip_text(TIPS["qdrant_apply"])
+        self.qdrant_apply.connect("clicked", self.on_qdrant_apply)
+        inner.pack_start(self.qdrant_apply, False, False, 0)
+
+        self.qdrant_apply_note = gtk.Label(label="")
+        self.qdrant_apply_note.set_xalign(0)
+        self.qdrant_apply_note.set_line_wrap(True)
+        self.qdrant_apply_note.set_max_width_chars(80)
+        self.qdrant_apply_note.set_selectable(True)
+        self.qdrant_apply_note.set_tooltip_text(TIPS["qdrant_apply"])
+        inner.pack_start(self.qdrant_apply_note, False, False, 0)
+
+        scroll.add(inner)
+        page.pack_start(scroll, True, True, 0)
+        self.stack.add_titled(page, "qdrant", "Qdrant")
+        self.qdrant_page = page
+        self.stack.connect("notify::visible-child-name", self.on_qdrant_page)
+
+    def _build_model_page(self) -> None:
+        """Install and name the models the assistant menu offers."""
+        from nomad_turbo.model_page import ModelPage
+
+        self.model_page = ModelPage(self.install, self.session, self.gtk, self.glib, self.window)
+        self.models_page = self.model_page.widget
+        self.stack.add_titled(self.model_page.widget, "models", "Models")
+        self.stack.connect("notify::visible-child-name", self.model_page.on_visible)
+
+    def on_qdrant_page(self, stack, *_args) -> None:
+        if stack.get_visible_child_name() != "qdrant":
+            return
+        self._refresh_qdrant_page()
+
+    def on_qdrant_choice(self, *_args) -> None:
+        if self._qdrant_guard:
+            return
+        self._paint_qdrant_note()
+
+    def _qdrant_form(self) -> tuple[str, bool, bool, bool, bool, bool]:
+        datatype = self.qdrant_storage.get_active_id() or "float32"
+        return (
+            datatype,
+            bool(self.qdrant_quant.get_active()),
+            bool(self.qdrant_vectors_disk.get_active()),
+            bool(self.qdrant_graph.get_active()),
+            bool(self.qdrant_vectors_auto.get_active()),
+            bool(self.qdrant_graph_auto.get_active()),
+        )
+
+    def _paint_qdrant_note(self) -> None:
+        from nomad_turbo.qdrant_settings import apply_note, apply_plan, status_text
+
+        view = self._qdrant_view
+        self.qdrant_settings_status.set_text(status_text(view, self.install.collection))
+        if not view.get("loaded") or not view.get("ok"):
+            self.qdrant_apply_note.set_text("")
+            self.qdrant_apply.set_sensitive(False)
+            return
+        datatype, quant, vectors, graph, vectors_auto, graph_auto = self._qdrant_form()
+        plan = apply_plan(view, datatype, quant, graph, vectors)
+        busy = self._work_alive()
+        note = apply_note(plan, datatype, int(view.get("points") or 0), busy=busy)
+        autos_changed = bool(vectors_auto) != bool(self.install.qdrant_vectors_auto) or bool(graph_auto) != bool(
+            self.install.qdrant_graph_auto
+        )
+        if plan == "none" and autos_changed:
+            note = "Apply saves automatic. The collection is left as it is."
+        self.qdrant_apply_note.set_text(note)
+        blocked = self._qdrant_writing() or (plan == "rebuild" and busy)
+        self.qdrant_apply.set_sensitive(not blocked)
+
+    def _refresh_qdrant_page(self) -> None:
+        self._qdrant_load += 1
+        token = self._qdrant_load
+        threading.Thread(
+            target=self._load_qdrant_page,
+            args=(token,),
+            name="nomad-turbo-qdrant-read",
+            daemon=True,
+        ).start()
+
+    def _load_qdrant_page(self, token: int) -> None:
+        from nomad_turbo import store
+
+        try:
+            view = store.read_collection_view(self.install)
+        except Exception as exc:
+            log.exception("could not read qdrant settings")
+            view = {"ok": False, "loaded": True, "present": False, "error": str(exc), "choices": ("float32", "float16")}
+        self.glib.idle_add(self._show_qdrant_page, token, view)
+
+    def _show_qdrant_page(self, token: int, view: dict) -> bool:
+        from nomad_turbo.qdrant_settings import storage_label
+
+        if token != self._qdrant_load:
+            return False
+        self._qdrant_view = view
+        self._qdrant_guard = True
+        try:
+            choices = tuple(view.get("choices") or ("float32", "float16"))
+            datatype = str(view.get("datatype") or "float32")
+            shown = list(choices)
+            if datatype not in shown:
+                shown.append(datatype)
+            self.qdrant_storage.remove_all()
+            for key in shown:
+                self.qdrant_storage.append(key, storage_label(key))
+            self.qdrant_storage.set_active_id(datatype)
+            self.qdrant_quant.set_active(bool(view.get("quantization")))
+            self.qdrant_vectors_disk.set_active(bool(view.get("vectors_on_disk")))
+            self.qdrant_graph.set_active(bool(view.get("hnsw_on_disk")))
+            self.qdrant_vectors_auto.set_active(bool(self.install.qdrant_vectors_auto))
+            self.qdrant_graph_auto.set_active(bool(self.install.qdrant_graph_auto))
+        finally:
+            self._qdrant_guard = False
+        writing = self._qdrant_writing()
+        self.qdrant_storage.set_sensitive(not writing)
+        self.qdrant_quant.set_sensitive(not writing)
+        self.qdrant_vectors_disk.set_sensitive(not writing)
+        self.qdrant_vectors_auto.set_sensitive(not writing)
+        self.qdrant_graph.set_sensitive(not writing)
+        self.qdrant_graph_auto.set_sensitive(not writing)
+        self._paint_qdrant_note()
+        error = getattr(self, "_qdrant_error", "")
+        if error:
+            self.qdrant_apply_note.set_text(error)
+            self._qdrant_error = ""
+        return False
+
+    def _qdrant_writing(self) -> bool:
+        delete = self.delete_thread is not None and self.delete_thread.is_alive()
+        writing = self.qdrant_thread is not None and self.qdrant_thread.is_alive()
+        return delete or writing
+
+    def on_qdrant_apply(self, *_args) -> None:
+        from nomad_turbo.qdrant_settings import accepted_datatype, apply_plan, changed_options, rebuild_warning
+
+        view = self._qdrant_view
+        if not view.get("ok") or self._qdrant_writing():
+            return
+        datatype, quant, vectors, graph, vectors_auto, graph_auto = self._qdrant_form()
+        try:
+            datatype = accepted_datatype(datatype, tuple(view.get("choices") or ("float32", "float16")))
+        except ValueError as exc:
+            self.qdrant_apply_note.set_text(str(exc))
+            return
+        plan = apply_plan(view, datatype, quant, graph, vectors)
+        if plan == "none":
+            self._save_qdrant_pref(datatype, quant, vectors, graph, vectors_auto, graph_auto)
+            self._paint_qdrant_note()
+            return
+        if plan == "rebuild":
+            if self._work_alive():
+                self._paint_qdrant_note()
+                return
+            title, body = rebuild_warning(int(view.get("points") or 0), datatype)
+            if not self._confirm_delete(title, body):
+                return
+            previous = (
+                self.install.qdrant_datatype,
+                bool(self.install.qdrant_quantization),
+                bool(self.install.qdrant_vectors_on_disk),
+                bool(self.install.qdrant_hnsw_on_disk),
+                bool(self.install.qdrant_vectors_auto),
+                bool(self.install.qdrant_graph_auto),
+            )
+            self._save_qdrant_pref(datatype, quant, vectors, graph, vectors_auto, graph_auto)
+            self.session.stop.clear()
+            self.qdrant_storage.set_sensitive(False)
+            self.qdrant_quant.set_sensitive(False)
+            self.qdrant_vectors_disk.set_sensitive(False)
+            self.qdrant_vectors_auto.set_sensitive(False)
+            self.qdrant_graph.set_sensitive(False)
+            self.qdrant_graph_auto.set_sensitive(False)
+            self.qdrant_apply.set_sensitive(False)
+            self.delete_thread = threading.Thread(
+                target=self._qdrant_rebuild,
+                args=(previous,),
+                name="nomad-turbo-qdrant",
+            )
+            self.delete_thread.start()
+            return
+        self.qdrant_storage.set_sensitive(False)
+        self.qdrant_quant.set_sensitive(False)
+        self.qdrant_vectors_disk.set_sensitive(False)
+        self.qdrant_vectors_auto.set_sensitive(False)
+        self.qdrant_graph.set_sensitive(False)
+        self.qdrant_graph_auto.set_sensitive(False)
+        self.qdrant_apply.set_sensitive(False)
+        changes = changed_options(view, quant, graph, vectors)
+        self.qdrant_thread = threading.Thread(
+            target=self._qdrant_write,
+            args=(plan, datatype, quant, vectors, graph, vectors_auto, graph_auto, changes),
+            name="nomad-turbo-qdrant",
+        )
+        self.qdrant_thread.start()
+
+    def _confirm_delete(self, title: str, body: str) -> bool:
+        gtk = self.gtk
+        dialog = gtk.MessageDialog(
+            parent=self.window,
+            flags=0,
+            message_type=gtk.MessageType.WARNING,
+            buttons=gtk.ButtonsType.NONE,
+            text=title,
+        )
+        dialog.format_secondary_text(body)
+        entry = gtk.Entry()
+        dialog.get_content_area().add(entry)
+        dialog.add_button("Cancel", gtk.ResponseType.CANCEL)
+        confirm = dialog.add_button("Delete", gtk.ResponseType.OK)
+        confirm.set_sensitive(False)
+        entry.connect("changed", lambda widget: confirm.set_sensitive(wipe_phrase_ok(widget.get_text())))
+        dialog.show_all()
+        response = dialog.run()
+        typed = entry.get_text()
+        dialog.destroy()
+        return response == gtk.ResponseType.OK and wipe_phrase_ok(typed)
+
+    def _save_qdrant_pref(
+        self,
+        datatype: str,
+        quant: bool,
+        vectors: bool,
+        graph: bool,
+        vectors_auto: bool,
+        graph_auto: bool,
+    ) -> None:
+        self.install.qdrant_datatype = datatype
+        self.install.qdrant_quantization = bool(quant)
+        self.install.qdrant_vectors_on_disk = bool(vectors)
+        self.install.qdrant_hnsw_on_disk = bool(graph)
+        self.install.qdrant_vectors_auto = bool(vectors_auto)
+        self.install.qdrant_graph_auto = bool(graph_auto)
+        try:
+            save_install(self.install)
+        except Exception:
+            log.exception("could not save the qdrant settings")
+
+    def _qdrant_rebuild(self, previous: tuple) -> None:
+        try:
+            engine = self._reload_indexer()
+            engine.delete_index_only(self.session.stop, session=self.session)
+        except Exception as exc:
+            log.exception("qdrant storage change failed")
+            self._save_qdrant_pref(*previous)
+            self.glib.idle_add(self._qdrant_finished, str(exc))
+            return
+        note = ""
+        try:
+            note = str(self.session.view().get("note") or "")
+        except Exception:
+            note = ""
+        if "not removed" in note:
+            self._save_qdrant_pref(*previous)
+        self.glib.idle_add(self._qdrant_finished, "")
+
+    def _qdrant_write(
+        self,
+        plan: str,
+        datatype: str,
+        quant: bool,
+        vectors: bool,
+        graph: bool,
+        vectors_auto: bool,
+        graph_auto: bool,
+        changes: dict,
+    ) -> None:
+        from nomad_turbo import store
+
+        previous = (
+            self.install.qdrant_datatype,
+            bool(self.install.qdrant_quantization),
+            bool(self.install.qdrant_vectors_on_disk),
+            bool(self.install.qdrant_hnsw_on_disk),
+            bool(self.install.qdrant_vectors_auto),
+            bool(self.install.qdrant_graph_auto),
+        )
+        try:
+            self.install.qdrant_datatype = datatype
+            self.install.qdrant_quantization = bool(quant)
+            self.install.qdrant_vectors_on_disk = bool(vectors)
+            self.install.qdrant_hnsw_on_disk = bool(graph)
+            self.install.qdrant_vectors_auto = bool(vectors_auto)
+            self.install.qdrant_graph_auto = bool(graph_auto)
+            if plan == "create":
+                store.collection_ready(self.install)
+            else:
+                store.update_collection_options(
+                    self.install,
+                    quantization=changes.get("quantization") if "quantization" in changes else None,
+                    hnsw_on_disk=changes.get("hnsw_on_disk") if "hnsw_on_disk" in changes else None,
+                    vectors_on_disk=changes.get("vectors_on_disk") if "vectors_on_disk" in changes else None,
+                )
+            save_install(self.install)
+        except Exception as exc:
+            log.exception("qdrant settings were not written")
+            (
+                self.install.qdrant_datatype,
+                self.install.qdrant_quantization,
+                self.install.qdrant_vectors_on_disk,
+                self.install.qdrant_hnsw_on_disk,
+                self.install.qdrant_vectors_auto,
+                self.install.qdrant_graph_auto,
+            ) = previous
+            self.glib.idle_add(self._qdrant_finished, str(exc))
+            return
+        self.glib.idle_add(self._qdrant_finished, "")
+
+    def _qdrant_finished(self, error: str) -> bool:
+        # The refresh paints the live plan over the note. Keep this failure
+        # until that paint has run, then show it once.
+        self._qdrant_error = str(error or "")
+        self._refresh_qdrant_page()
+        return False
 
     def _device_block(self, title, tip, cpu, gpu, combo):
         gtk = self.gtk

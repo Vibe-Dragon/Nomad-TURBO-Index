@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import re
 import subprocess
 import threading
 import time
@@ -108,6 +109,41 @@ def set_policy(install: Install, policy: str) -> None:
         f"VALUES ('rag.defaultIngestPolicy', '{policy}', NOW(), NOW()) "
         "ON DUPLICATE KEY UPDATE value=VALUES(value), updated_at=NOW();\n",
     )
+
+
+# The Models page reads the cap. It writes the tasks model, and the assistant's
+# last model only after the selected model was deleted.
+_KV_READ = re.compile(r"^[A-Za-z0-9._]+$")
+_KV_WRITE = frozenset({"ai.tasksModel", "chat.lastModel"})
+
+
+def kv_read_statement(key: str) -> str:
+    if not _KV_READ.fullmatch(key or ""):
+        raise StoreError(f"refusing key {key}")
+    return f"SELECT value FROM kv_store WHERE `key`='{key}';\n"
+
+
+def kv_write_statement(key: str, value: str) -> str:
+    if key not in _KV_WRITE:
+        raise StoreError(f"refusing key {key}")
+    if any(char in value for char in ("\n", "\r", "\x00")):
+        raise StoreError("refusing a value with a newline")
+    return (
+        "INSERT INTO kv_store (`key`, value, created_at, updated_at) "
+        f"VALUES ('{key}', {quote(value)}, NOW(), NOW()) "
+        "ON DUPLICATE KEY UPDATE value=VALUES(value), updated_at=NOW();\n"
+    )
+
+
+def get_kv(install: Install, key: str) -> str | None:
+    rows = _sql(install, kv_read_statement(key)).strip()
+    if not rows:
+        return None
+    return rows.splitlines()[-1]
+
+
+def set_kv(install: Install, key: str, value: str) -> None:
+    _sql(install, kv_write_statement(key, value))
 
 
 def active_from_cell(cell: str | None) -> bool:
@@ -356,6 +392,241 @@ def _health_ok(base: str) -> bool:
         return False
 
 
+def read_collection_view(install: Install) -> dict:
+    """The settings page's picture of Qdrant. A missing collection is not an error."""
+    from nomad_turbo.qdrant_settings import (
+        canonical_datatype,
+        parse_version,
+        snapshot_from_info,
+        storage_choices,
+    )
+
+    base = install.qdrant_url.rstrip("/")
+    version_text = ""
+    try:
+        root = _request(f"{base}/", timeout=5)
+        version_text = str(root.get("version") or "")
+    except StoreError as exc:
+        return {
+            "ok": False,
+            "loaded": True,
+            "present": False,
+            "error": str(exc),
+            "version": "",
+            "choices": storage_choices(None),
+            "datatype": canonical_datatype(getattr(install, "qdrant_datatype", "float32")),
+            "quantization": bool(getattr(install, "qdrant_quantization", False)),
+            "hnsw_on_disk": bool(getattr(install, "qdrant_hnsw_on_disk", False)),
+            "points": 0,
+        }
+    choices = storage_choices(parse_version(version_text))
+    saved_type = canonical_datatype(getattr(install, "qdrant_datatype", "float32"))
+    if saved_type not in choices:
+        saved_type = "float32"
+    try:
+        info = _request(f"{base}/collections/{install.collection}", timeout=8)
+    except StoreError as exc:
+        if "404" not in str(exc):
+            return {
+                "ok": False,
+                "loaded": True,
+                "present": False,
+                "error": str(exc),
+                "version": version_text,
+                "choices": choices,
+                "datatype": saved_type,
+                "quantization": bool(getattr(install, "qdrant_quantization", False)),
+                "hnsw_on_disk": bool(getattr(install, "qdrant_hnsw_on_disk", False)),
+                "points": 0,
+            }
+        return {
+            "ok": True,
+            "loaded": True,
+            "present": False,
+            "error": None,
+            "version": version_text,
+            "choices": choices,
+            "datatype": saved_type,
+            "quantization": bool(getattr(install, "qdrant_quantization", False)),
+            "hnsw_on_disk": bool(getattr(install, "qdrant_hnsw_on_disk", False)),
+            "points": 0,
+            "distance": "Cosine",
+            "size": int(install.dimension),
+        }
+    view = snapshot_from_info(info.get("result"))
+    view.update(
+        ok=True,
+        loaded=True,
+        error=None,
+        version=version_text,
+        choices=choices,
+    )
+    return view
+
+
+# One collection read per minute. The graph grows much slower than that.
+_graph_auto_lock = threading.Lock()
+_graph_auto_checked = 0.0
+GRAPH_AUTO_INTERVAL = 60.0
+
+
+def consider_graph_auto(install: Install) -> bool:
+    """Move the graph to disk when automatic is on and RAM cannot hold it.
+
+    Returns True when a patch was sent. Never moves the graph back to memory.
+    A read or a decision that says no waits out the interval. Automatic off
+    does not. A patch also saves the on-disk preference so a recreated
+    collection matches.
+    """
+    if not bool(getattr(install, "qdrant_graph_auto", False)):
+        return False
+    global _graph_auto_checked
+    now = time.time()
+    with _graph_auto_lock:
+        if now - _graph_auto_checked < GRAPH_AUTO_INTERVAL:
+            return False
+        _graph_auto_checked = now
+    try:
+        view = read_collection_view(install)
+    except Exception:
+        log.exception("could not read the collection while checking the graph")
+        return False
+    if not view.get("ok") or not view.get("present") or view.get("hnsw_on_disk"):
+        return False
+    from nomad_turbo.qdrant_settings import graph_auto_wants_disk
+    from nomad_turbo.segment_guard import _spare_ram_bytes
+
+    points = int(view.get("points") or 0)
+    if not graph_auto_wants_disk(
+        automatic=True,
+        on_disk=False,
+        points=points,
+        spare_ram_bytes=_spare_ram_bytes(),
+    ):
+        return False
+    log.info(
+        "Spare memory cannot hold the search graph (%s points). Moving it to disk.",
+        points,
+    )
+    update_collection_options(install, hnsw_on_disk=True)
+    install.qdrant_hnsw_on_disk = True
+    try:
+        from nomad_turbo.discover import save_install
+
+        save_install(install)
+    except Exception:
+        log.exception("the graph was moved to disk, and the saved preference was not written")
+    return True
+
+
+_vectors_auto_lock = threading.Lock()
+_vectors_auto_checked = 0.0
+
+
+def consider_vectors_auto(install: Install) -> bool:
+    """Move the vectors to disk when automatic is on and the int8 copy would not fit.
+
+    Returns True when a patch was sent. Never moves the vectors back to the
+    in-RAM storage that pins the int8 copy. A collection without quantization
+    is left alone.
+    """
+    if not bool(getattr(install, "qdrant_vectors_auto", True)):
+        return False
+    global _vectors_auto_checked
+    now = time.time()
+    with _vectors_auto_lock:
+        if now - _vectors_auto_checked < GRAPH_AUTO_INTERVAL:
+            return False
+        _vectors_auto_checked = now
+    try:
+        view = read_collection_view(install)
+    except Exception:
+        log.exception("could not read the collection while checking the vectors")
+        return False
+    if not view.get("ok") or not view.get("present"):
+        return False
+    from nomad_turbo.qdrant_settings import vectors_auto_wants_disk
+    from nomad_turbo.segment_guard import _spare_ram_bytes
+
+    points = int(view.get("points") or 0)
+    dimension = int(view.get("size") or 768)
+    if not vectors_auto_wants_disk(
+        automatic=True,
+        on_disk=bool(view.get("vectors_on_disk")),
+        quantization=bool(view.get("quantization")),
+        points=points,
+        dimension=dimension,
+        spare_ram_bytes=_spare_ram_bytes(),
+    ):
+        return False
+    log.info(
+        "Spare memory cannot hold the int8 vector copy (%s points). Moving the vectors to disk.",
+        points,
+    )
+    update_collection_options(install, vectors_on_disk=True)
+    install.qdrant_vectors_on_disk = True
+    try:
+        from nomad_turbo.discover import save_install
+
+        save_install(install)
+    except Exception:
+        log.exception("the vectors were moved to disk, and the saved preference was not written")
+    return True
+
+
+def update_collection_options(
+    install: Install,
+    *,
+    quantization: bool | None = None,
+    hnsw_on_disk: bool | None = None,
+    vectors_on_disk: bool | None = None,
+) -> None:
+    """Change quantization or the graph location on the collection already there.
+
+    The storage type is not included. Qdrant keeps that for the life of the
+    collection. Points stay.
+    """
+    from nomad_turbo.qdrant_settings import update_body
+
+    changes = {}
+    if quantization is not None:
+        changes["quantization"] = bool(quantization)
+    if hnsw_on_disk is not None:
+        changes["hnsw_on_disk"] = bool(hnsw_on_disk)
+    if vectors_on_disk is not None:
+        changes["vectors_on_disk"] = bool(vectors_on_disk)
+    body = update_body(changes)
+    if not body:
+        return
+    name = install.collection
+    _request(
+        f"{install.qdrant_url.rstrip('/')}/collections/{name}",
+        body,
+        timeout=60,
+        method="PATCH",
+    )
+
+
+def _create_collection(install: Install) -> None:
+    """Create the collection with the storage choices saved on the install."""
+    from nomad_turbo.qdrant_settings import canonical_datatype, create_body
+
+    datatype = canonical_datatype(getattr(install, "qdrant_datatype", "float32"))
+    body = create_body(
+        int(install.dimension),
+        datatype,
+        bool(getattr(install, "qdrant_quantization", False)),
+        bool(getattr(install, "qdrant_hnsw_on_disk", False)),
+        bool(getattr(install, "qdrant_vectors_on_disk", False)),
+    )
+    _request(
+        f"{install.qdrant_url.rstrip('/')}/collections/{install.collection}",
+        body,
+        timeout=60,
+        method="PUT",
+    )
+
+
 def collection_ready(install: Install) -> None:
     """Make sure the stock collection exists and can take writes.
 
@@ -387,12 +658,7 @@ def collection_ready(install: Install) -> None:
         return
     if action == "raise":
         raise StoreError(info_error or "qdrant collection check failed")
-    _request(
-        f"{base}/collections/{name}",
-        {"vectors": {"size": install.dimension, "distance": "Cosine"}},
-        timeout=60,
-        method="PUT",
-    )
+    _create_collection(install)
     _ensure_keyword_indexes(install)
     apply_segment_cap(install)
 

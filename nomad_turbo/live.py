@@ -43,6 +43,8 @@ class ButtonFacts:
     measuring: bool = False
     measure_then_index: bool = False
     repair_kind: str = ""
+    # The Qdrant page is writing quantization or the graph. A storage rebuild uses delete_alive.
+    qdrant_busy: bool = False
 
 
 @dataclass(frozen=True)
@@ -120,7 +122,9 @@ def control_senses(phase: str, facts: ButtonFacts) -> dict:
     file_repairing = facts.repair_alive or facts.repair_starting
     optimizing = facts.optimize_busy
     repairing = file_repairing or optimizing
-    library_idle = facts.rows_ready and not running and not repairing and not deleting
+    # A quantization or graph write keeps the points, and it still must not overlap Start.
+    settling = deleting or facts.qdrant_busy
+    library_idle = facts.rows_ready and not running and not repairing and not settling
     changes = changes_allowed(facts.qdrant_ready)
     can_delete = delete_allowed(facts.qdrant_ready, facts.collection_missing)
     measuring = facts.measuring
@@ -129,11 +133,11 @@ def control_senses(phase: str, facts: ButtonFacts) -> dict:
         and changes
         and not measuring
         and not repairing
-        and not deleting
+        and not settling
         and (library_idle or running)
     )
-    then_index = measuring and not repairing and not deleting
-    idle_repair = not running and not repairing and not deleting and not facts.scanning and changes
+    then_index = measuring and not repairing and not settling
+    idle_repair = not running and not repairing and not settling and not facts.scanning and changes
     return {
         "running": running,
         "deleting": deleting,
@@ -168,6 +172,7 @@ def button_facts(window) -> ButtonFacts:
         then_index = bool(session.measure_then_index())
     repair_thread = getattr(window, "repair_thread", None)
     delete_thread = getattr(window, "delete_thread", None)
+    qdrant_thread = getattr(window, "qdrant_thread", None)
     thread = getattr(window, "thread", None)
     board = getattr(window, "repair_board", None)
     kind = str(getattr(board, "kind", "") or "") if board is not None else ""
@@ -185,6 +190,7 @@ def button_facts(window) -> ButtonFacts:
         measuring=measuring,
         measure_then_index=then_index,
         repair_kind=kind,
+        qdrant_busy=qdrant_thread is not None and qdrant_thread.is_alive(),
     )
 
 

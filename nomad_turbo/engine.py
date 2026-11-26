@@ -89,6 +89,8 @@ from nomad_turbo.tune import content_kind
 from nomad_turbo.store import (
     clear_ingest_rows,
     collection_ready,
+    consider_graph_auto,
+    consider_vectors_auto,
     count_source,
     delete_collection,
     delete_source_points,
@@ -351,6 +353,11 @@ def _wait_to_write(
     """
     known = downloads
     while not stop.is_set():
+        try:
+            consider_vectors_auto(install)
+            consider_graph_auto(install)
+        except Exception:
+            log.exception("could not check whether the vectors or the graph fit in memory")
         # Segment and space are hard holds. A disk stall must not skip them.
         segment = _segment_hold(install)
         library = _library_hold(install, known)
@@ -468,6 +475,9 @@ class FileWork:
     doc_skipped: list[str] = field(default_factory=list)
     document_mode: bool = False
     document_path: str = ""
+    # Index of the last committed HTML entry in iterByPath order.
+    # Absent on a checkpoint that only has a path.
+    dirent: int | None = None
 
 
 def _checkpoint_file(source: str) -> Path:
@@ -507,6 +517,12 @@ def _write_checkpoint(work: FileWork) -> None:
                 "doc_skipped": list(getattr(work, "doc_skipped", []) or []),
                 "skipped": int(work.skipped or 0),
                 "bad": int(work.bad or 0),
+                **(
+                    {}
+                    if (getattr(work, "zim_pass", None) or "html") != "html"
+                    or checkpoint_dirent({"dirent": getattr(work, "dirent", None)}, work.path) is None
+                    else {"dirent": work.dirent}
+                ),
             }
         )
     )
@@ -546,6 +562,34 @@ def _spill_paths(source: str) -> dict[str, Path]:
         "prints": folder / f"{spill_id}.prints",
         "go": folder / f"{spill_id}.go",
     }
+
+
+def checkpoint_dirent(saved: dict | None, path: str | None) -> int | None:
+    """Dirent saved with this path. A missing path or a bad number is absent."""
+    if not path or not saved:
+        return None
+    raw = saved.get("dirent")
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+        return None
+    return raw
+
+
+def note_resume_cursor(work: FileWork, event: dict) -> bool:
+    """Remember a dirent once it names the checkpoint path.
+
+    The reader sends this when it reaches the saved article, before the next
+    article is embedded. A different path is ignored.
+    """
+    raw = event.get("dirent")
+    path = str(event.get("path") or "")
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+        return False
+    if not path or path != (work.path or ""):
+        return False
+    if getattr(work, "dirent", None) == raw:
+        return False
+    work.dirent = raw
+    return True
 
 
 def _extract_resume(work: FileWork) -> tuple[str | None, str | None, str]:
@@ -1429,6 +1473,7 @@ def _work_list(
         if checkpoint and int(checkpoint.get("articles") or 0) >= articles and checkpoint.get("path"):
             resume_path = checkpoint["path"]
             articles = int(checkpoint["articles"])
+        resume_dirent = checkpoint_dirent(checkpoint, resume_path)
         zim_pass = str((checkpoint or {}).get("pass") or "html")
         if zim_pass not in ("html", "text", "ocr", "queued"):
             zim_pass = "ocr" if zim_pass == "done" else "html"
@@ -1456,6 +1501,7 @@ def _work_list(
                 source=source,
                 articles=articles,
                 path=resume_path,
+                dirent=resume_dirent,
                 chunks=chunks,
                 jobs=[(job_id, offset) for job_id, offset, _data in entries],
                 total_articles=total,
@@ -1608,6 +1654,9 @@ def _commit_article(
     work.chunks += int(new_chunks)
     work.articles = int(article["index"])
     work.path = article.get("path")
+    raw_dirent = article.get("dirent")
+    if isinstance(raw_dirent, int) and not isinstance(raw_dirent, bool) and raw_dirent >= 0:
+        work.dirent = raw_dirent
     work.touched = True
     if getattr(work, "pass_total", None):
         work.pass_done = int(getattr(work, "pass_done", 0) or 0) + 1
@@ -2194,6 +2243,7 @@ def _index_zim(
         0 if after_path else work.articles,
         after_path,
         work.articles,
+        after_dirent=getattr(work, "dirent", None) if after_path else None,
         quality=_ocr_quality(session, install),
         spill_id=spill["id"],
         zim_pass=zim_pass,
@@ -2268,6 +2318,11 @@ def _index_zim(
             if not str(line).strip():
                 continue
             event = json.loads(line)
+            if event.get("type") == "cursor":
+                if note_resume_cursor(work, event):
+                    _write_checkpoint(work)
+                    log.info("%s resume cursor is dirent %s", Path(work.source).name, work.dirent)
+                continue
             if event.get("type") == "meta":
                 archive = event
                 if event.get("totalArticles"):

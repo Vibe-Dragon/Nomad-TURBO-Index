@@ -1400,27 +1400,75 @@ class AboutAndLayoutTest(unittest.TestCase):
         changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
         window = (ROOT / "nomad_turbo" / "window.py").read_text(encoding="utf-8")
         self.assertEqual(facts["version"], __version__)
-        self.assertEqual(TESTED_NOMAD_VERSION, "1.35.1")
+        self.assertEqual(TESTED_NOMAD_VERSION, "1.35.2")
+        self.assertGreater(tuple(int(part) for part in __version__.split(".")), (1, 3, 2))
         self.assertIn(f"Project NOMAD {TESTED_NOMAD_VERSION}", facts["tested"])
         self.assertIn(f"tested with Project NOMAD {TESTED_NOMAD_VERSION}", readme)
+        self.assertIn("docs/faq.md", readme)
+        self.assertIn("docs/vs-stock.md", readme)
         self.assertIn(facts["turbo_repo"], readme)
         self.assertIn(facts["nomad_repo"], readme)
-        self.assertIn("About", readme)
-        self.assertIn("package version", readme)
-        self.assertIn("at least half", readme)
-        self.assertIn("Then index does nothing until", readme)
+        headings = [line for line in readme.splitlines() if line.startswith("## ")]
+        for banned in (
+            "## FAQ",
+            "## Disclaimer",
+            "## Common log lines",
+            "## Repair",
+            "## Turbo resumes a ZIM from the saved article instead of counting from the first article on every batch",
+            "## Turbo keeps the meat of a long HTML page and chunks it instead of cutting the page short",
+            "## Turbo runs outside the admin container and does not patch it",
+            "## Turbo uses its own embed server and larger calls instead of stock's small embed jobs",
+            "## Turbo leaves out navigation, scripts, and similar chrome",
+            "## Turbo reads upload PDFs and pictures itself",
+            "## Turbo pauses only file embedding and restores the ingest policy found at start",
+            "## The call size is a chunk count",
+            "## Resource spikes while indexing",
+            "## Log",
+            "## Next large efforts",
+            "## Stock contract",
+            "## Index",
+            "## Use",
+            "## Commands",
+        ):
+            self.assertNotIn(banned, headings)
+        comparison = (ROOT / "docs" / "vs-stock.md").read_text(encoding="utf-8")
+        self.assertIn("Project NOMAD 1.35.2", comparison)
+        self.assertIn("dirent-cursor batch seek", comparison)
+        self.assertIn("resumeAtDirent", comparison)
+        self.assertIn("iterByPath().offset", comparison)
+        self.assertNotIn("counts from the first article on every batch", comparison)
+        faq = (ROOT / "docs" / "faq.md").read_text(encoding="utf-8")
+        self.assertIn("Then index does nothing until", faq)
+        for phrase in _ABOUT_PHRASES:
+            self.assertIn(phrase, faq)
+        window_doc = (ROOT / "docs" / "window.md").read_text(encoding="utf-8")
+        self.assertIn("at least half", window_doc)
+        self.assertIn("package version", window_doc)
+        self.assertIn("About", window_doc)
         self.assertNotIn("is a checkbox", readme)
         for phrase in _ABOUT_PHRASES:
             self.assertIn(phrase, facts["body"])
         self.assertIn("About", changelog)
         self.assertIn("half the page", changelog)
-        self.assertIn("Project NOMAD 1.35.1", changelog)
+        self.assertIn("Project NOMAD 1.35.2", changelog)
         self.assertIn("shared rows", changelog)
+        self.assertNotIn("## Unreleased", changelog)
+        released_headings = [line[3:].strip() for line in changelog.splitlines() if line.startswith("## ")]
+        self.assertEqual(released_headings[0], __version__)
         notes = changelog.split(f"## {__version__}", 1)[1].split("\n## ", 1)[0]
-        self.assertIn("Stop", notes)
-        self.assertIn("already saved", notes)
-        self.assertIn("same ids", notes)
-        self.assertIn("waiting list", notes)
+        self.assertIn("Models", notes)
+        self.assertIn("dirent", notes)
+        self.assertIn("Project NOMAD 1.35.2", notes)
+        released_132 = changelog.split("## 1.3.2", 1)[1].split("\n## ", 1)[0]
+        self.assertIn("Qdrant", released_132)
+        self.assertIn("Float16", released_132)
+        self.assertIn("DELETE", released_132)
+        self.assertIn("Manual", released_132)
+        released_131 = changelog.split("## 1.3.1", 1)[1].split("\n## ", 1)[0]
+        self.assertIn("Stop", released_131)
+        self.assertIn("already saved", released_131)
+        self.assertIn("same ids", released_131)
+        self.assertIn("waiting list", released_131)
         released_130 = changelog.split("## 1.3.0", 1)[1].split("\n## ", 1)[0]
         self.assertIn("ZIM documents", released_130)
         self.assertIn("OCR every PDF", released_130)
@@ -1464,7 +1512,9 @@ class AboutAndLayoutTest(unittest.TestCase):
         previous_notes = changelog.split("## 1.1.4", 1)[1].split("\n## ", 1)[0]
         self.assertIn("Auto", previous_notes)
         self.assertIn("finished embed calls", previous_notes)
-        self.assertLess(changelog.index(f"## {__version__}"), changelog.index("## 1.3.0"))
+        self.assertLess(changelog.index(f"## {__version__}"), changelog.index("## 1.3.2"))
+        self.assertLess(changelog.index("## 1.3.2"), changelog.index("## 1.3.1"))
+        self.assertLess(changelog.index("## 1.3.1"), changelog.index("## 1.3.0"))
         self.assertLess(changelog.index("## 1.3.0"), changelog.index("## 1.2.1"))
         self.assertLess(changelog.index("## 1.2.1"), changelog.index("## 1.2.0"))
         self.assertLess(changelog.index("## 1.2.0"), changelog.index("## 1.1.7"))

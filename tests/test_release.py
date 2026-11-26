@@ -370,6 +370,7 @@ class HandoffNoteTest(unittest.TestCase):
         engine = (ROOT / "nomad_turbo" / "engine.py").read_text(encoding="utf-8")
         cli = (ROOT / "nomad_turbo" / "cli.py").read_text(encoding="utf-8")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        faq = (ROOT / "docs" / "faq.md").read_text(encoding="utf-8")
         self.assertIn("stop_status_note", window)
         self.assertIn("finished_status_note", window)
         run = window.split("def _run", 1)[1].split("\n    def ", 1)[0]
@@ -382,11 +383,14 @@ class HandoffNoteTest(unittest.TestCase):
         self.assertNotIn('set_note("Nothing left to index. NOMAD is embedding again.")', engine)
         self.assertIn("stop_status_note", cli)
         self.assertNotIn("NOMAD embeds again", readme)
-        self.assertIn("## Disclaimer", readme)
-        self.assertIn("## FAQ", readme)
-        self.assertIn("I am not responsible", readme)
-        self.assertIn("when I get to it", readme)
-        self.assertIn("MIT License", readme)
+        self.assertNotIn("## FAQ", readme)
+        self.assertNotIn("## Disclaimer", readme)
+        self.assertIn("docs/faq.md", readme)
+        self.assertIn("# FAQ", faq)
+        self.assertIn("## Disclaimer", faq)
+        self.assertIn("I am not responsible", faq)
+        self.assertIn("when I get to it", faq)
+        self.assertIn("MIT License", faq)
 
 
 class PackageSourceTest(unittest.TestCase):

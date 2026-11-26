@@ -500,6 +500,45 @@ class ExtractLaunchTest(unittest.TestCase):
                     os.environ["NOMAD_TURBO_STATE"] = previous
         self.assertEqual(saved["pass"], "text")
         self.assertEqual(saved["path"], "book.epub")
+        self.assertNotIn("dirent", saved)
+
+    def test_an_html_checkpoint_keeps_the_dirent_with_the_path(self):
+        from nomad_turbo.engine import _commit_article, checkpoint_dirent, note_resume_cursor
+
+        previous = os.environ.get("NOMAD_TURBO_STATE")
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["NOMAD_TURBO_STATE"] = tmp
+            try:
+                work = FileWork(host=Path(tmp) / "a.zim", kind="zim", source="/app/storage/zim/a.zim")
+                work.path = "Old.html"
+                work.articles = 4
+                self.assertTrue(note_resume_cursor(work, {"dirent": 80, "path": "Old.html"}))
+                self.assertFalse(note_resume_cursor(work, {"dirent": 80, "path": "Old.html"}))
+                self.assertFalse(note_resume_cursor(work, {"dirent": 3, "path": "Other.html"}))
+                _write_checkpoint(work)
+                saved = json.loads(next(state_dir().joinpath("checkpoints").glob("*.json")).read_text())
+                self.assertEqual(saved["dirent"], 80)
+                self.assertEqual(checkpoint_dirent(saved, saved["path"]), 80)
+                _commit_article(
+                    work,
+                    set(),
+                    None,
+                    {"index": 5, "path": "Next.html", "dirent": 91},
+                    2,
+                    publish=False,
+                )
+                self.assertEqual(work.dirent, 91)
+                self.assertEqual(work.path, "Next.html")
+                work.zim_pass = "text"
+                work.path = "book.epub"
+                _write_checkpoint(work)
+                later = json.loads(next(state_dir().joinpath("checkpoints").glob("*.json")).read_text())
+                self.assertNotIn("dirent", later)
+            finally:
+                if previous is None:
+                    os.environ.pop("NOMAD_TURBO_STATE", None)
+                else:
+                    os.environ["NOMAD_TURBO_STATE"] = previous
 
     def test_files_inside_a_zim_stay_unread_until_the_setting_is_on(self):
         from nomad_turbo.engine import _index_zim, _wants_zim_documents

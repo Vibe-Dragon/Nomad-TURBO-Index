@@ -411,36 +411,117 @@ function eventTurn() {
   });
 }
 
-async function* entries(archive, afterPath) {
-  // findByPath in this libzim build returns only that entry, not the tail.
-  // One forward walk reaches the checkpoint. The archive then stays open.
-  // gc() drops the JS wrapper only. The native entry is freed by a finalizer,
-  // and that finalizer runs on a later turn of this thread. A tight walk
-  // never takes that turn, so the await is what actually releases the memory.
-  let skipping = Boolean(afterPath);
-  let visited = 0;
-  for (const entry of archive.iterByPath()) {
-    visited += 1;
-    if (collectEntries(visited)) {
-      await eventTurn();
-      await eventTurn();
-    }
-    if (skipping) {
-      if (entry.path === afterPath) skipping = false;
-      continue;
-    }
-    yield entry;
+// iterByPath().offset(dirent, size) seeks inside that range. findByPath still
+// returns one entry, so a checkpoint without a dirent walks forward once.
+// dirent is the index of the checkpoint entry. offset() yields that entry
+// first. It is checked against the path and skipped. The archive stays open.
+const DIRENT_LIMIT = 2147483647;
+
+export function resumeDirent(value) {
+  if (value === "" || value === null || value === undefined || typeof value === "boolean") return null;
+  const cursor = typeof value === "number" ? value : Number(value);
+  if (!Number.isInteger(cursor) || cursor < 0) return null;
+  return cursor;
+}
+
+export function openResumeRange(range, dirent) {
+  const cursor = resumeDirent(dirent);
+  const size = range ? Number(range.size) : NaN;
+  if (cursor === null || !range || typeof range.offset !== "function" || !Number.isInteger(size) || size < 0) {
+    return { mode: "walk" };
   }
-  if (skipping) {
-    throw new Error(`resume path was not found: ${afterPath}`);
+  if (size > DIRENT_LIMIT) return { mode: "walk" };
+  if (cursor >= size) return { mode: "past", size };
+  return { mode: "seek", range: range.offset(cursor, size), cursor };
+}
+
+function iteratorRest(iterator) {
+  return {
+    [Symbol.iterator]() {
+      return iterator;
+    },
+  };
+}
+
+function stampDirent(entry, dirent) {
+  if (!entry || typeof entry !== "object") return;
+  try {
+    entry.dirent = dirent;
+  } catch {
+    // A native entry can refuse a new field. The walk still has the number.
   }
 }
 
-async function* selectedArticles(archive, afterPath, skip) {
+function readDirent(entry) {
+  const direct = entry && entry.dirent;
+  if (Number.isInteger(direct) && direct >= 0) return direct;
+  return null;
+}
+
+async function* entries(archive, afterPath, afterDirent) {
+  // findByPath in this libzim build returns only that entry, not the tail.
+  // A saved dirent seeks with offset(). The path is checked, then the archive
+  // stays open. A checkpoint with only a path walks forward once.
+  // gc() drops the JS wrapper only. The native entry is freed by a finalizer,
+  // and that finalizer runs on a later turn of this thread. A tight walk
+  // never takes that turn, so the await is what actually releases the memory.
+  async function* walk(source, skipPath, origin) {
+    let skipping = Boolean(skipPath);
+    let visited = 0;
+    let dirent = origin;
+    for (const entry of source) {
+      const here = dirent;
+      dirent += 1;
+      visited += 1;
+      if (collectEntries(visited)) {
+        await eventTurn();
+        await eventTurn();
+      }
+      if (skipping) {
+        if (entry.path === skipPath) {
+          skipping = false;
+          yield { cursorMark: true, dirent: here, path: entry.path };
+        }
+        continue;
+      }
+      stampDirent(entry, here);
+      yield entry;
+    }
+    if (skipping) {
+      throw new Error(`resume path was not found: ${skipPath}`);
+    }
+  }
+
+  const cursor = afterPath ? resumeDirent(afterDirent) : null;
+  if (cursor !== null) {
+    const opened = openResumeRange(archive.iterByPath(), cursor);
+    if (opened.mode === "seek") {
+      const iterator = opened.range[Symbol.iterator]();
+      const first = iterator.next();
+      if (!first.done && first.value && first.value.path === afterPath) {
+        console.error(`seeking to dirent ${cursor}`);
+        yield { cursorMark: true, dirent: cursor, path: afterPath };
+        await eventTurn();
+        yield* walk(iteratorRest(iterator), "", cursor + 1);
+        return;
+      }
+      const found = first.done ? "the end" : (first.value && first.value.path) || "an entry with no path";
+      console.error(`resume dirent ${cursor} is ${found}, not ${afterPath}; walking from the start`);
+    } else if (opened.mode === "past") {
+      console.error(
+        `resume dirent ${cursor} is past the end of the archive (${opened.size} entries); walking from the start`,
+      );
+    }
+  }
+  yield* walk(archive.iterByPath(), afterPath, 0);
+}
+
+async function* selectedArticles(archive, afterPath, skip, afterDirent) {
   let seen = 0;
   const resumeSkip = !afterPath && (Number(skip) || 0) > 0;
   const limitSkip = Number(skip) || 0;
-  for await (const entry of entries(archive, afterPath)) {
+  for await (const entry of entries(archive, afterPath, afterDirent)) {
+    if (entry && entry.cursorMark) continue;
     if (!isArticle(entry)) continue;
     seen += 1;
     if (resumeSkip && seen <= limitSkip) continue;
@@ -448,12 +529,12 @@ async function* selectedArticles(archive, afterPath, skip) {
   }
 }
 
-async function prefetchArticles({ zimPath, afterPath, skip, budget, seq }) {
+async function prefetchArticles({ zimPath, afterPath, afterDirent, skip, budget, seq }) {
   const seqView = new Int32Array(seq);
   const archive = new Archive(zimPath);
   const state = { inflight: [], ahead: 0 };
   let articleSeq = 0;
-  for await (const entry of selectedArticles(archive, afterPath || "", skip)) {
+  for await (const entry of selectedArticles(archive, afterPath || "", skip, afterDirent)) {
     if (Atomics.load(seqView, 1) === 1) return;
     articleSeq += 1;
     while (true) {
@@ -477,7 +558,7 @@ async function prefetchArticles({ zimPath, afterPath, skip, budget, seq }) {
   }
 }
 
-function startLookahead(zimPath, afterPath, skip) {
+function startLookahead(zimPath, afterPath, skip, afterDirent) {
   const budget = clusterCacheBudget();
   if (!(budget > 0)) return null;
   const shared = new SharedArrayBuffer(8);
@@ -490,6 +571,7 @@ function startLookahead(zimPath, afterPath, skip) {
     prefetch: true,
     zimPath,
     afterPath: afterPath || "",
+    afterDirent: resumeDirent(afterDirent),
     skip: Number(skip) || 0,
     budget,
     seq: shared,
@@ -703,10 +785,59 @@ async function selfTest() {
     },
   };
   for await (const entry of entries(fakeArchive, "")) walked.push(entry.path);
-  if (walked.length !== 2048 || walked[2047] !== "p2047") {
+  if (walked.length !== 2048 || walked[2047] !== "p2047" || walked[0] !== "p0") {
     throw new Error(`entry walk count ${walked.length}`);
   }
   if (!turned) throw new Error("entry walk never returned to the event loop");
+  if (resumeDirent("") !== null || resumeDirent(-1) !== null || resumeDirent(1.5) !== null || resumeDirent(0) !== 0) {
+    throw new Error("dirent cursor rejected a real index or accepted a bad one");
+  }
+  function fakeRange(paths) {
+    const rows = paths.map((path) => ({ path }));
+    return {
+      size: rows.length,
+      offset(start, maxResults) {
+        const end = Math.min(rows.length, start + maxResults);
+        return rows.slice(start, end);
+      },
+      [Symbol.iterator]() {
+        return rows[Symbol.iterator]();
+      },
+    };
+  }
+  const ranged = {
+    iterByPath() {
+      return fakeRange(["p0", "p1", "p2", "p3", "p4", "p5"]);
+    },
+  };
+  const sought = [];
+  const marks = [];
+  for await (const entry of entries(ranged, "p2", 2)) {
+    if (entry.cursorMark) marks.push(entry);
+    else sought.push(`${entry.path}:${entry.dirent}`);
+  }
+  if (marks.length !== 1 || marks[0].dirent !== 2 || sought.join(",") !== "p3:3,p4:4,p5:5") {
+    throw new Error(`seek missed the tail: ${JSON.stringify(marks)} ${sought.join(",")}`);
+  }
+  const mismatched = [];
+  for await (const entry of entries(ranged, "p1", 4)) {
+    if (!entry.cursorMark) mismatched.push(`${entry.path}:${entry.dirent}`);
+  }
+  if (mismatched.join(",") !== "p2:2,p3:3,p4:4,p5:5") {
+    throw new Error(`a bad dirent did not walk from the path: ${mismatched.join(",")}`);
+  }
+  const plain = {
+    iterByPath() {
+      return ["a", "b", "c"].map((path) => ({ path }));
+    },
+  };
+  const counted = [];
+  for await (const entry of entries(plain, "a", 1)) {
+    if (!entry.cursorMark) counted.push(`${entry.path}:${entry.dirent}`);
+  }
+  if (counted.join(",") !== "b:1,c:2") {
+    throw new Error(`a range without offset did not walk: ${counted.join(",")}`);
+  }
   if (!lookaheadShouldWait(1, 0) || !lookaheadShouldWait(100, 100) || lookaheadShouldWait(40, 100)) {
     throw new Error("lookahead wait condition is wrong");
   }
@@ -1029,6 +1160,7 @@ async function main() {
   const zimPath = arg("--zim");
   const skip = Number(arg("--skip", "0")) || 0;
   const afterPath = arg("--after-path");
+  const afterDirent = arg("--after-dirent");
   const limit = Number(arg("--limit", "0")) || 0;
   let index = Number(arg("--index-start", "0")) || 0;
   if (!zimPath) {
@@ -1066,7 +1198,7 @@ async function main() {
   const workers = startWorkers();
   let lookahead = null;
   try {
-    lookahead = startLookahead(zimPath, afterPath, skip);
+    lookahead = startLookahead(zimPath, afterPath, skip, afterDirent);
   } catch (error) {
     console.error(`cluster lookahead stopped: ${error && error.message ? error.message : error}`);
   }
@@ -1242,6 +1374,7 @@ async function main() {
       title: job.title,
       sections: parsed.sections || [],
     };
+    if (Number.isInteger(job.dirent) && job.dirent >= 0) article.dirent = job.dirent;
     if (skipReason) article.skip = skipReason;
     await emit(JSON.stringify(article) + "\n");
     emitted += 1;
@@ -1267,7 +1400,11 @@ async function main() {
         }
       }
     }
-    for await (const entry of (wantedPass === "html" ? entries(archive, afterPath) : [])) {
+    for await (const entry of (wantedPass === "html" ? entries(archive, afterPath, afterDirent) : [])) {
+      if (entry && entry.cursorMark) {
+        await emitArticle(emit, { type: "cursor", dirent: entry.dirent, path: entry.path });
+        continue;
+      }
       let earlyPath = "";
       let earlyMime = "";
       let earlySize = 0;
@@ -1344,6 +1481,7 @@ async function main() {
         path,
         title,
         problem,
+        dirent: readDirent(entry),
         done,
       });
       if (flight.length >= workers.length) await flushOne();
