@@ -1437,6 +1437,15 @@ class AboutAndLayoutTest(unittest.TestCase):
         self.assertIn("resumeAtDirent", comparison)
         self.assertIn("iterByPath().offset", comparison)
         self.assertNotIn("counts from the first article on every batch", comparison)
+        self.assertIn(
+            'Both also remove `[role="navigation"]` and `#coordinates`.',
+            comparison,
+        )
+        self.assertNotIn("Turbo does not.", comparison)
+        chrome = (ROOT / "worker" / "extract.mjs").read_text(encoding="utf-8")
+        chrome = chrome.split("function isChrome", 1)[1].split("\nfunction ", 1)[0]
+        self.assertIn('=== "navigation"', chrome)
+        self.assertIn('=== "coordinates"', chrome)
         faq = (ROOT / "docs" / "faq.md").read_text(encoding="utf-8")
         self.assertIn("Then index does nothing until", faq)
         for phrase in _ABOUT_PHRASES:

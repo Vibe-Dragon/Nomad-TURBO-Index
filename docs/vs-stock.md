@@ -24,7 +24,7 @@ Turbo does not bring a page-size cap back. The reader keeps the body of the page
 
 ## Chrome
 
-Leaving out navigation and the other furniture is not a Turbo-only change. Stock 1.35.2 removes the same tags and classes Turbo skips: `script`, `style`, `nav`, `header`, `footer`, `noscript`, `iframe`, `svg`, and the classes `navbox`, `sidebar`, `infobox`, `mw-editsection`, `reference`, `reflist`, `toc`, `noprint`, `mw-jump-link`, `mw-headline-anchor`, `navbar`, `hatnote`, `ambox`, `sistersitebox`, `portal`, `geo-nondefault`, and `authority-control`. Both drop the headings See also, References, External links, Further reading, Notes, Bibliography, and Navigation, and both join a table row with ` | `. Stock also removes `[role="navigation"]` and `#coordinates`. Turbo does not.
+Leaving out navigation and the other furniture is not a Turbo-only change. Stock 1.35.2 removes the same tags and classes Turbo skips: `script`, `style`, `nav`, `header`, `footer`, `noscript`, `iframe`, `svg`, and the classes `navbox`, `sidebar`, `infobox`, `mw-editsection`, `reference`, `reflist`, `toc`, `noprint`, `mw-jump-link`, `mw-headline-anchor`, `navbar`, `hatnote`, `ambox`, `sistersitebox`, `portal`, `geo-nondefault`, and `authority-control`. Both drop the headings See also, References, External links, Further reading, Notes, Bibliography, and Navigation, and both join a table row with ` | `. Both also remove `[role="navigation"]` and `#coordinates`. Turbo's reader treats a `navigation` role and an id of `coordinates` as chrome, the same way stock's selector list does.
 
 ## Article and section headings
 
